@@ -439,6 +439,25 @@ export async function assignProxiesRoundRobin(
 // 负载均衡模式
 export type LoadBalancingMode = 'priority' | 'balanced' | 'priority-balanced'
 
+// 切换顺序：优先级 → 优先级均衡 → 均衡负载 → 优先级
+const LOAD_BALANCING_CYCLE: LoadBalancingMode[] = ['priority', 'priority-balanced', 'balanced']
+
+export function nextLoadBalancingMode(cur: LoadBalancingMode): LoadBalancingMode {
+  const idx = LOAD_BALANCING_CYCLE.indexOf(cur)
+  return LOAD_BALANCING_CYCLE[(idx + 1) % LOAD_BALANCING_CYCLE.length]
+}
+
+export function loadBalancingModeLabel(mode: LoadBalancingMode): string {
+  switch (mode) {
+    case 'balanced':
+      return '均衡负载'
+    case 'priority-balanced':
+      return '优先级均衡'
+    default:
+      return '优先级'
+  }
+}
+
 // 获取负载均衡模式
 export async function getLoadBalancingMode(): Promise<{ mode: LoadBalancingMode }> {
   const { data } = await api.get<{ mode: LoadBalancingMode }>('/config/load-balancing')
