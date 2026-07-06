@@ -162,7 +162,12 @@ pub struct Config {
     #[serde(default = "default_update_auto_apply_time")]
     pub update_auto_apply_time: String,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority"、"balanced" 或 "priority-balanced"）
+    ///
+    /// - priority：始终使用优先级最高（priority 值最小）的可用凭据，故障时降级。
+    /// - balanced：在全部可用凭据中做 least-used 均衡。
+    /// - priority-balanced：先在最高优先级层内做 least-used 均衡，该层账号全部报错/
+    ///   禁用/冷却后自动降级到下一优先级层。
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 

@@ -29,7 +29,8 @@ import {
   useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { extractErrorMessage } from '@/lib/utils'
+import { updateAdminKey, type SelfHealConfigPatch, type LoadBalancingMode } from '@/api/credentials'
+import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 
@@ -100,8 +101,14 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     toast.success('已刷新')
   }
 
-  const onError = (err: unknown) =>
-    toast.error('切换失败：' + extractErrorMessage(err))
+  const handleToggleLoadBalancing = () => {
+    const cur = loadBalancingData?.mode || 'priority'
+    const next = nextLoadBalancingMode(cur)
+    setLoadBalancingMode(next, {
+      onSuccess: () => toast.success(`已切换到${loadBalancingModeLabel(next)}`),
+      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
 
   const balanced = lbData?.mode === 'balanced'
   const failover = throttle?.failover ?? true
@@ -203,11 +210,21 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   )
 }
 
-interface ToolsProps {
-  toggles: ToggleSpec[]
-  onRefresh: () => void
-  onOpenModels: () => void
-  onOpenImageUpdate: () => void
+interface ToolControls {
+  handleRefresh: () => void
+  handleToggleFailover: () => void
+  handleToggleLoadBalancing: () => void
+  isLoadingMode: boolean
+  isLoadingThrottle: boolean
+  isSettingMode: boolean
+  isSettingThrottle: boolean
+  loadBalancingMode?: LoadBalancingMode
+  openImageUpdate: () => void
+  openKeyDialog: () => void
+  openModels: () => void
+  throttleConfig?: { failover: boolean; cooldownSecs: number }
+  updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
+  updateCooldown: (secs: number) => void
 }
 
 function FullTools({
@@ -278,17 +295,15 @@ function CompactTools({
         align="end"
         className="max-h-[calc(100dvh-4.5rem)] w-56 max-w-[calc(100dvw-1rem)] overflow-x-hidden overflow-y-auto overscroll-contain"
       >
-        <DropdownMenuLabel>调度</DropdownMenuLabel>
-        {toggles.map((t) => (
-          <DropdownMenuItem key={t.key} disabled={t.busy} onSelect={t.onToggle}>
-            {t.icon}
-            {t.menuLabel}
-          </DropdownMenuItem>
-        ))}
-        <DropdownMenuLabel>操作</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={onRefresh}>
-          <RefreshCw />
-          刷新数据
+        <DropdownMenuLabel>系统操作</DropdownMenuLabel>
+        <DropdownMenuItem
+          disabled={controls.isLoadingMode || controls.isSettingMode}
+          onSelect={controls.handleToggleLoadBalancing}
+        >
+          <Activity />
+          {controls.isLoadingMode
+            ? '负载均衡加载中'
+            : `切换到${loadBalancingModeLabel(nextLoadBalancingMode(controls.loadBalancingMode || 'priority'))}`}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={onOpenModels}>
           <Boxes />
@@ -301,6 +316,98 @@ function CompactTools({
       </DropdownMenuContent>
     </DropdownMenu>
   )
+}
+
+function LoadBalancingButton({ controls }: { controls: ToolControls }) {
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={controls.handleToggleLoadBalancing}
+      disabled={controls.isLoadingMode || controls.isSettingMode}
+      title={`当前：${loadBalancingModeLabel(controls.loadBalancingMode || 'priority')}，点击切换`}
+    >
+      <Activity className="h-3.5 w-3.5" />
+      <span className="hidden md:inline">
+        {controls.isLoadingMode
+          ? '加载中…'
+          : loadBalancingModeLabel(controls.loadBalancingMode || 'priority')}
+      </span>
+    </Button>
+  )
+}
+
+function ModelsButton({ onOpen }: { onOpen: () => void }) {
+  return (
+    <Button variant="ghost" size="icon" onClick={onOpen} title="可用模型">
+      <Boxes className="h-4 w-4" />
+    </Button>
+  )
+}
+
+function RefreshButton({ onRefresh }: { onRefresh: () => void }) {
+  return (
+    <Button variant="ghost" size="icon" onClick={onRefresh} title="刷新">
+      <RefreshCw className="h-4 w-4" />
+    </Button>
+  )
+}
+
+function ImageUpdateButton({ controls }: { controls: ToolControls }) {
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={controls.openImageUpdate}
+      title={imageUpdateTitle(controls.updateCheck)}
+      className="relative"
+    >
+      <UploadCloud className="h-4 w-4" />
+      {controls.updateCheck?.hasUpdate && <UpdateDot />}
+    </Button>
+  )
+}
+
+function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon" title="设置">
+          <Settings className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onOpenKeyDialog}>
+          <Key />修改登录API密钥（管理面板登录）
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+// 负载均衡模式循环顺序：优先级 → 优先级均衡 → 均衡负载 → 优先级
+const LOAD_BALANCING_CYCLE: LoadBalancingMode[] = ['priority', 'priority-balanced', 'balanced']
+
+function nextLoadBalancingMode(cur: LoadBalancingMode): LoadBalancingMode {
+  const idx = LOAD_BALANCING_CYCLE.indexOf(cur)
+  return LOAD_BALANCING_CYCLE[(idx + 1) % LOAD_BALANCING_CYCLE.length]
+}
+
+function loadBalancingModeLabel(mode: LoadBalancingMode): string {
+  switch (mode) {
+    case 'balanced':
+      return '均衡负载'
+    case 'priority-balanced':
+      return '优先级均衡'
+    default:
+      return '优先级'
+  }
+}
+
+function imageUpdateTitle(updateCheck: ToolControls['updateCheck']) {
+  if (!updateCheck?.hasUpdate) return '镜像在线更新'
+  return `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
 }
 
 function UpdateDot() {

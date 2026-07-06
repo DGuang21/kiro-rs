@@ -1915,7 +1915,11 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：在全部可用凭据中均衡选择（least-used）
+    /// - priority-balanced 模式：先锁定当前可用凭据里优先级最高的那一层（priority
+    ///   值最小），仅在该层内做 least-used 均衡；该层账号全部报错/禁用/冷却而移出
+    ///   可用集合后，min(priority) 自然落到下一层，从而实现"高优先级层优先、报错后
+    ///   逐层降级"的故障转移。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -1959,6 +1963,18 @@ impl MultiTokenManager {
                         e.id,
                     )
                 })?;
+
+                Some((entry.id, entry.credentials.clone()))
+            }
+            "priority-balanced" => {
+                // 优先级负载均衡：先取可用集合里最高优先级层（priority 值最小），
+                // 仅在该层内做 least-used 均衡。平局再按 id 保证确定性。
+                // 该层全部不可用时，min(priority) 自动落到下一层，实现逐层降级。
+                let top_priority = available.iter().map(|e| e.credentials.priority).min()?;
+                let entry = available
+                    .iter()
+                    .filter(|e| e.credentials.priority == top_priority)
+                    .min_by_key(|e| (e.success_count, e.id))?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -2017,24 +2033,17 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, is_balanced) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                // 仅 priority 模式固定 current_id；balanced 与 priority-balanced
+                // 都需要每次请求重新选择，才能在候选集合内做 least-used 均衡。
+                let reselect_each_request =
+                    self.load_balancing_mode.lock().as_str() != "priority";
+                // 对外只区分"均衡选出"与"优先级固定"，因此所有重选模式都算 balanced。
+                let is_balanced = reselect_each_request;
 
-                // 两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
-                // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
-                let mut best = self.select_next_credential(model, group);
-
-                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
-                // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
-                if best.is_none() && self.try_self_heal(model, group) {
-                    best = self.select_next_credential(model, group);
-                }
-
-                let (id, credentials) = if let Some((new_id, new_creds)) = best {
-                    if update_current {
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                    }
-                    (new_id, new_creds)
+                // balanced / priority-balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                // priority 模式：优先使用 current_id 指向的凭据
+                let current_hit = if reselect_each_request {
+                    None
                 } else {
                     let entries = self.entries.lock();
                     // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
@@ -4281,7 +4290,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "priority-balanced" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -7130,6 +7139,79 @@ mod tests {
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+    }
+
+    /// priority-balanced：在最高优先级层内做 least-used 均衡，层内耗尽后逐层降级。
+    #[test]
+    fn test_priority_balanced_balances_within_top_tier_then_falls_back() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-balanced".to_string();
+        // 高优先级层 priority=0：A(id1),B(id2)；低优先级层 priority=5：C(id3)
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 0;
+        let mut c = grouped_cred("c", &[]);
+        c.priority = 5;
+        let manager =
+            MultiTokenManager::new(config, vec![a, b, c], None, None, false).unwrap();
+
+        // 初始平局(success_count 均为 0)：按 id 取更小的 A(id1)
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1)
+        );
+
+        // A 成功一次 → 顶层内 least-used 转向 B(id2)，仍不会跨到低优先级 C
+        manager.report_success(1);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "顶层内应转向 success_count 更小的 B，绝不选低优先级 C"
+        );
+
+        // 顶层两个账号全部禁用 → min(priority) 落到低优先级层，选到 C(id3)
+        manager.set_disabled(1, true).unwrap();
+        manager.set_disabled(2, true).unwrap();
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(3),
+            "顶层耗尽后应降级到低优先级层"
+        );
+    }
+
+    /// priority-balanced：临时冷却(throttle)使顶层移出可用集合，触发降级；冷却结束自动回到顶层。
+    #[test]
+    fn test_priority_balanced_falls_back_on_throttle_and_recovers() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-balanced".to_string();
+        let mut hi = grouped_cred("hi", &[]);
+        hi.priority = 0;
+        let mut lo = grouped_cred("lo", &[]);
+        lo.priority = 9;
+        let manager = MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap();
+
+        // 正常时选顶层 hi(id1)
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1)
+        );
+
+        // 顶层冷却 → 降级到 lo(id2)
+        manager.report_account_throttled(1, StdDuration::from_secs(600));
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "顶层冷却期间应降级到低优先级层"
+        );
+
+        // 手动解除冷却 → 回到顶层 hi(id1)
+        manager.clear_throttle(1).unwrap();
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "冷却解除后应回到最高优先级层"
+        );
     }
 
     #[tokio::test]
