@@ -29,7 +29,10 @@ import {
   useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { updateAdminKey, type SelfHealConfigPatch, type LoadBalancingMode } from '@/api/credentials'
+import {
+  updateAdminKey, nextLoadBalancingMode, loadBalancingModeLabel,
+  type SelfHealConfigPatch, type LoadBalancingMode,
+} from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
@@ -384,25 +387,6 @@ function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
       </DropdownMenuContent>
     </DropdownMenu>
   )
-}
-
-// 负载均衡模式循环顺序：优先级 → 优先级均衡 → 均衡负载 → 优先级
-const LOAD_BALANCING_CYCLE: LoadBalancingMode[] = ['priority', 'priority-balanced', 'balanced']
-
-function nextLoadBalancingMode(cur: LoadBalancingMode): LoadBalancingMode {
-  const idx = LOAD_BALANCING_CYCLE.indexOf(cur)
-  return LOAD_BALANCING_CYCLE[(idx + 1) % LOAD_BALANCING_CYCLE.length]
-}
-
-function loadBalancingModeLabel(mode: LoadBalancingMode): string {
-  switch (mode) {
-    case 'balanced':
-      return '均衡负载'
-    case 'priority-balanced':
-      return '优先级均衡'
-    default:
-      return '优先级'
-  }
 }
 
 function imageUpdateTitle(updateCheck: ToolControls['updateCheck']) {

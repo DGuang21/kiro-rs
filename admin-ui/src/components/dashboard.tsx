@@ -133,6 +133,8 @@ import {
   enableOverageForAllCapable,
   exportKamCredentials,
   updateAdminKey,
+  nextLoadBalancingMode,
+  loadBalancingModeLabel,
 } from "@/api/credentials";
 import {
   cn,
@@ -1315,12 +1317,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || "priority";
-    const next = cur === "priority" ? "balanced" : "priority";
+    const next = nextLoadBalancingMode(cur);
     setLoadBalancingMode(next, {
       onSuccess: () =>
-        toast.success(
-          `已切换到${next === "priority" ? "优先级模式" : "均衡负载模式"}`,
-        ),
+        toast.success(`已切换到${loadBalancingModeLabel(next)}模式`),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     });
   };
@@ -1383,9 +1383,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <Activity className="h-3.5 w-3.5" />
                 {isLoadingMode
                   ? "加载中…"
-                  : loadBalancingData?.mode === "priority"
-                    ? "优先级"
-                    : "均衡负载"}
+                  : loadBalancingModeLabel(loadBalancingData?.mode || "priority")}
               </Button>
               <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
                 <a
