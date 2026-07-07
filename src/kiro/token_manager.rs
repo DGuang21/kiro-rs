@@ -29,7 +29,6 @@ use crate::kiro::model::token_refresh::{
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::session_affinity::{RouteDecision, SessionAffinity, StickyOutcome};
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -1081,10 +1080,6 @@ pub struct CredentialEntrySnapshot {
     pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
-    /// Profile ARN 原文。Kiro 上游的 prompt cache 按 profile 而非单账号隔离
-    /// （实测同 profile 跨账号命中），前端据此把账号按 profile 分组展示。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile_arn: Option<String>,
     /// Token 过期时间
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -1195,8 +1190,6 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
-    /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
-    session_affinity: SessionAffinity,
     /// 账号级 429 风控故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
@@ -1425,10 +1418,6 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
-        let session_affinity = SessionAffinity::new(
-            config.session_affinity_enabled,
-            config.session_affinity_ttl_secs,
-        );
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
@@ -1450,7 +1439,6 @@ impl MultiTokenManager {
             runtime_config_update_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
-            session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
@@ -1927,7 +1915,13 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：在全部可用凭据中均衡选择（least-used）
+    /// - priority-balanced 模式：先锁定当前可用凭据里优先级最高的那一层（priority
+    ///   值最小），仅在该层内做 least-used 均衡；该层账号全部报错/禁用/冷却而移出
+    ///   可用集合后，min(priority) 自然落到下一层，从而实现"高优先级层优先、报错后
+    ///   逐层降级"的故障转移。
+    /// - priority-random 模式：同样先锁定最高优先级层，但层内**随机**选择而非
+    ///   least-used；该层账号全部移出可用集合后自动降级到下一层随机选择。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -1974,6 +1968,31 @@ impl MultiTokenManager {
 
                 Some((entry.id, entry.credentials.clone()))
             }
+            "priority-balanced" => {
+                // 优先级负载均衡：先取可用集合里最高优先级层（priority 值最小），
+                // 仅在该层内做 least-used 均衡。平局再按 id 保证确定性。
+                // 该层全部不可用时，min(priority) 自动落到下一层，实现逐层降级。
+                let top_priority = available.iter().map(|e| e.credentials.priority).min()?;
+                let entry = available
+                    .iter()
+                    .filter(|e| e.credentials.priority == top_priority)
+                    .min_by_key(|e| (e.success_count, e.id))?;
+
+                Some((entry.id, entry.credentials.clone()))
+            }
+            "priority-random" => {
+                // 优先级随机：先取可用集合里最高优先级层（priority 值最小），
+                // 在该层内随机选择一个账号；该层全部不可用时，min(priority) 自动
+                // 落到下一层，继续在下一层内随机选择，实现逐层随机降级。
+                let top_priority = available.iter().map(|e| e.credentials.priority).min()?;
+                let tier: Vec<_> = available
+                    .iter()
+                    .filter(|e| e.credentials.priority == top_priority)
+                    .collect();
+                let entry = tier[fastrand::usize(..tier.len())];
+
+                Some((entry.id, entry.credentials.clone()))
+            }
             _ => {
                 // priority 模式（默认）：严格选择数字最小的有效凭据。
                 // 同优先级按 ID 升序固定顺序，保证后端调度与前端预览一致。
@@ -2000,86 +2019,12 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, None, true)
+        self.acquire_context_impl(model, group, true)
             .await
-            .map(|(context, _, _)| context)
+            .map(|(context, _)| context)
     }
 
-    /// 带会话粘性的上下文获取：`session` 有绑定且绑定凭据可用时直接沿用，
-    /// 否则走普通负载均衡。同时返回路由决策供 trace 落库。
-    ///
-    /// 本方法只读绑定表；调用方在上游请求**成功**后调用 [`Self::bind_session`]，
-    /// 避免把失败的凭据钉给会话。
-    pub async fn acquire_context_routed(
-        &self,
-        model: Option<&str>,
-        group: Option<&str>,
-        session: Option<&str>,
-    ) -> anyhow::Result<(CallContext, RouteDecision)> {
-        self.acquire_context_impl(model, group, session, true)
-            .await
-            .map(|(context, _, route)| (context, route))
-    }
-
-    /// 记录「该凭据成功服务了该会话」，供下一轮粘性命中。
-    pub fn bind_session(&self, session: &str, credential_id: u64) {
-        self.session_affinity.bind(session, credential_id);
-    }
-
-    /// 计入一次粘性判定结果（命中率统计）
-    pub fn record_route(&self, route: &RouteDecision) {
-        self.session_affinity.record(route.sticky_outcome);
-    }
-
-    pub fn session_affinity(&self) -> &SessionAffinity {
-        &self.session_affinity
-    }
-
-    /// 粘性候选：会话有绑定、绑定凭据存在且当前可用 → 直接返回该凭据。
-    /// 同时给出判定结果与「选号前的绑定」供 trace 使用。
-    fn sticky_candidate(
-        &self,
-        session: Option<&str>,
-        model: Option<&str>,
-        group: Option<&str>,
-    ) -> (Option<(u64, KiroCredentials)>, RouteDecision) {
-        let Some(session) = session else {
-            return (None, RouteDecision::none());
-        };
-        if !self.session_affinity.is_enabled() {
-            return (None, RouteDecision::none());
-        }
-        let Some(bound_id) = self.session_affinity.lookup(session) else {
-            return (
-                None,
-                RouteDecision {
-                    sticky_outcome: StickyOutcome::MissFirst,
-                    previous_credential_id: None,
-                },
-            );
-        };
-        let entries = self.entries.lock();
-        let now = Instant::now();
-        let pick = entries
-            .iter()
-            .find(|e| e.id == bound_id)
-            .filter(|e| self.entry_available_for_request(e, model, group, now))
-            .map(|e| (e.id, e.credentials.clone()));
-        let outcome = if pick.is_some() {
-            StickyOutcome::Hit
-        } else {
-            StickyOutcome::MissUnavailable
-        };
-        (
-            pick,
-            RouteDecision {
-                sticky_outcome: outcome,
-                previous_credential_id: Some(bound_id),
-            },
-        )
-    }
-
-    /// 获取 API 调用上下文，并返回本次选择是否使用了 balanced 模式与粘性路由决策。
+    /// 获取 API 调用上下文，并返回本次选择是否使用了 balanced 模式。
     ///
     /// `update_current` 仅应在真实业务请求中开启。Admin 模型发现需要复用同一套
     /// 凭据选择和 Token 刷新规则，但不应因只读查询改变调度状态。
@@ -2087,9 +2032,8 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         group: Option<&str>,
-        session: Option<&str>,
         update_current: bool,
-    ) -> anyhow::Result<(CallContext, bool, RouteDecision)> {
+    ) -> anyhow::Result<(CallContext, bool)> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -2103,27 +2047,18 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, is_balanced, route) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+            let (id, credentials, is_balanced) = {
+                // 仅 priority 模式固定 current_id；balanced 与 priority-balanced
+                // 都需要每次请求重新选择，才能在候选集合内做 least-used 均衡。
+                let reselect_each_request =
+                    self.load_balancing_mode.lock().as_str() != "priority";
+                // 对外只区分"均衡选出"与"优先级固定"，因此所有重选模式都算 balanced。
+                let is_balanced = reselect_each_request;
 
-                // 会话粘性优先：绑定凭据仍可用就沿用，保住上游按账号隔离的 prompt cache。
-                // 粘性未命中时两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
-                // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
-                let (sticky_pick, route) = self.sticky_candidate(session, model, group);
-                let mut best = sticky_pick.or_else(|| self.select_next_credential(model, group));
-
-                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
-                // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
-                if best.is_none() && self.try_self_heal(model, group) {
-                    best = self.select_next_credential(model, group);
-                }
-
-                let (id, credentials) = if let Some((new_id, new_creds)) = best {
-                    if update_current {
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                    }
-                    (new_id, new_creds)
+                // balanced / priority-balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                // priority 模式：优先使用 current_id 指向的凭据
+                let current_hit = if reselect_each_request {
+                    None
                 } else {
                     let entries = self.entries.lock();
                     // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
@@ -2142,7 +2077,7 @@ impl MultiTokenManager {
                     anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                 };
 
-                (id, credentials, is_balanced, route)
+                (id, credentials, is_balanced)
             };
 
             // 尝试获取/刷新 Token
@@ -2153,7 +2088,7 @@ impl MultiTokenManager {
                         // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
                         continue;
                     }
-                    return Ok((ctx, is_balanced, route));
+                    return Ok((ctx, is_balanced));
                 }
                 Err(e) => {
                     let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
@@ -3172,7 +3107,6 @@ impl MultiTokenManager {
                         e.credentials.provider.clone()
                     },
                     has_profile_arn: e.credentials.profile_arn.is_some(),
-                    profile_arn: e.credentials.profile_arn.clone(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
                     } else {
@@ -3697,7 +3631,7 @@ impl MultiTokenManager {
     pub async fn get_available_models_for_current(
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
-        let (context, is_balanced, _) = self.acquire_context_impl(None, None, None, false).await?;
+        let (context, is_balanced) = self.acquire_context_impl(None, None, false).await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
         Ok((id, response, is_balanced))
@@ -3986,11 +3920,6 @@ impl MultiTokenManager {
                 self_heal_model: None,
             });
         }
-
-        // 新凭据可能比当前凭据优先级更高，入库后立即重选，确保 priority 模式
-        // 不会继续粘滞在旧的低优先级凭据上。即使后续持久化失败，内存中的
-        // entries 与 current_id 也应保持一致。
-        self.select_highest_priority();
 
         // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
         self.is_multiple_format.store(true, Ordering::Relaxed);
@@ -4376,7 +4305,11 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority"
+            && mode != "balanced"
+            && mode != "priority-balanced"
+            && mode != "priority-random"
+        {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -4467,51 +4400,6 @@ impl MultiTokenManager {
             config.account_throttle_failover = failover;
             config.account_throttle_cooldown_secs = cooldown_secs;
         })
-    }
-
-    /// 更新会话粘性路由配置（Admin API）。任一参数传 `None` 表示不修改该字段。
-    /// 运行时立即生效并持久化到 config.json；持久化失败回滚内存值。
-    pub fn set_session_affinity_config(
-        &self,
-        enabled: Option<bool>,
-        ttl_secs: Option<u64>,
-    ) -> anyhow::Result<()> {
-        if let Some(secs) = ttl_secs {
-            // 1 分钟到 24 小时
-            if !(60..=86_400).contains(&secs) {
-                anyhow::bail!("会话粘性 TTL 必须在 60..=86400 秒内: {}", secs);
-            }
-        }
-
-        let _update_guard = self.runtime_config_update_lock.lock();
-
-        let prev_enabled = self.session_affinity.is_enabled();
-        let prev_ttl = self.session_affinity.ttl_secs();
-        let new_enabled = enabled.unwrap_or(prev_enabled);
-        let new_ttl = ttl_secs.unwrap_or(prev_ttl);
-
-        if new_enabled == prev_enabled && new_ttl == prev_ttl {
-            return Ok(());
-        }
-
-        self.session_affinity.set_enabled(new_enabled);
-        self.session_affinity.set_ttl_secs(new_ttl);
-
-        if let Err(err) = self.update_config_file(move |config| {
-            config.session_affinity_enabled = new_enabled;
-            config.session_affinity_ttl_secs = new_ttl;
-        }) {
-            self.session_affinity.set_enabled(prev_enabled);
-            self.session_affinity.set_ttl_secs(prev_ttl);
-            return Err(err);
-        }
-
-        tracing::info!(
-            "会话粘性路由配置已更新: enabled={}, ttl_secs={}",
-            new_enabled,
-            new_ttl
-        );
-        Ok(())
     }
 
     /// 获取单账号 RPM 限流配置（Admin API）。返回：(是否启用, 每分钟上限)。
@@ -5057,53 +4945,6 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
-        assert_eq!(manager.snapshot().current_id, id);
-    }
-
-    #[tokio::test]
-    async fn test_add_higher_priority_credential_becomes_current() {
-        let config = Config::default();
-
-        let mut existing = KiroCredentials::default();
-        existing.kiro_api_key = Some("ksk_existing_lower_priority".to_string());
-        existing.auth_method = Some("api_key".to_string());
-        existing.priority = 1000;
-
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
-        let original_id = manager.snapshot().current_id;
-
-        let mut higher_priority = KiroCredentials::default();
-        higher_priority.kiro_api_key = Some("ksk_new_higher_priority".to_string());
-        higher_priority.auth_method = Some("api_key".to_string());
-        higher_priority.priority = 0;
-
-        let new_id = manager.add_credential(higher_priority).await.unwrap();
-
-        assert_ne!(new_id, original_id);
-        assert_eq!(manager.snapshot().current_id, new_id);
-    }
-
-    #[tokio::test]
-    async fn test_add_lower_priority_credential_keeps_current() {
-        let config = Config::default();
-
-        let mut existing = KiroCredentials::default();
-        existing.kiro_api_key = Some("ksk_existing_higher_priority".to_string());
-        existing.auth_method = Some("api_key".to_string());
-        existing.priority = 0;
-
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
-        let original_id = manager.snapshot().current_id;
-
-        let mut lower_priority = KiroCredentials::default();
-        lower_priority.kiro_api_key = Some("ksk_new_lower_priority".to_string());
-        lower_priority.auth_method = Some("api_key".to_string());
-        lower_priority.priority = 1000;
-
-        let new_id = manager.add_credential(lower_priority).await.unwrap();
-
-        assert_ne!(new_id, original_id);
-        assert_eq!(manager.snapshot().current_id, original_id);
     }
 
     /// add_credential 应在入库时为新凭据写入 created_at（RFC3339），
@@ -5993,8 +5834,8 @@ mod tests {
         assert_eq!(manager.snapshot().current_id, 1);
         manager.report_success(1);
 
-        let (context, is_balanced, _) = manager
-            .acquire_context_impl(None, None, None, false)
+        let (context, is_balanced) = manager
+            .acquire_context_impl(None, None, false)
             .await
             .unwrap();
 
@@ -7160,116 +7001,6 @@ mod tests {
         assert_eq!(recovered_context.id, 1);
     }
 
-    /// 会话粘性：绑定后同一会话沿用低优先级凭据，即便高优先级已恢复；
-    /// 绑定凭据不可用时回落并给出 miss_unavailable；无绑定为 miss_first；关闭为 off。
-    #[tokio::test]
-    async fn test_session_affinity_overrides_priority_and_falls_back_when_unavailable() {
-        let mut first = grouped_cred("first", &[]);
-        first.priority = 0;
-        let mut second = grouped_cred("second", &[]);
-        second.priority = 10;
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
-                .unwrap();
-
-        // 首轮：无绑定 → miss_first，priority 模式选 #1
-        let (ctx, route) = manager
-            .acquire_context_routed(None, None, Some("sess-A"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 1);
-        assert_eq!(route.sticky_outcome, StickyOutcome::MissFirst);
-        assert_eq!(route.previous_credential_id, None);
-
-        // 模拟 #1 被禁用时会话落到 #2 并成功 → 绑定到 #2
-        manager.set_disabled(1, true).unwrap();
-        let (ctx, route) = manager
-            .acquire_context_routed(None, None, Some("sess-A"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 2);
-        assert_eq!(route.sticky_outcome, StickyOutcome::MissFirst, "尚未 bind 过");
-        manager.bind_session("sess-A", 2);
-
-        // #1 恢复：不带会话的请求立刻回切 #1（既有 priority 语义不变）
-        manager.set_disabled(1, false).unwrap();
-        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 1);
-
-        // 带会话的请求仍粘在 #2 → hit
-        let (ctx, route) = manager
-            .acquire_context_routed(None, None, Some("sess-A"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 2, "粘性优先于 priority 回切");
-        assert_eq!(route.sticky_outcome, StickyOutcome::Hit);
-        assert_eq!(route.previous_credential_id, Some(2));
-
-        // 另一个会话不受影响 → miss_first 且按 priority 选 #1
-        let (ctx, route) = manager
-            .acquire_context_routed(None, None, Some("sess-B"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 1);
-        assert_eq!(route.sticky_outcome, StickyOutcome::MissFirst);
-
-        // 绑定凭据 #2 被禁用 → miss_unavailable，回落到 #1，previous 仍报 #2 供 UI 显示换号
-        manager.set_disabled(2, true).unwrap();
-        let (ctx, route) = manager
-            .acquire_context_routed(None, None, Some("sess-A"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 1);
-        assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
-        assert_eq!(route.previous_credential_id, Some(2));
-
-        // 关闭粘性 → off，且不再读绑定
-        manager.set_disabled(2, false).unwrap();
-        manager.session_affinity().set_enabled(false);
-        let (ctx, route) = manager
-            .acquire_context_routed(None, None, Some("sess-A"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 1, "关闭后按 priority 选号");
-        assert_eq!(route.sticky_outcome, StickyOutcome::Off);
-        assert_eq!(route.previous_credential_id, None);
-
-        // 无会话 id 的请求恒为 off，不参与统计
-        let (_, route) = manager
-            .acquire_context_routed(None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(route.sticky_outcome, StickyOutcome::Off);
-    }
-
-    /// 粘性命中也受 RPM 限制约束：绑定凭据打满时回落，而不是硬等。
-    #[tokio::test]
-    async fn test_session_affinity_respects_rpm_limit() {
-        let mut config = Config::default();
-        config.account_rpm_limit_enabled = true;
-        config.account_rpm_limit = 1;
-        let mut first = grouped_cred("first", &[]);
-        first.priority = 0;
-        let mut second = grouped_cred("second", &[]);
-        second.priority = 10;
-        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
-
-        let (ctx, _) = manager
-            .acquire_context_routed(None, None, Some("s"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 1);
-        manager.bind_session("s", 1);
-
-        // #1 RPM 已满（limit=1，上一次 acquire 已计入）→ 粘性不可用 → 落到 #2
-        let (ctx, route) = manager
-            .acquire_context_routed(None, None, Some("s"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 2);
-        assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
-        assert_eq!(route.previous_credential_id, Some(1));
-    }
-
     #[tokio::test]
     async fn test_priority_mode_switches_back_after_higher_priority_is_enabled() {
         let mut first = grouped_cred("first", &[]);
@@ -7427,6 +7158,139 @@ mod tests {
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+    }
+
+    /// priority-balanced：在最高优先级层内做 least-used 均衡，层内耗尽后逐层降级。
+    #[test]
+    fn test_priority_balanced_balances_within_top_tier_then_falls_back() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-balanced".to_string();
+        // 高优先级层 priority=0：A(id1),B(id2)；低优先级层 priority=5：C(id3)
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 0;
+        let mut c = grouped_cred("c", &[]);
+        c.priority = 5;
+        let manager =
+            MultiTokenManager::new(config, vec![a, b, c], None, None, false).unwrap();
+
+        // 初始平局(success_count 均为 0)：按 id 取更小的 A(id1)
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1)
+        );
+
+        // A 成功一次 → 顶层内 least-used 转向 B(id2)，仍不会跨到低优先级 C
+        manager.report_success(1);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "顶层内应转向 success_count 更小的 B，绝不选低优先级 C"
+        );
+
+        // 顶层两个账号全部禁用 → min(priority) 落到低优先级层，选到 C(id3)
+        manager.set_disabled(1, true).unwrap();
+        manager.set_disabled(2, true).unwrap();
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(3),
+            "顶层耗尽后应降级到低优先级层"
+        );
+    }
+
+    /// priority-balanced：临时冷却(throttle)使顶层移出可用集合，触发降级；冷却结束自动回到顶层。
+    #[test]
+    fn test_priority_balanced_falls_back_on_throttle_and_recovers() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-balanced".to_string();
+        let mut hi = grouped_cred("hi", &[]);
+        hi.priority = 0;
+        let mut lo = grouped_cred("lo", &[]);
+        lo.priority = 9;
+        let manager = MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap();
+
+        // 正常时选顶层 hi(id1)
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1)
+        );
+
+        // 顶层冷却 → 降级到 lo(id2)
+        manager.report_account_throttled(1, StdDuration::from_secs(600));
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "顶层冷却期间应降级到低优先级层"
+        );
+
+        // 手动解除冷却 → 回到顶层 hi(id1)
+        manager.clear_throttle(1).unwrap();
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "冷却解除后应回到最高优先级层"
+        );
+    }
+
+    /// priority-random：只在最高优先级层内随机选择，绝不跨到低优先级层；
+    /// 多次抽样应能覆盖到该层内的每个账号。
+    #[test]
+    fn test_priority_random_stays_in_top_tier_and_covers_all() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-random".to_string();
+        // 顶层 priority=0：A(id1),B(id2),C(id3)；低层 priority=5：D(id4)
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 0;
+        let mut c = grouped_cred("c", &[]);
+        c.priority = 0;
+        let mut d = grouped_cred("d", &[]);
+        d.priority = 5;
+        let manager =
+            MultiTokenManager::new(config, vec![a, b, c, d], None, None, false).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let id = manager.select_next_credential(None, None).map(|(id, _)| id);
+            assert!(
+                matches!(id, Some(1) | Some(2) | Some(3)),
+                "priority-random 必须只在顶层内选择，绝不选低优先级 D(id4)，实际={:?}",
+                id
+            );
+            if let Some(id) = id {
+                seen.insert(id);
+            }
+        }
+        // 200 次抽样几乎必然覆盖顶层三个账号（每个漏选概率 (2/3)^200，可忽略）
+        assert_eq!(seen.len(), 3, "顶层三个账号都应被随机选到过，实际={:?}", seen);
+    }
+
+    /// priority-random：顶层全部不可用后逐层降级到下一层随机选择。
+    #[test]
+    fn test_priority_random_falls_back_when_top_tier_exhausted() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-random".to_string();
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 0;
+        let mut d = grouped_cred("d", &[]);
+        d.priority = 5;
+        let manager =
+            MultiTokenManager::new(config, vec![a, b, d], None, None, false).unwrap();
+
+        // 顶层两个账号：禁用 A、冷却 B → 顶层耗尽，只剩低层 D(id3)
+        manager.set_disabled(1, true).unwrap();
+        manager.report_account_throttled(2, StdDuration::from_secs(600));
+        for _ in 0..50 {
+            assert_eq!(
+                manager.select_next_credential(None, None).map(|(id, _)| id),
+                Some(3),
+                "顶层耗尽后应降级到低优先级层 D"
+            );
+        }
     }
 
     #[tokio::test]

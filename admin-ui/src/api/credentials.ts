@@ -437,10 +437,19 @@ export async function assignProxiesRoundRobin(
 }
 
 // 负载均衡模式
-export type LoadBalancingMode = 'priority' | 'balanced' | 'priority-balanced'
+export type LoadBalancingMode =
+  | 'priority'
+  | 'balanced'
+  | 'priority-balanced'
+  | 'priority-random'
 
-// 切换顺序：优先级 → 优先级均衡 → 均衡负载 → 优先级
-const LOAD_BALANCING_CYCLE: LoadBalancingMode[] = ['priority', 'priority-balanced', 'balanced']
+// 切换顺序：优先级 → 优先级均衡 → 优先级随机 → 均衡负载 → 优先级
+const LOAD_BALANCING_CYCLE: LoadBalancingMode[] = [
+  'priority',
+  'priority-balanced',
+  'priority-random',
+  'balanced',
+]
 
 export function nextLoadBalancingMode(cur: LoadBalancingMode): LoadBalancingMode {
   const idx = LOAD_BALANCING_CYCLE.indexOf(cur)
@@ -453,6 +462,8 @@ export function loadBalancingModeLabel(mode: LoadBalancingMode): string {
       return '均衡负载'
     case 'priority-balanced':
       return '优先级均衡'
+    case 'priority-random':
+      return '优先级随机'
     default:
       return '优先级'
   }
