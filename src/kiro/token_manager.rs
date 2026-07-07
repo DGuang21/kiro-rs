@@ -1920,6 +1920,8 @@ impl MultiTokenManager {
     ///   值最小），仅在该层内做 least-used 均衡；该层账号全部报错/禁用/冷却而移出
     ///   可用集合后，min(priority) 自然落到下一层，从而实现"高优先级层优先、报错后
     ///   逐层降级"的故障转移。
+    /// - priority-random 模式：同样先锁定最高优先级层，但层内**随机**选择而非
+    ///   least-used；该层账号全部移出可用集合后自动降级到下一层随机选择。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -1975,6 +1977,19 @@ impl MultiTokenManager {
                     .iter()
                     .filter(|e| e.credentials.priority == top_priority)
                     .min_by_key(|e| (e.success_count, e.id))?;
+
+                Some((entry.id, entry.credentials.clone()))
+            }
+            "priority-random" => {
+                // 优先级随机：先取可用集合里最高优先级层（priority 值最小），
+                // 在该层内随机选择一个账号；该层全部不可用时，min(priority) 自动
+                // 落到下一层，继续在下一层内随机选择，实现逐层随机降级。
+                let top_priority = available.iter().map(|e| e.credentials.priority).min()?;
+                let tier: Vec<_> = available
+                    .iter()
+                    .filter(|e| e.credentials.priority == top_priority)
+                    .collect();
+                let entry = tier[fastrand::usize(..tier.len())];
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -4290,7 +4305,11 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" && mode != "priority-balanced" {
+        if mode != "priority"
+            && mode != "balanced"
+            && mode != "priority-balanced"
+            && mode != "priority-random"
+        {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -7212,6 +7231,66 @@ mod tests {
             Some(1),
             "冷却解除后应回到最高优先级层"
         );
+    }
+
+    /// priority-random：只在最高优先级层内随机选择，绝不跨到低优先级层；
+    /// 多次抽样应能覆盖到该层内的每个账号。
+    #[test]
+    fn test_priority_random_stays_in_top_tier_and_covers_all() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-random".to_string();
+        // 顶层 priority=0：A(id1),B(id2),C(id3)；低层 priority=5：D(id4)
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 0;
+        let mut c = grouped_cred("c", &[]);
+        c.priority = 0;
+        let mut d = grouped_cred("d", &[]);
+        d.priority = 5;
+        let manager =
+            MultiTokenManager::new(config, vec![a, b, c, d], None, None, false).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let id = manager.select_next_credential(None, None).map(|(id, _)| id);
+            assert!(
+                matches!(id, Some(1) | Some(2) | Some(3)),
+                "priority-random 必须只在顶层内选择，绝不选低优先级 D(id4)，实际={:?}",
+                id
+            );
+            if let Some(id) = id {
+                seen.insert(id);
+            }
+        }
+        // 200 次抽样几乎必然覆盖顶层三个账号（每个漏选概率 (2/3)^200，可忽略）
+        assert_eq!(seen.len(), 3, "顶层三个账号都应被随机选到过，实际={:?}", seen);
+    }
+
+    /// priority-random：顶层全部不可用后逐层降级到下一层随机选择。
+    #[test]
+    fn test_priority_random_falls_back_when_top_tier_exhausted() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-random".to_string();
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 0;
+        let mut d = grouped_cred("d", &[]);
+        d.priority = 5;
+        let manager =
+            MultiTokenManager::new(config, vec![a, b, d], None, None, false).unwrap();
+
+        // 顶层两个账号：禁用 A、冷却 B → 顶层耗尽，只剩低层 D(id3)
+        manager.set_disabled(1, true).unwrap();
+        manager.report_account_throttled(2, StdDuration::from_secs(600));
+        for _ in 0..50 {
+            assert_eq!(
+                manager.select_next_credential(None, None).map(|(id, _)| id),
+                Some(3),
+                "顶层耗尽后应降级到低优先级层 D"
+            );
+        }
     }
 
     #[tokio::test]
