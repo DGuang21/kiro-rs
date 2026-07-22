@@ -21,15 +21,12 @@ use crate::kiro::token_manager::{MultiTokenManager, RequestGuard};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
-/// 每个凭据的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
-
-/// 总重试次数硬上限（避免无限重试）
-///
-/// 注：上游 429 多为账号级速率配额（SERVICE_REQUEST_RATE_EXCEEDED），高峰期
-/// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
-/// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
-const MAX_TOTAL_RETRIES: usize = 4;
+// 重试次数（每凭据上限、总上限）现为运行时可配置，见 Config::max_retries_per_credential /
+// max_total_retries，通过 token_manager 的 getter 读取；Admin API 可在线修改并持久化。
+//
+// 注：上游 429 多为账号级速率配额（SERVICE_REQUEST_RATE_EXCEEDED），高峰期多账号同时触顶时，
+// 过多重试会在账号间连环撞墙、放大限流。故总上限默认取较小值（4），配合 429 专用长退避
+// （见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
@@ -360,7 +357,9 @@ impl KiroProvider {
         group: Option<&str>,
     ) -> anyhow::Result<McpCallResult> {
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = (total_credentials
+            * self.token_manager.get_max_retries_per_credential())
+        .min(self.token_manager.get_max_total_retries());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
@@ -709,10 +708,9 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 API 调用
     ///
-    /// 重试策略：
-    /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// 重试策略（次数取自运行时配置，Admin API 可在线修改）：
+    /// - 每个凭据最多重试 `Config::max_retries_per_credential` 次（默认 3）
+    /// - 总重试次数 = min(分组内账号数 × 每凭据重试次数, `Config::max_total_retries`)（默认上限 4）
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -722,7 +720,9 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = (total_credentials
+            * self.token_manager.get_max_retries_per_credential())
+        .min(self.token_manager.get_max_total_retries());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };

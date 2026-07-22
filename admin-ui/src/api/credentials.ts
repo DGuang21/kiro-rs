@@ -552,6 +552,25 @@ export async function setSelfHealConfig(
   return data
 }
 
+export interface RetryConfig {
+  // 每个凭据的最大重试次数（1-10）
+  perCredential: number
+  // 单次请求总重试次数硬上限（1-20）
+  total: number
+}
+
+// 获取重试次数配置
+export async function getRetryConfig(): Promise<RetryConfig> {
+  const { data } = await api.get<RetryConfig>('/config/retry')
+  return data
+}
+
+// 更新重试次数配置
+export async function setRetryConfig(patch: Partial<RetryConfig>): Promise<RetryConfig> {
+  const { data } = await api.put<RetryConfig>('/config/retry', patch)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number
