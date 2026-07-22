@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -1228,6 +1228,10 @@ pub struct MultiTokenManager {
     self_heal_min_interval_secs: AtomicU64,
     /// 连续自愈最大轮数（0=不限，运行时可修改）
     self_heal_max_consecutive_rounds: AtomicU32,
+    /// 每个凭据的最大重试次数（运行时可修改）
+    max_retries_per_credential: AtomicUsize,
+    /// 单次请求总重试次数硬上限（运行时可修改）
+    max_total_retries: AtomicUsize,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1449,6 +1453,8 @@ impl MultiTokenManager {
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
+        let max_retries_per_credential = config.max_retries_per_credential;
+        let max_total_retries = config.max_total_retries;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1470,6 +1476,8 @@ impl MultiTokenManager {
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
+            max_retries_per_credential: AtomicUsize::new(max_retries_per_credential),
+            max_total_retries: AtomicUsize::new(max_total_retries),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             model_cache: Mutex::new(HashMap::new()),
@@ -4638,6 +4646,73 @@ impl MultiTokenManager {
             config.self_heal_enabled = self_heal_enabled;
             config.self_heal_min_interval_secs = self_heal_min_interval_secs;
             config.self_heal_max_consecutive_rounds = self_heal_max_consecutive_rounds;
+        })
+    }
+
+    /// 获取每个凭据的最大重试次数（Admin API）
+    pub fn get_max_retries_per_credential(&self) -> usize {
+        self.max_retries_per_credential.load(Ordering::Relaxed)
+    }
+
+    /// 获取单次请求总重试次数硬上限（Admin API）
+    pub fn get_max_total_retries(&self) -> usize {
+        self.max_total_retries.load(Ordering::Relaxed)
+    }
+
+    /// 设置重试次数配置（Admin API）
+    ///
+    /// 任一参数传 `None` 表示不修改该字段。
+    pub fn set_retry_config(
+        &self,
+        per_credential: Option<usize>,
+        total: Option<usize>,
+    ) -> anyhow::Result<()> {
+        if let Some(v) = per_credential {
+            if !(1..=10).contains(&v) {
+                anyhow::bail!("每凭据重试次数必须在 1..=10 内: {}", v);
+            }
+        }
+        if let Some(v) = total {
+            if !(1..=20).contains(&v) {
+                anyhow::bail!("总重试次数上限必须在 1..=20 内: {}", v);
+            }
+        }
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let prev_per_credential = self.get_max_retries_per_credential();
+        let prev_total = self.get_max_total_retries();
+        let new_per_credential = per_credential.unwrap_or(prev_per_credential);
+        let new_total = total.unwrap_or(prev_total);
+
+        if new_per_credential == prev_per_credential && new_total == prev_total {
+            return Ok(());
+        }
+
+        self.max_retries_per_credential
+            .store(new_per_credential, Ordering::Relaxed);
+        self.max_total_retries.store(new_total, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_retry_config(new_per_credential, new_total) {
+            // 回滚内存值
+            self.max_retries_per_credential
+                .store(prev_per_credential, Ordering::Relaxed);
+            self.max_total_retries.store(prev_total, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "重试次数配置已更新: per_credential={}, total={}",
+            new_per_credential,
+            new_total
+        );
+        Ok(())
+    }
+
+    fn persist_retry_config(&self, per_credential: usize, total: usize) -> anyhow::Result<()> {
+        self.update_config_file(move |config| {
+            config.max_retries_per_credential = per_credential;
+            config.max_total_retries = total;
         })
     }
 }

@@ -235,6 +235,20 @@ pub struct Config {
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
 
+    /// 每个凭据的最大重试次数（默认 3）。
+    ///
+    /// 单次请求内，某凭据失败后在该凭据上的重试上限。实际总重试次数为
+    /// `min(分组内账号数 × 本值, max_total_retries)`。
+    #[serde(default = "default_max_retries_per_credential")]
+    pub max_retries_per_credential: usize,
+
+    /// 单次请求的总重试次数硬上限（默认 4）。
+    ///
+    /// 与 `max_retries_per_credential` 共同决定实际重试预算，避免多账号故障转移
+    /// 时无限重试放大限流。取值见 provider 的重试循环。
+    #[serde(default = "default_max_total_retries")]
+    pub max_total_retries: usize,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -362,6 +376,14 @@ fn default_model_cache_ttl_secs() -> u64 {
     60 * 60
 }
 
+fn default_max_retries_per_credential() -> usize {
+    3
+}
+
+fn default_max_total_retries() -> usize {
+    4
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -426,6 +448,8 @@ impl Default for Config {
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
+            max_retries_per_credential: default_max_retries_per_credential(),
+            max_total_retries: default_max_total_retries(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),

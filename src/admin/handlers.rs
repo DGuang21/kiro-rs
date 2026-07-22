@@ -27,7 +27,7 @@ use super::{
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetSelfHealConfigRequest,
+        SetRetryConfigRequest, SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -616,6 +616,24 @@ pub async fn set_self_heal_config(
     Json(payload): Json<SetSelfHealConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_self_heal_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/retry
+/// 获取重试次数配置
+pub async fn get_retry_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_retry_config())
+}
+
+/// PUT /api/admin/config/retry
+/// 更新重试次数配置
+pub async fn set_retry_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRetryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_retry_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

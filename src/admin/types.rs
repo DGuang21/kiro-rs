@@ -572,6 +572,28 @@ pub struct SetSelfHealConfigRequest {
     pub max_consecutive_rounds: Option<u32>,
 }
 
+/// 重试次数配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryConfigResponse {
+    /// 每个凭据的最大重试次数
+    pub per_credential: usize,
+    /// 单次请求总重试次数硬上限
+    pub total: usize,
+}
+
+/// 更新重试次数配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRetryConfigRequest {
+    /// 每个凭据的最大重试次数；缺省表示不修改，1..=10
+    #[serde(default)]
+    pub per_credential: Option<usize>,
+    /// 单次请求总重试次数硬上限；缺省表示不修改，1..=20
+    #[serde(default)]
+    pub total: Option<usize>,
+}
+
 /// 日志治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

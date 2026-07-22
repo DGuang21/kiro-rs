@@ -46,12 +46,12 @@ use super::types::{
     CredentialMetadataSchemaConfig,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
+    ProxyPoolResponse, QuotaExceededResult, RetryConfigResponse, SelfHealConfigResponse,
     SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest,
-    SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    SetLogGovernanceConfigRequest, SetRetryConfigRequest, SetSelfHealConfigRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
+    UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -2420,6 +2420,32 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_self_heal_config())
+    }
+
+    /// 获取重试次数配置
+    pub fn get_retry_config(&self) -> RetryConfigResponse {
+        RetryConfigResponse {
+            per_credential: self.token_manager.get_max_retries_per_credential(),
+            total: self.token_manager.get_max_total_retries(),
+        }
+    }
+
+    /// 更新重试次数配置
+    pub fn set_retry_config(
+        &self,
+        req: SetRetryConfigRequest,
+    ) -> Result<RetryConfigResponse, AdminServiceError> {
+        if req.per_credential.is_none() && req.total.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 perCredential 或 total 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_retry_config(req.per_credential, req.total)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_retry_config())
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

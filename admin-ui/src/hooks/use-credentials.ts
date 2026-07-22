@@ -22,6 +22,8 @@ import {
   setAccountRpmLimitConfig,
   getSelfHealConfig,
   setSelfHealConfig,
+  getRetryConfig,
+  setRetryConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   getGlobalProxy,
@@ -312,6 +314,25 @@ export function useSetSelfHealConfig() {
     mutationFn: setSelfHealConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['selfHealConfig'] })
+    },
+  })
+}
+
+// 获取重试次数配置
+export function useRetryConfig() {
+  return useQuery({
+    queryKey: ['retryConfig'],
+    queryFn: getRetryConfig,
+  })
+}
+
+// 更新重试次数配置
+export function useSetRetryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setRetryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['retryConfig'] })
     },
   })
 }
