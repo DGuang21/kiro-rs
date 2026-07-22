@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
@@ -878,6 +880,7 @@ async fn handle_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    let concurrency_guard = call_result.concurrency_guard;
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
@@ -892,8 +895,12 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
+    // 创建 SSE 流，并让并发 guard 随流存活到流结束/客户端断开
     let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream = GuardedStream {
+        inner: Box::pin(stream),
+        _guard: concurrency_guard,
+    };
 
     // 返回 SSE 响应
     Response::builder()
@@ -911,6 +918,26 @@ const PING_INTERVAL_SECS: u64 = 25;
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+/// 包装 SSE 响应流并持有并发计数 guard。
+///
+/// SSE 流被 axum 惰性拉取（客户端消费多久，流就存活多久）。把
+/// [`RequestGuard`](crate::kiro::token_manager::RequestGuard) 随流一起持有，
+/// 流播完或客户端断开导致本结构被 Drop 时，对应凭据的在途并发才 -1，
+/// 从而让"当前并发"覆盖整个流式响应生命周期。
+struct GuardedStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>,
+    _guard: Option<crate::kiro::token_manager::RequestGuard>,
+}
+
+impl Stream for GuardedStream {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // GuardedStream 自身 Unpin（inner 是 Pin<Box<..>>，_guard 仅含 Arc + u64）。
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
 }
 
 /// 创建 SSE 事件流
@@ -1183,6 +1210,8 @@ async fn handle_non_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    // 保活并发 guard 到函数结束（覆盖读取响应体与构建响应的全过程）
+    let _concurrency_guard = call_result.concurrency_guard;
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -1865,6 +1894,7 @@ async fn handle_stream_request_buffered(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    let concurrency_guard = call_result.concurrency_guard;
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
@@ -1876,8 +1906,12 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_cache_usage(cache_usage);
 
-    // 创建缓冲 SSE 流
+    // 创建缓冲 SSE 流，并让并发 guard 随流存活到流结束/客户端断开
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
+    let stream = GuardedStream {
+        inner: Box::pin(stream),
+        _guard: concurrency_guard,
+    };
 
     // 返回 SSE 响应
     Response::builder()

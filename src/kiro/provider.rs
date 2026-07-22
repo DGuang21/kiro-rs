@@ -17,7 +17,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, RequestGuard};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -87,6 +87,9 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 在途请求并发计数 guard。调用方需持有它直到请求真正结束（非流式：读完响应体；
+    /// 流式：SSE 流播完/客户端断开），Drop 时该凭据并发 -1。
+    pub concurrency_guard: Option<RequestGuard>,
 }
 
 /// A successful MCP HTTP response whose trace attempt is finalized after body validation.
@@ -813,6 +816,9 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
+            // 本次尝试真正向上游发起请求：并发 +1。若该尝试失败并 continue/返回，
+            // guard 随迭代结束 Drop（并发 -1）；成功则移入 KiroCallResult 继续存活。
+            let concurrency_guard = self.token_manager.begin_request(ctx.id);
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -862,6 +868,7 @@ impl KiroProvider {
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    concurrency_guard: Some(concurrency_guard),
                 });
             }
 

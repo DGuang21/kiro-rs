@@ -767,7 +767,7 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
-                    metadata,
+                    in_flight: entry.in_flight,
                     balance,
                     balance_updated_at,
                     created_at: entry.created_at,
@@ -782,7 +782,7 @@ impl AdminService {
             total: snapshot.total,
             available: snapshot.available,
             current_id: exposed_current_id,
-            metadata_schema,
+            active_concurrency: snapshot.active_concurrency,
             credentials,
         }
     }

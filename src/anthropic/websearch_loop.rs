@@ -467,13 +467,10 @@ async fn run_round(
         }
     };
     let credential_id = call_result.credential_id;
-    let mut outcome = decode_round(
-        call_result.response,
-        &payload.model,
-        &conversion.tool_name_map,
-        tracer,
-    )
-    .await;
+    // 保活并发 guard 到本轮上游流解码完成
+    let _concurrency_guard = call_result.concurrency_guard;
+    let mut outcome =
+        decode_round(call_result.response, &payload.model, &conversion.tool_name_map).await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
     // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
     outcome.known_tool_names = conversion.known_tool_names;

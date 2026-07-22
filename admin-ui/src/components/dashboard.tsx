@@ -1479,8 +1479,65 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           description="管理 Kiro 的所有访问凭据、负载均衡与登录信息"
         />
 
-        {/* 状态标签条已下移到紧贴列表处（见下方 <StatusStrip />）：
-            它是列表的表头兼筛选器，放在标题下方会与它筛选的列表隔开两行工具栏。 */}
+        {/* 统计卡片 */}
+        <div className="mb-5 grid grid-cols-2 gap-2 sm:mb-6 sm:grid-cols-4 sm:gap-4">
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                凭据总数
+              </div>
+              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl">
+                {formatNumber(data?.total)}
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                可用凭据
+              </div>
+              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400 sm:mt-2 sm:text-3xl">
+                {formatNumber(data?.available)}
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                {loadBalancingData?.mode === "balanced" ? "调度模式" : "当前优先"}
+              </div>
+              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5 sm:mt-2 sm:gap-2">
+                <span className="truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  {loadBalancingData?.mode === "balanced"
+                    ? "均衡负载"
+                    : `#${data?.currentId || "-"}`}
+                </span>
+                {loadBalancingData?.mode === "balanced" ? (
+                  <Badge variant="secondary">动态选择</Badge>
+                ) : (
+                  data?.currentId && <Badge variant="success">当前优先</Badge>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                当前并发
+              </div>
+              <div
+                className={`mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl ${
+                  data?.activeConcurrency
+                    ? "text-blue-600 dark:text-blue-400"
+                    : ""
+                }`}
+                title="正在进行、尚未结束的请求总数（含流式响应期间）"
+              >
+                {formatNumber(data?.activeConcurrency)}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
 
         {/* 工具栏 */}
         <div className="mb-5 flex flex-col gap-3">

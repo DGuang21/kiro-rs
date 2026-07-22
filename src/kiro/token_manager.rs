@@ -950,6 +950,9 @@ struct CredentialEntry {
     last_self_heal_at: Option<DateTime<Utc>>,
     /// 当前连续自愈轮次对应的模型；None 表示 MCP/无模型请求。
     self_heal_model: Option<String>,
+    /// 当前该凭据的在途请求数（并发）。请求向上游发起时 +1，请求结束（含流式播完/
+    /// 客户端断开）时 -1。不持久化，仅用于展示实时并发。
+    in_flight: u32,
 }
 
 impl CredentialEntry {
@@ -1123,6 +1126,8 @@ pub struct CredentialEntrySnapshot {
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// 该凭据当前的在途请求数（并发）
+    pub in_flight: u32,
 }
 
 /// 凭据管理器状态快照
@@ -1137,6 +1142,23 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+    /// 全局在途请求总数（所有凭据在途数之和）
+    pub active_concurrency: u64,
+}
+
+/// 在途请求并发计数 guard。
+///
+/// 由 [`MultiTokenManager::begin_request`] 创建（对应凭据并发 +1），Drop 时对应凭据
+/// 并发 -1。流式请求需把它随响应流一起持有，直到流结束/客户端断开才 Drop。
+pub struct RequestGuard {
+    manager: Arc<MultiTokenManager>,
+    id: u64,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.manager.end_request(self.id);
+    }
 }
 
 #[derive(Clone)]
@@ -1373,6 +1395,7 @@ impl MultiTokenManager {
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
                     self_heal_model: cred.self_heal_model.clone(),
+                    in_flight: 0,
                 }
             })
             .collect();
@@ -1972,11 +1995,11 @@ impl MultiTokenManager {
                 // 优先级负载均衡：先取可用集合里最高优先级层（priority 值最小），
                 // 仅在该层内做 least-used 均衡。平局再按 id 保证确定性。
                 // 该层全部不可用时，min(priority) 自动落到下一层，实现逐层降级。
-                let top_priority = available.iter().map(|e| e.credentials.priority).min()?;
-                let entry = available
+                let top_priority = available.iter().map(|(e, _)| e.credentials.priority).min()?;
+                let (entry, _) = available
                     .iter()
-                    .filter(|e| e.credentials.priority == top_priority)
-                    .min_by_key(|e| (e.success_count, e.id))?;
+                    .filter(|(e, _)| e.credentials.priority == top_priority)
+                    .min_by_key(|(e, _)| (e.success_count, e.id))?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -1984,12 +2007,12 @@ impl MultiTokenManager {
                 // 优先级随机：先取可用集合里最高优先级层（priority 值最小），
                 // 在该层内随机选择一个账号；该层全部不可用时，min(priority) 自动
                 // 落到下一层，继续在下一层内随机选择，实现逐层随机降级。
-                let top_priority = available.iter().map(|e| e.credentials.priority).min()?;
+                let top_priority = available.iter().map(|(e, _)| e.credentials.priority).min()?;
                 let tier: Vec<_> = available
                     .iter()
-                    .filter(|e| e.credentials.priority == top_priority)
+                    .filter(|(e, _)| e.credentials.priority == top_priority)
                     .collect();
-                let entry = tier[fastrand::usize(..tier.len())];
+                let (entry, _) = tier[fastrand::usize(..tier.len())];
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -3079,6 +3102,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
             .count();
+        let active_concurrency: u64 = entries.iter().map(|e| e.in_flight as u64).sum();
 
         ManagerSnapshot {
             entries: entries
@@ -3145,11 +3169,38 @@ impl MultiTokenManager {
                     source_channel: e.credentials.source_channel.clone(),
                     metadata: e.credentials.metadata.clone(),
                     created_at: e.credentials.created_at.clone(),
+                    in_flight: e.in_flight,
                 })
                 .collect(),
             current_id,
             total: entries.len(),
             available,
+            active_concurrency,
+        }
+    }
+
+    /// 标记一次请求开始占用某凭据（并发 +1），返回在 Drop 时自动 -1 的 guard。
+    ///
+    /// 由 provider 在真正向上游发起 HTTP 请求前调用；guard 需在请求整个生命周期
+    /// （非流式：读完响应体；流式：SSE 流播完或客户端断开）内保持存活。
+    pub fn begin_request(self: &Arc<Self>, id: u64) -> RequestGuard {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.in_flight = entry.in_flight.saturating_add(1);
+            }
+        }
+        RequestGuard {
+            manager: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// 标记一次请求结束释放某凭据（并发 -1）。仅由 `RequestGuard::drop` 调用。
+    fn end_request(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
         }
     }
 
@@ -3918,6 +3969,7 @@ impl MultiTokenManager {
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
                 self_heal_model: None,
+                in_flight: 0,
             });
         }
 
@@ -7217,7 +7269,7 @@ mod tests {
         );
 
         // 顶层冷却 → 降级到 lo(id2)
-        manager.report_account_throttled(1, StdDuration::from_secs(600));
+        manager.report_account_throttled_for_request(1, StdDuration::from_secs(600), None, None);
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(2),
@@ -7283,7 +7335,7 @@ mod tests {
 
         // 顶层两个账号：禁用 A、冷却 B → 顶层耗尽，只剩低层 D(id3)
         manager.set_disabled(1, true).unwrap();
-        manager.report_account_throttled(2, StdDuration::from_secs(600));
+        manager.report_account_throttled_for_request(2, StdDuration::from_secs(600), None, None);
         for _ in 0..50 {
             assert_eq!(
                 manager.select_next_credential(None, None).map(|(id, _)| id),

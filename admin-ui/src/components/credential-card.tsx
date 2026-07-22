@@ -995,6 +995,22 @@ export function CredentialCard({
             <RotateCcw className="h-3 w-3 opacity-50" />
           </button>
         </div>
+
+        <div className="w-14 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            并发
+          </div>
+          <div
+            className={`mt-0.5 text-sm font-medium tabular-nums ${
+              credential.inFlight > 0
+                ? "text-blue-600 dark:text-blue-400"
+                : "text-muted-foreground"
+            }`}
+            title="该凭据当前的在途请求数（并发）"
+          >
+            {credential.inFlight}
+          </div>
+        </div>
       </div>
 
       <div className="hidden w-44 shrink-0 xl:block">
@@ -1263,6 +1279,60 @@ export function CredentialCard({
                   )}
                   <ScrollText className="h-2.5 w-2.5 opacity-50" />
                 </button>
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">刷新失败</dt>
+              <dd
+                className={`tabular-nums font-medium ${credential.refreshFailureCount > 0 ? "text-destructive" : ""}`}
+              >
+                {credential.refreshFailureCount}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">成功次数</dt>
+              <dd className="min-w-0">
+                <button
+                  type="button"
+                  onClick={handleResetSuccess}
+                  className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                  title="点击重置成功次数"
+                >
+                  {credential.successCount}
+                  <RotateCcw className="h-3 w-3 opacity-70" />
+                </button>
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">当前并发</dt>
+              <dd
+                className={`tabular-nums font-medium ${credential.inFlight > 0 ? "text-blue-600 dark:text-blue-400" : ""}`}
+                title="该凭据当前的在途请求数（并发）"
+              >
+                {credential.inFlight}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
+              <dt className="shrink-0 text-muted-foreground">最后调用</dt>
+              <dd className="min-w-0 truncate text-right font-medium">
+                {formatLastUsed(credential.lastUsedAt)}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+              <dt className="shrink-0 text-muted-foreground">添加时间</dt>
+              <dd
+                className="min-w-0 truncate text-right font-medium tabular-nums"
+                title={formatCreatedAtFull(credential.createdAt)}
+              >
+                {formatCreatedAt(credential.createdAt)}
+              </dd>
+            </div>
+            {credential.maskedApiKey && (
+              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+                <dt className="shrink-0 text-muted-foreground">API Key</dt>
+                <dd className="min-w-0 truncate text-right font-mono text-xs">
+                  {credential.maskedApiKey}
+                </dd>
               </div>
             </div>
 
