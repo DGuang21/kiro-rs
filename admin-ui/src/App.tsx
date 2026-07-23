@@ -12,7 +12,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, ScrollText, FolderTree, SlidersHorizontal } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Network } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
 import { tabFromHash } from "@/hooks/use-url-state";
@@ -53,19 +53,13 @@ const GroupsPage = lazy(() =>
     default: m.GroupsPage,
   })),
 );
-const SettingsPage = lazy(() =>
-  import("@/components/settings-page").then((m) => ({
-    default: m.SettingsPage,
+const ProxyPoolPage = lazy(() =>
+  import("@/components/proxy-pool-page").then((m) => ({
+    default: m.ProxyPoolPage,
   })),
 );
 
-type Tab =
-  | "overview"
-  | "credentials"
-  | "keys"
-  | "groups"
-  | "traces"
-  | "settings";
+type Tab = "overview" | "credentials" | "keys" | "groups" | "proxies" | "traces";
 
 const TABS: {
   key: Tab;
@@ -98,6 +92,12 @@ const TABS: {
     icon: <FolderTree className="h-3.5 w-3.5" />,
   },
   {
+    key: "proxies",
+    label: "代理池",
+    mobileLabel: "代理",
+    icon: <Network className="h-3.5 w-3.5" />,
+  },
+  {
     key: "traces",
     label: "请求日志",
     mobileLabel: "日志",
@@ -119,6 +119,7 @@ function readTabFromHash(): Tab {
     h === "credentials" ||
     h === "keys" ||
     h === "groups" ||
+    h === "proxies" ||
     h === "overview" ||
     h === "traces" ||
     h === "settings"
@@ -459,6 +460,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
         {tab === "keys" && <ClientKeysPage />}
         {tab === "groups" && <GroupsPage />}
+        {tab === "proxies" && <ProxyPoolPage />}
         {tab === "traces" && <TraceLogPage />}
         {tab === "settings" && <SettingsPage />}
       </Suspense>

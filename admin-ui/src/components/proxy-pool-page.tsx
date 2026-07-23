@@ -12,17 +12,15 @@ import {
   CheckCircle2,
   XCircle,
   HelpCircle,
+  RefreshCw,
+  Network,
 } from 'lucide-react'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 import {
   getProxyPool,
   addProxy,
@@ -38,32 +36,29 @@ import {
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import type { ProxyPoolEntry } from '@/types/api'
 
-interface ProxyPoolDialogProps {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  /** 点击"分配"按钮时的回调（传入代理 URL，用于编辑凭据） */
-  onSelectProxy?: (url: string) => void
-}
-
-
-export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPoolDialogProps) {
+/**
+ * 代理 IP 池管理页（独立 Tab）。
+ *
+ * 与原 ProxyPoolDialog 等价，但作为独立页面：可提前添加 / 批量导入代理、
+ * 单个或全部批量验活（健康检查）、设为全局代理、轮询分配给凭据。
+ */
+export function ProxyPoolPage() {
   const [newUrl, setNewUrl] = useState('')
   const [newLabel, setNewLabel] = useState('')
   const [batchText, setBatchText] = useState('')
   const [showBatch, setShowBatch] = useState(false)
   const [batchErrors, setBatchErrors] = useState<string[]>([])
   const queryClient = useQueryClient()
+  const confirm = useConfirm()
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ['proxy-pool'],
     queryFn: getProxyPool,
-    enabled: open,
   })
 
   const { data: globalProxyData } = useQuery({
     queryKey: ['global-proxy'],
     queryFn: getGlobalProxy,
-    enabled: open,
   })
 
   const setGlobalProxyMutation = useMutation({
@@ -166,6 +161,26 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     addMutation.mutate()
   }
 
+  const handleDelete = async (proxy: ProxyPoolEntry) => {
+    if (
+      proxy.credentialCount > 0 &&
+      !(await confirm({
+        title: '删除代理',
+        description: `该代理正被 ${proxy.credentialCount} 个凭据使用中，删除后这些凭据将回退到全局代理配置。确定删除吗？`,
+        confirmText: '删除',
+        destructive: true,
+      }))
+    )
+      return
+    deleteMutation.mutate(proxy.id)
+  }
+
+  const total = data?.total ?? 0
+  const proxies = data?.proxies ?? []
+  const enabledCount = proxies.filter((p) => p.enabled).length
+  const healthyCount = proxies.filter((p) => p.health === 'healthy').length
+  const unhealthyCount = proxies.filter((p) => p.health === 'unhealthy').length
+
   const renderHealthBadge = (proxy: ProxyPoolEntry) => {
     if (proxy.health === 'healthy') {
       return (
@@ -192,16 +207,57 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
-        <DialogHeader>
-          <DialogTitle>代理 IP 池管理</DialogTitle>
-        </DialogHeader>
+    <div className="space-y-5">
+      {/* 标题 */}
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px] flex items-center gap-2">
+            <Network className="h-6 w-6" />
+            代理 IP 池
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            提前添加、批量导入与批量验活代理；可设为全局代理或轮询分配给凭据
+          </p>
+        </div>
+        <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
+          <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+          刷新
+        </Button>
+      </div>
 
-        <div className="flex-1 overflow-y-auto space-y-4 py-2">
-          {/* 单条添加 */}
+      {/* 统计卡片 */}
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-4">
+        <Card>
+          <CardContent className="p-3 sm:p-5">
+            <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">代理总数</div>
+            <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl">{total}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-3 sm:p-5">
+            <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">已启用</div>
+            <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl">{enabledCount}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-3 sm:p-5">
+            <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">健康</div>
+            <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400 sm:mt-2 sm:text-3xl">{healthyCount}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-3 sm:p-5">
+            <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">异常</div>
+            <div className={`mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl ${unhealthyCount > 0 ? 'text-destructive' : ''}`}>{unhealthyCount}</div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* 添加 / 批量导入 */}
+      <Card>
+        <CardContent className="p-4 space-y-3">
           {!showBatch && (
-            <form onSubmit={handleAdd} className="flex gap-2">
+            <form onSubmit={handleAdd} className="flex flex-col gap-2 sm:flex-row">
               <Input
                 placeholder="代理 URL（如 socks5://user:pass@host:port）"
                 value={newUrl}
@@ -212,25 +268,21 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                 placeholder="备注（可选）"
                 value={newLabel}
                 onChange={(e) => setNewLabel(e.target.value)}
-                className="w-32"
+                className="sm:w-40"
               />
-              <Button type="submit" size="sm" disabled={addMutation.isPending || !newUrl.trim()}>
-                <Plus className="h-4 w-4 mr-1" />
-                添加
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => setShowBatch(true)}
-              >
-                <Upload className="h-4 w-4 mr-1" />
-                批量
-              </Button>
+              <div className="flex gap-2">
+                <Button type="submit" size="sm" disabled={addMutation.isPending || !newUrl.trim()}>
+                  <Plus className="h-4 w-4 mr-1" />
+                  添加
+                </Button>
+                <Button type="button" size="sm" variant="outline" onClick={() => setShowBatch(true)}>
+                  <Upload className="h-4 w-4 mr-1" />
+                  批量
+                </Button>
+              </div>
             </form>
           )}
 
-          {/* 批量导入 */}
           {showBatch && (
             <div className="space-y-2">
               <label className="text-sm font-medium">
@@ -258,7 +310,6 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                   {batchMutation.isSuccess ? '关闭' : '取消'}
                 </Button>
               </div>
-              {/* 批量导入失败明细 */}
               {batchErrors.length > 0 && (
                 <div className="text-xs text-muted-foreground space-y-1 max-h-24 overflow-y-auto border rounded-md p-2">
                   <div className="font-medium text-yellow-600 dark:text-yellow-400">跳过的条目：</div>
@@ -293,59 +344,59 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
               {currentGlobalProxy ? maskProxyUrl(currentGlobalProxy) : '未配置（直连）'}
             </div>
           </div>
+        </CardContent>
+      </Card>
 
-          {/* 代理列表 */}
-          <div className="space-y-1">
-            <div className="flex items-center justify-between">
-              <div className="text-sm text-muted-foreground">
-                共 {data?.total ?? 0} 个代理
+      {/* 代理列表 */}
+      <Card>
+        <CardContent className="p-4 space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-sm text-muted-foreground">共 {total} 个代理</div>
+            {total > 0 && (
+              <div className="flex items-center gap-1">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs"
+                  onClick={() => checkAllMutation.mutate()}
+                  disabled={checkAllMutation.isPending}
+                  title="对所有已启用代理执行健康检查（批量验活）"
+                >
+                  <Activity className="h-3 w-3 mr-1" />
+                  {checkAllMutation.isPending ? '检测中...' : '批量验活'}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs"
+                  onClick={() => assignRoundRobinMutation.mutate()}
+                  disabled={assignRoundRobinMutation.isPending}
+                  title="将可用代理轮询分配给所有凭据"
+                >
+                  <Shuffle className="h-3 w-3 mr-1" />
+                  轮询分配
+                </Button>
               </div>
-              {(data?.total ?? 0) > 0 && (
-                <div className="flex items-center gap-1">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 text-xs"
-                    onClick={() => checkAllMutation.mutate()}
-                    disabled={checkAllMutation.isPending}
-                    title="对所有已启用代理执行健康检查"
-                  >
-                    <Activity className="h-3 w-3 mr-1" />
-                    {checkAllMutation.isPending ? '检测中...' : '全部检测'}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 text-xs"
-                    onClick={() => assignRoundRobinMutation.mutate()}
-                    disabled={assignRoundRobinMutation.isPending}
-                    title="将可用代理轮询分配给所有凭据"
-                  >
-                    <Shuffle className="h-3 w-3 mr-1" />
-                    轮询分配
-                  </Button>
-                </div>
-              )}
+            )}
+          </div>
+
+          {isLoading && (
+            <div className="text-sm text-muted-foreground py-8 text-center">加载中...</div>
+          )}
+
+          {proxies.length === 0 && !isLoading && (
+            <div className="text-sm text-muted-foreground py-8 text-center">
+              暂无代理，请在上方添加或批量导入
             </div>
+          )}
 
-            {isLoading && (
-              <div className="text-sm text-muted-foreground py-4 text-center">加载中...</div>
-            )}
-
-            {data?.proxies.length === 0 && !isLoading && (
-              <div className="text-sm text-muted-foreground py-4 text-center">
-                暂无代理，请添加
-              </div>
-            )}
-
-            <div className="border rounded-md divide-y max-h-[320px] overflow-y-auto">
-              {data?.proxies.map((proxy: ProxyPoolEntry) => (
+          {proxies.length > 0 && (
+            <div className="border rounded-md divide-y">
+              {proxies.map((proxy) => (
                 <div key={proxy.id} className="flex items-center gap-3 p-3">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-xs truncate">
-                        {maskProxyUrl(proxy.url)}
-                      </span>
+                      <span className="font-mono text-xs truncate">{maskProxyUrl(proxy.url)}</span>
                       {proxy.label && (
                         <Badge variant="secondary" className="text-xs">{proxy.label}</Badge>
                       )}
@@ -381,19 +432,6 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       <Activity className="h-3 w-3 mr-1" />
                       {checkingId === proxy.id ? '测试中' : '测试'}
                     </Button>
-                    {onSelectProxy && proxy.enabled && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-7 text-xs"
-                        onClick={() => {
-                          onSelectProxy(proxy.url)
-                          onOpenChange(false)
-                        }}
-                      >
-                        选用
-                      </Button>
-                    )}
                     {proxy.enabled && proxy.url !== currentGlobalProxy && (
                       <Button
                         size="sm"
@@ -427,7 +465,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       size="sm"
                       variant="ghost"
                       className="h-7 w-7 p-0 text-destructive hover:text-destructive"
-                      onClick={() => deleteMutation.mutate(proxy.id)}
+                      onClick={() => handleDelete(proxy)}
                       disabled={deleteMutation.isPending}
                     >
                       <Trash2 className="h-4 w-4" />
@@ -436,9 +474,10 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                 </div>
               ))}
             </div>
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
+          )}
+        </CardContent>
+      </Card>
+    </div>
   )
 }
+
