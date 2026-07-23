@@ -39,6 +39,7 @@ import {
   ArrowUp,
   ArrowDown,
   Loader2,
+  PackageCheck,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -89,6 +90,7 @@ import {
 } from "@/components/batch-verify-dialog";
 import { detectTier, type Tier } from "@/components/subscription-badge";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
+import { RestockDialog } from "@/components/restock-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   useCredentials,
@@ -268,6 +270,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
+  const [restockDialogOpen, setRestockDialogOpen] = useState(false);
   const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
   const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
   const [newAdminKey, setNewAdminKey] = useState("");
@@ -1829,6 +1832,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 添加凭据
               </Button>
 
+              {/* 一键补货：从上游提货并批量入库 */}
+              <Button
+                onClick={() => setRestockDialogOpen(true)}
+                size="sm"
+                variant="outline"
+                className="w-full sm:w-auto"
+                title="从配置的上游渠道提货，批量入库并指定代理"
+              >
+                <PackageCheck className="h-3.5 w-3.5" />
+                一键补货
+              </Button>
+
               {/* 导入 / 登录折叠菜单 */}
               <DropdownMenu modal={false}>
                 <DropdownMenuTrigger asChild>
@@ -2356,6 +2371,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
+      />
+      <RestockDialog
+        open={restockDialogOpen}
+        onOpenChange={setRestockDialogOpen}
       />
       <ImageUpdateDialog
         open={imageUpdateDialogOpen}

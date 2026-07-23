@@ -12,7 +12,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Network } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Network, PackagePlus } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
 import { tabFromHash } from "@/hooks/use-url-state";
@@ -58,8 +58,20 @@ const ProxyPoolPage = lazy(() =>
     default: m.ProxyPoolPage,
   })),
 );
+const UpstreamPage = lazy(() =>
+  import("@/components/upstream-page").then((m) => ({
+    default: m.UpstreamPage,
+  })),
+);
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "proxies" | "traces";
+type Tab =
+  | "overview"
+  | "credentials"
+  | "keys"
+  | "groups"
+  | "proxies"
+  | "restock"
+  | "traces";
 
 const TABS: {
   key: Tab;
@@ -98,6 +110,12 @@ const TABS: {
     icon: <Network className="h-3.5 w-3.5" />,
   },
   {
+    key: "restock",
+    label: "补货上游",
+    mobileLabel: "补货",
+    icon: <PackagePlus className="h-3.5 w-3.5" />,
+  },
+  {
     key: "traces",
     label: "请求日志",
     mobileLabel: "日志",
@@ -120,6 +138,7 @@ function readTabFromHash(): Tab {
     h === "keys" ||
     h === "groups" ||
     h === "proxies" ||
+    h === "restock" ||
     h === "overview" ||
     h === "traces" ||
     h === "settings"
@@ -461,6 +480,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "keys" && <ClientKeysPage />}
         {tab === "groups" && <GroupsPage />}
         {tab === "proxies" && <ProxyPoolPage />}
+        {tab === "restock" && <UpstreamPage />}
         {tab === "traces" && <TraceLogPage />}
         {tab === "settings" && <SettingsPage />}
       </Suspense>

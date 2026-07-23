@@ -441,6 +441,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={batchText}
                     onChange={(e) => setBatchText(e.target.value)}
                     disabled={importing}
+                    autoComplete="off"
                     className="flex min-h-[120px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm font-mono placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 disabled:opacity-50"
                   />
                   <p className="text-xs text-muted-foreground">已解析 {batchLines.length} 个 API Key（自动去重）</p>
@@ -457,6 +458,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={kiroApiKey}
                     onChange={(e) => setKiroApiKey(e.target.value)}
                     disabled={isPending}
+                    autoComplete="new-password"
                   />
                 </div>
               )
@@ -470,6 +472,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={batchText}
                   onChange={(e) => setBatchText(e.target.value)}
                   disabled={importing}
+                  autoComplete="off"
                   className="flex min-h-[120px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm font-mono placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 disabled:opacity-50"
                 />
                 <p className="text-xs text-muted-foreground">已解析 {batchLines.length} 个 Token（自动去重）</p>
@@ -486,6 +489,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={refreshToken}
                   onChange={(e) => setRefreshToken(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
                 />
               </div>
             )}
@@ -500,6 +504,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={authRegion}
                   onChange={(e) => setAuthRegion(e.target.value)}
                   disabled={isPending || importing}
+                  autoComplete="off"
                 />
                 <Input
                   id="apiRegion"
@@ -507,6 +512,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={apiRegion}
                   onChange={(e) => setApiRegion(e.target.value)}
                   disabled={isPending || importing}
+                  autoComplete="off"
                 />
               </div>
               <p className="text-xs text-muted-foreground">
@@ -527,6 +533,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
                   />
                 </div>
                 <div className="space-y-2">
@@ -540,6 +547,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={clientSecret}
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
+                    autoComplete="new-password"
                   />
                 </div>
               </>
@@ -559,6 +567,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending || importing}
+                    autoComplete="off"
                   />
                 </div>
                 <div className="space-y-2">
@@ -572,6 +581,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={tokenEndpoint}
                     onChange={(e) => setTokenEndpoint(e.target.value)}
                     disabled={isPending || importing}
+                    autoComplete="off"
                   />
                   <p className="text-xs text-muted-foreground">
                     仅允许 *.microsoftonline.com / .us / .cn 主机（https）
@@ -585,6 +595,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={issuerUrl}
                     onChange={(e) => setIssuerUrl(e.target.value)}
                     disabled={isPending || importing}
+                    autoComplete="off"
                   />
                 </div>
                 <div className="space-y-2">
@@ -595,6 +606,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                     value={scopes}
                     onChange={(e) => setScopes(e.target.value)}
                     disabled={isPending || importing}
+                    autoComplete="off"
                   />
                 </div>
               </>
@@ -610,6 +622,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={machineId}
                   onChange={(e) => setMachineId(e.target.value)}
                   disabled={isPending}
+                  autoComplete="off"
                 />
                 <p className="text-xs text-muted-foreground">
                   可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
@@ -626,6 +639,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 value={endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
                 disabled={isPending || importing}
+                autoComplete="off"
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
@@ -655,6 +669,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 value={sourceChannel}
                 onChange={(e) => setSourceChannel(e.target.value)}
                 disabled={isPending || importing}
+                autoComplete="off"
               />
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪{useBatch && '（所有凭据共用）'}
@@ -759,6 +774,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={proxyUsername}
                   onChange={(e) => setProxyUsername(e.target.value)}
                   disabled={isPending || importing}
+                  autoComplete="off"
                 />
                 <Input
                   id="proxyPassword"
@@ -767,6 +783,7 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                   value={proxyPassword}
                   onChange={(e) => setProxyPassword(e.target.value)}
                   disabled={isPending || importing}
+                  autoComplete="new-password"
                 />
               </div>
               <p className="text-xs text-muted-foreground">
