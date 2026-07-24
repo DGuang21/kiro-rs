@@ -34,6 +34,12 @@ use super::{
         update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
+    upstream_handlers::{
+        create_upstream, delete_upstream, list_upstreams, receive_webhook, update_upstream,
+        upstream_created_at, upstream_events, upstream_keys, upstream_orders, upstream_profile,
+        upstream_purchase, upstream_register_webhook, upstream_status, upstream_stock,
+        upstream_test_webhook,
+    },
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -205,6 +211,28 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-key", get(stats_by_key))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))
+        // 补货上游
+        .route(
+            "/upstream",
+            get(list_upstreams).post(create_upstream),
+        )
+        .route("/upstream/events", get(upstream_events))
+        .route(
+            "/upstream/{id}",
+            put(update_upstream).delete(delete_upstream),
+        )
+        .route("/upstream/{id}/stock", get(upstream_stock))
+        .route("/upstream/{id}/profile", get(upstream_profile))
+        .route("/upstream/{id}/keys", get(upstream_keys))
+        .route("/upstream/{id}/created-at", get(upstream_created_at))
+        .route("/upstream/{id}/orders", get(upstream_orders))
+        .route("/upstream/{id}/status", get(upstream_status))
+        .route("/upstream/{id}/purchase", post(upstream_purchase))
+        .route(
+            "/upstream/{id}/webhook/register",
+            post(upstream_register_webhook),
+        )
+        .route("/upstream/{id}/webhook/test", post(upstream_test_webhook))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
@@ -213,5 +241,15 @@ pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
         .merge(authenticated)
         .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_SIZE))
+        .with_state(state)
+}
+
+/// 创建公共 webhook 接收路由（**不经过 admin 鉴权**）
+///
+/// 上游无法携带本服务的 adminApiKey，因此靠 path 中的 per-upstream 随机 token 鉴别来源。
+/// 挂在顶层 app 的 `/api/upstream/webhook/{token}`。
+pub fn create_upstream_webhook_router(state: AdminState) -> Router {
+    Router::new()
+        .route("/webhook/{token}", post(receive_webhook))
         .with_state(state)
 }

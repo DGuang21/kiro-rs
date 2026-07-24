@@ -16,6 +16,7 @@ use super::client_keys::SharedClientKeyManager;
 use super::groups::SharedGroupManager;
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
+use super::upstream::{SharedUpstreamEventLog, SharedUpstreamManager};
 use super::usage_stats::SharedAggregator;
 use super::trace_db::SharedTraceStore;
 use crate::common::auth;
@@ -35,9 +36,14 @@ pub struct AdminState {
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
+    /// 补货上游配置（持久化到 upstreams.json）
+    pub upstreams: SharedUpstreamManager,
+    /// 补货上游事件日志（持久化到 upstream_events.json）
+    pub upstream_events: SharedUpstreamEventLog,
 }
 
 impl AdminState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         admin_api_key: impl Into<String>,
         service: AdminService,
@@ -45,6 +51,8 @@ impl AdminState {
         usage_aggregator: SharedAggregator,
         trace_store: SharedTraceStore,
         groups: SharedGroupManager,
+        upstreams: SharedUpstreamManager,
+        upstream_events: SharedUpstreamEventLog,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
@@ -53,6 +61,8 @@ impl AdminState {
             usage_aggregator,
             trace_store,
             groups,
+            upstreams,
+            upstream_events,
         }
     }
 }

@@ -9,14 +9,19 @@ import {
   KeyRound,
   Webhook,
   RefreshCw,
-  Copy,
   Loader2,
   Info,
+  Copy,
+  Zap,
+  CheckCircle2,
+  XCircle,
+  AlertCircle,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import {
   Dialog,
   DialogContent,
@@ -25,82 +30,181 @@ import {
   DialogFooter,
   DialogDescription,
 } from '@/components/ui/dialog'
-import { useConfirm } from '@/components/ui/confirm-dialog'
-import { useUpstreams, useSaveUpstream, useDeleteUpstream } from '@/hooks/use-upstream'
 import {
-  queryUpstreamBalance,
-  extractUpstreamKeys,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from '@/components/ui/select'
+import { useConfirm } from '@/components/ui/confirm-dialog'
+import { GroupMultiSelect } from '@/components/group-select'
+import { useGroupOptions } from '@/hooks/use-groups'
+import {
+  useUpstreams,
+  useUpstreamEvents,
+  useCreateUpstream,
+  useUpdateUpstream,
+  useDeleteUpstream,
+} from '@/hooks/use-upstream'
+import {
+  queryUpstreamStock,
+  queryUpstreamProfile,
+  purchaseUpstream,
+  registerUpstreamWebhook,
   testUpstreamWebhook,
+  queryUpstreamCreatedAt,
+  queryUpstreamOrders,
+  queryUpstreamStatus,
   type UpstreamConfig,
-  type UpstreamBalance,
+  type UpstreamProfile,
+  type UpstreamEvent,
+  type KeysCreatedAt,
+  type UpstreamOrder,
+  type PurchaseSchedule,
+  type PeakWindow,
 } from '@/api/upstream'
 import { extractErrorMessage } from '@/lib/utils'
-type EditTarget = (Partial<UpstreamConfig> & { name: string }) | null
+
+/** 提货量展示：0 = 提满 */
+function fmtCount(n: number): string {
+  return n > 0 ? `×${n}` : '提满'
+}
+interface EditState {
+  id?: string
+  name: string
+  baseUrl: string
+  apiKey: string
+  receiverBaseUrl: string
+  autoPurchaseEnabled: boolean
+  autoPurchaseCount: string
+  // 分时段：多条高峰规则 + 高峰/低谷两档
+  scheduleEnabled: boolean
+  peakWindows: PeakWindow[]
+  peakCount: string
+  offpeakCount: string
+  endpoint: string
+  groups: string[]
+  note: string
+}
+
+const emptyEdit: EditState = {
+  name: '',
+  baseUrl: '',
+  apiKey: '',
+  receiverBaseUrl: '',
+  autoPurchaseEnabled: false,
+  autoPurchaseCount: '0',
+  scheduleEnabled: false,
+  peakWindows: [],
+  peakCount: '0',
+  offpeakCount: '0',
+  endpoint: '',
+  groups: [],
+  note: '',
+}
+
+/** 星期几标签（0=周日…6=周六，与 JS Date.getDay 一致） */
+const WEEKDAY_LABELS = ['日', '一', '二', '三', '四', '五', '六']
 
 /**
  * 补货上游管理页（Tab）。
  *
- * ⚠️ 当前为 Mock：上游配置存 localStorage，"查询余额 / 提取新 KEY / Webhook"
- * 均返回模拟数据。拿到真实上游 API 后替换 api/upstream.ts 里的 mock 函数即可。
- *
- * 基础能力：
- * - 上游 CRUD（配置 URL + API Key + 各路径）
- * - 查询余额（余额 / 剩余可提取 KEY 数 / 单价）
- * - 提取新 API KEY（此页仅提取展示；批量入库走凭据页「一键补货」）
- * - Webhook 配置与连通性测试
+ * 基础能力：上游 CRUD（URL + usr-key）、查询余额/库存、手动提号入库、
+ * 配置自动提号（低消：收到 new_keys_available 自动提）、注册/测试 Webhook、事件日志。
  */
 export function UpstreamPage() {
   const { data: upstreams, isLoading, isFetching, refetch } = useUpstreams()
-  const saveUpstream = useSaveUpstream()
+  const { data: events } = useUpstreamEvents()
+  const createUpstream = useCreateUpstream()
+  const updateUpstream = useUpdateUpstream()
   const deleteUpstream = useDeleteUpstream()
   const confirm = useConfirm()
+  const groupOptions = useGroupOptions()
 
-  // 编辑 / 新建
   const [editOpen, setEditOpen] = useState(false)
-  const [editTarget, setEditTarget] = useState<EditTarget>(null)
+  const [edit, setEdit] = useState<EditState>(emptyEdit)
 
-  // 余额缓存：id → 结果
-  const [balances, setBalances] = useState<Record<string, UpstreamBalance>>({})
-  const [balanceLoading, setBalanceLoading] = useState<string | null>(null)
-
-  // 提取 KEY 弹窗
-  const [extractTarget, setExtractTarget] = useState<UpstreamConfig | null>(null)
-
-  // Webhook 弹窗
-  const [webhookTarget, setWebhookTarget] = useState<UpstreamConfig | null>(null)
+  // 余额 / 库存缓存：id → 结果
+  const [profiles, setProfiles] = useState<Record<string, UpstreamProfile & { max?: number }>>({})
+  const [loadingId, setLoadingId] = useState<string | null>(null)
+  const [purchasingId, setPurchasingId] = useState<string | null>(null)
 
   const list = upstreams ?? []
 
   const openCreate = () => {
-    setEditTarget({
-      name: '',
-      baseUrl: '',
-      apiKey: '',
-      balancePath: '/v1/balance',
-      extractPath: '/v1/keys/issue',
-      webhookUrl: '',
-      note: '',
-    })
+    setEdit(emptyEdit)
     setEditOpen(true)
   }
 
   const openEdit = (u: UpstreamConfig) => {
-    setEditTarget({ ...u })
+    const s = u.schedule
+    setEdit({
+      id: u.id,
+      name: u.name,
+      baseUrl: u.baseUrl,
+      apiKey: '', // 不回填明文，留空表示不改
+      receiverBaseUrl: u.receiverBaseUrl ?? '',
+      autoPurchaseEnabled: u.autoPurchaseEnabled,
+      autoPurchaseCount: String(u.autoPurchaseCount),
+      scheduleEnabled: s?.enabled ?? false,
+      peakWindows: s?.peakWindows ?? [],
+      peakCount: String(s?.peakCount ?? 0),
+      offpeakCount: String(s?.offpeakCount ?? 0),
+      endpoint: u.endpoint ?? '',
+      groups: u.groups ?? [],
+      note: u.note ?? '',
+    })
     setEditOpen(true)
   }
 
   const handleSave = async () => {
-    if (!editTarget) return
-    if (!editTarget.name.trim()) {
+    if (!edit.name.trim()) {
       toast.error('上游名称不能为空')
       return
     }
+    const count = parseInt(edit.autoPurchaseCount, 10)
+    const toCount = (s: string) => {
+      const n = parseInt(s, 10)
+      return Number.isNaN(n) || n < 0 ? 0 : n
+    }
+    // 校验：开启分时段但没配任何高峰规则
+    if (edit.scheduleEnabled && edit.peakWindows.length === 0) {
+      toast.error('已开启分时段，请至少添加一条高峰时段规则')
+      return
+    }
+    const schedule: PurchaseSchedule = {
+      enabled: edit.scheduleEnabled,
+      peakWindows: edit.peakWindows,
+      peakCount: toCount(edit.peakCount),
+      offpeakCount: toCount(edit.offpeakCount),
+    }
+    const req = {
+      name: edit.name.trim(),
+      baseUrl: edit.baseUrl.trim(),
+      receiverBaseUrl: edit.receiverBaseUrl.trim() || null,
+      autoPurchaseEnabled: edit.autoPurchaseEnabled,
+      autoPurchaseCount: Number.isNaN(count) || count < 0 ? 0 : count,
+      schedule,
+      endpoint: edit.endpoint.trim() || null,
+      groups: edit.groups,
+      note: edit.note.trim() || null,
+    }
     try {
-      await saveUpstream.mutateAsync({
-        ...editTarget,
-        name: editTarget.name.trim(),
-      })
-      toast.success(editTarget.id ? '上游已更新' : '上游已添加')
+      if (edit.id) {
+        await updateUpstream.mutateAsync({
+          id: edit.id,
+          req: { ...req, apiKey: edit.apiKey.trim() || undefined },
+        })
+        toast.success('上游已更新')
+      } else {
+        if (!edit.apiKey.trim()) {
+          toast.error('上游 API Key 不能为空')
+          return
+        }
+        await createUpstream.mutateAsync({ ...req, apiKey: edit.apiKey.trim() })
+        toast.success('上游已添加')
+      }
       setEditOpen(false)
     } catch (e) {
       toast.error(extractErrorMessage(e))
@@ -125,16 +229,55 @@ export function UpstreamPage() {
     }
   }
 
-  const handleQueryBalance = async (u: UpstreamConfig) => {
-    setBalanceLoading(u.id)
+  // 查询余额 + 库存（并发两个请求）
+  const handleQuery = async (u: UpstreamConfig) => {
+    setLoadingId(u.id)
     try {
-      const b = await queryUpstreamBalance(u.id)
-      setBalances((prev) => ({ ...prev, [u.id]: b }))
-      toast.success(`${u.name}：余额 ${b.currency}${b.balance}，剩余 ${b.remainingKeys} 个`)
-    } catch (e) {
-      toast.error('查询失败: ' + extractErrorMessage(e))
+      const [profile, stock] = await Promise.allSettled([
+        queryUpstreamProfile(u.id),
+        queryUpstreamStock(u.id),
+      ])
+      const merged: UpstreamProfile & { max?: number } = {}
+      if (profile.status === 'fulfilled') Object.assign(merged, profile.value)
+      if (stock.status === 'fulfilled') merged.max = stock.value.max
+      setProfiles((prev) => ({ ...prev, [u.id]: merged }))
+      if (profile.status === 'rejected' && stock.status === 'rejected') {
+        toast.error('查询失败: ' + extractErrorMessage(stock.reason))
+      } else {
+        toast.success(
+          `${u.name}：余额 ${merged.remaining ?? '-'}，可提取 ${merged.max ?? '-'} 个`,
+        )
+      }
     } finally {
-      setBalanceLoading(null)
+      setLoadingId(null)
+    }
+  }
+
+  // 手动提号：必须指定数量（弹窗输入）
+  const [purchaseTarget, setPurchaseTarget] = useState<UpstreamConfig | null>(null)
+  const [purchaseCount, setPurchaseCount] = useState('')
+
+  const openPurchase = (u: UpstreamConfig) => {
+    setPurchaseTarget(u)
+    setPurchaseCount('')
+  }
+
+  const handlePurchase = async () => {
+    if (!purchaseTarget) return
+    const n = parseInt(purchaseCount, 10)
+    if (!purchaseCount.trim() || Number.isNaN(n) || n <= 0) {
+      toast.error('请填写提货数量（≥ 1）')
+      return
+    }
+    setPurchasingId(purchaseTarget.id)
+    try {
+      const res = await purchaseUpstream(purchaseTarget.id, n)
+      toast.success(`提号完成：出 Key ${res.purchased} 个，入库 ${res.imported} 个`)
+      setPurchaseTarget(null)
+    } catch (e) {
+      toast.error('提号失败: ' + extractErrorMessage(e))
+    } finally {
+      setPurchasingId(null)
     }
   }
 
@@ -147,9 +290,6 @@ export function UpstreamPage() {
             <PackagePlus className="h-6 w-6" />
             补货上游
           </h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            配置上游提货渠道（URL + API Key），查询余额、提取新 KEY、配置 Webhook
-          </p>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
@@ -161,14 +301,6 @@ export function UpstreamPage() {
             添加上游
           </Button>
         </div>
-      </div>
-
-      {/* Mock 提示条 */}
-      <div className="flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3.5 py-2.5 text-sm text-amber-700 dark:text-amber-400">
-        <Info className="mt-0.5 h-4 w-4 shrink-0" />
-        <span>
-          当前为 <b>Mock 演示</b>：查询余额 / 提取 KEY / Webhook 均返回模拟数据。等接入真实上游 API 后即可切换为真实调用。
-        </span>
       </div>
 
       {/* 列表 */}
@@ -187,11 +319,11 @@ export function UpstreamPage() {
             <UpstreamCard
               key={u.id}
               upstream={u}
-              balance={balances[u.id]}
-              balanceLoading={balanceLoading === u.id}
-              onQueryBalance={() => handleQueryBalance(u)}
-              onExtract={() => setExtractTarget(u)}
-              onWebhook={() => setWebhookTarget(u)}
+              profile={profiles[u.id]}
+              loading={loadingId === u.id}
+              purchasing={purchasingId === u.id}
+              onQuery={() => handleQuery(u)}
+              onPurchase={() => openPurchase(u)}
               onEdit={() => openEdit(u)}
               onDelete={() => handleDelete(u)}
             />
@@ -199,16 +331,57 @@ export function UpstreamPage() {
         </div>
       )}
 
+      {/* 事件日志 */}
+      <EventLog events={events ?? []} />
+
       <UpstreamEditDialog
         open={editOpen}
         onOpenChange={setEditOpen}
-        target={editTarget}
-        onChange={setEditTarget}
+        edit={edit}
+        onChange={setEdit}
         onSave={handleSave}
-        saving={saveUpstream.isPending}
+        saving={createUpstream.isPending || updateUpstream.isPending}
+        groupOptions={groupOptions}
       />
-      <ExtractKeysDialog upstream={extractTarget} onClose={() => setExtractTarget(null)} />
-      <WebhookDialog upstream={webhookTarget} onClose={() => setWebhookTarget(null)} />
+
+      {/* 手动提号数量弹窗（必须填数量） */}
+      <Dialog open={!!purchaseTarget} onOpenChange={(o) => !o && setPurchaseTarget(null)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>提号入库 · {purchaseTarget?.name}</DialogTitle>
+            <DialogDescription>
+              手动提号必须指定数量。将提取并作为 api_key 凭据入库（代理池轮询分配），产生真实消费。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5 py-2">
+            <label className="text-sm font-medium">提货数量 <span className="text-red-500">*</span></label>
+            <Input
+              type="number"
+              min={1}
+              max={purchaseTarget ? profiles[purchaseTarget.id]?.max ?? undefined : undefined}
+              placeholder={
+                purchaseTarget && profiles[purchaseTarget.id]?.max
+                  ? `1 ~ ${profiles[purchaseTarget.id]?.max}`
+                  : '请输入要提取的数量'
+              }
+              value={purchaseCount}
+              onChange={(e) => setPurchaseCount(e.target.value)}
+              disabled={!!purchasingId}
+              autoFocus
+              autoComplete="off"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPurchaseTarget(null)} disabled={!!purchasingId}>
+              取消
+            </Button>
+            <Button onClick={handlePurchase} disabled={!!purchasingId || !purchaseCount.trim()}>
+              {purchasingId ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <KeyRound className="h-4 w-4 mr-1" />}
+              提号入库
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
@@ -216,35 +389,81 @@ export function UpstreamPage() {
 
 function UpstreamCard({
   upstream,
-  balance,
-  balanceLoading,
-  onQueryBalance,
-  onExtract,
-  onWebhook,
+  profile,
+  loading,
+  purchasing,
+  onQuery,
+  onPurchase,
   onEdit,
   onDelete,
 }: {
   upstream: UpstreamConfig
-  balance?: UpstreamBalance
-  balanceLoading: boolean
-  onQueryBalance: () => void
-  onExtract: () => void
-  onWebhook: () => void
+  profile?: UpstreamProfile & { max?: number }
+  loading: boolean
+  purchasing: boolean
+  onQuery: () => void
+  onPurchase: () => void
   onEdit: () => void
   onDelete: () => void
 }) {
+  const [registering, setRegistering] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [detailsOpen, setDetailsOpen] = useState(false)
+
+  const copyWebhook = async () => {
+    if (!upstream.webhookReceiverUrl) return
+    try {
+      await navigator.clipboard.writeText(upstream.webhookReceiverUrl)
+      toast.success('已复制 Webhook 接收地址')
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  const handleRegister = async () => {
+    setRegistering(true)
+    try {
+      const res = await registerUpstreamWebhook(upstream.id)
+      toast.success(res.message)
+    } catch (e) {
+      toast.error('注册失败: ' + extractErrorMessage(e))
+    } finally {
+      setRegistering(false)
+    }
+  }
+
+  const handleTest = async () => {
+    setTesting(true)
+    try {
+      const res = await testUpstreamWebhook(upstream.id)
+      toast.success(res.message)
+    } catch (e) {
+      toast.error('测试失败: ' + extractErrorMessage(e))
+    } finally {
+      setTesting(false)
+    }
+  }
+
   return (
-    <Card>
+    <Card className="min-w-0">
       <CardContent className="p-4 space-y-3">
         <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <div className="font-medium truncate">{upstream.name}</div>
-            <div className="text-xs text-muted-foreground font-mono truncate">
-              {upstream.baseUrl || '未配置 URL'}
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-medium truncate">{upstream.name}</span>
+              {!upstream.enabled && <Badge variant="outline" className="text-xs text-muted-foreground">已禁用</Badge>}
+              {upstream.autoPurchaseEnabled && (
+                <Badge variant="secondary" className="text-xs gap-1 shrink-0">
+                  <Zap className="h-3 w-3" />
+                  {upstream.schedule?.enabled && upstream.schedule.peakWindows.length > 0
+                    ? `分时 高峰${fmtCount(upstream.schedule.peakCount)}/低谷${fmtCount(upstream.schedule.offpeakCount)}`
+                    : `自动提号 ${fmtCount(upstream.autoPurchaseCount)}`}
+                </Badge>
+              )}
             </div>
-            {upstream.note && (
-              <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{upstream.note}</p>
-            )}
+            <div className="text-xs text-muted-foreground font-mono truncate">{upstream.baseUrl || '未配置 URL'}</div>
+            <div className="text-xs text-muted-foreground font-mono truncate">Key: {upstream.maskedApiKey}</div>
+            {upstream.note && <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{upstream.note}</p>}
           </div>
           <div className="flex shrink-0 items-center gap-1">
             <Button size="icon" variant="ghost" className="h-7 w-7" onClick={onEdit} title="编辑">
@@ -262,38 +481,393 @@ function UpstreamCard({
           </div>
         </div>
 
-        {/* 余额展示 */}
-        {balance && (
+        {/* 余额 / 库存 */}
+        {profile && (
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <Badge variant="secondary" className="gap-1">
-              <Wallet className="h-3 w-3" />
-              余额 {balance.currency}{balance.balance}
-            </Badge>
-            <Badge variant="secondary" className="gap-1">
-              <KeyRound className="h-3 w-3" />
-              剩余 {balance.remainingKeys} 个
-            </Badge>
-            <Badge variant="outline">单价 {balance.currency}{balance.unitPrice}/个</Badge>
+            {profile.remaining != null && (
+              <Badge variant="secondary" className="gap-1"><Wallet className="h-3 w-3" />余额 {profile.remaining}</Badge>
+            )}
+            {profile.max != null && (
+              <Badge variant="secondary" className="gap-1"><KeyRound className="h-3 w-3" />可提取 {profile.max} 个</Badge>
+            )}
           </div>
+        )}
+
+        {/* Webhook 接收地址 */}
+        {upstream.webhookReceiverUrl ? (
+          <div className="flex items-center gap-1.5 rounded-md bg-secondary/40 px-2 py-1.5">
+            <Webhook className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span className="flex-1 min-w-0 truncate font-mono text-[11px]" title={upstream.webhookReceiverUrl}>
+              {upstream.webhookReceiverUrl}
+            </span>
+            <Button size="icon" variant="ghost" className="h-6 w-6" onClick={copyWebhook} title="复制接收地址">
+              <Copy className="h-3 w-3" />
+            </Button>
+          </div>
+        ) : (
+          <p className="text-[11px] text-muted-foreground">未配置「本服务对外地址」，无法生成 Webhook 接收地址</p>
         )}
 
         {/* 操作 */}
         <div className="flex flex-wrap items-center gap-1.5">
-          <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onQueryBalance} disabled={balanceLoading}>
-            {balanceLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />}
+          <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onQuery} disabled={loading}>
+            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />}
             查询余额
           </Button>
-          <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onExtract}>
-            <KeyRound className="h-3.5 w-3.5" />
-            提取新 KEY
+          <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onPurchase} disabled={purchasing}>
+            {purchasing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
+            提号入库
           </Button>
-          <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onWebhook}>
-            <Webhook className="h-3.5 w-3.5" />
-            Webhook
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8 text-xs"
+            onClick={handleRegister}
+            disabled={registering || !upstream.webhookReceiverUrl}
+            title={upstream.webhookReceiverUrl ? '把接收地址注册到上游' : '请先配置本服务对外地址'}
+          >
+            {registering ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Webhook className="h-3.5 w-3.5" />}
+            注册 Webhook
+          </Button>
+          <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={handleTest} disabled={testing}>
+            {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+            测试推送
+          </Button>
+          <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={() => setDetailsOpen(true)}>
+            <Info className="h-3.5 w-3.5" />
+            详情
           </Button>
         </div>
       </CardContent>
+      <UpstreamDetailsDialog upstream={upstream} open={detailsOpen} onOpenChange={setDetailsOpen} />
     </Card>
+  )
+}
+
+// ── 上游详情弹窗：有效期起点 / 最近订单 / 系统库存 ───────────────────────────
+
+function UpstreamDetailsDialog({
+  upstream,
+  open,
+  onOpenChange,
+}: {
+  upstream: UpstreamConfig
+  open: boolean
+  onOpenChange: (o: boolean) => void
+}) {
+  const [loading, setLoading] = useState(false)
+  const [createdAt, setCreatedAt] = useState<KeysCreatedAt | null>(null)
+  const [orders, setOrders] = useState<UpstreamOrder[]>([])
+  const [status, setStatus] = useState<Record<string, unknown> | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  // 打开时并发拉取三类信息
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setLoading(true)
+    setErr(null)
+    Promise.allSettled([
+      queryUpstreamCreatedAt(upstream.id),
+      queryUpstreamOrders(upstream.id),
+      queryUpstreamStatus(upstream.id),
+    ]).then(([ca, od, st]) => {
+      if (cancelled) return
+      if (ca.status === 'fulfilled') setCreatedAt(ca.value)
+      if (od.status === 'fulfilled') setOrders(od.value)
+      if (st.status === 'fulfilled') setStatus(st.value)
+      if (ca.status === 'rejected' && od.status === 'rejected' && st.status === 'rejected') {
+        setErr(extractErrorMessage(ca.reason))
+      }
+      setLoading(false)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [open, upstream.id])
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
+        <DialogHeader>
+          <DialogTitle>上游详情 · {upstream.name}</DialogTitle>
+          <DialogDescription>账号有效期起点、最近提取订单与系统库存（实时查询上游）</DialogDescription>
+        </DialogHeader>
+        <div className="flex-1 overflow-y-auto space-y-4 py-2 pr-1">
+          {loading ? (
+            <div className="py-8 text-center text-sm text-muted-foreground">
+              <Loader2 className="h-5 w-5 animate-spin mx-auto mb-2" />查询中…
+            </div>
+          ) : err ? (
+            <div className="py-6 text-center text-sm text-destructive">{err}</div>
+          ) : (
+            <>
+              {/* 有效期起点 */}
+              <div className="space-y-1.5">
+                <h3 className="text-sm font-medium">账号有效期起点</h3>
+                <div className="rounded-lg border p-3 text-sm">
+                  {createdAt?.createdAt ? (
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono">{createdAt.createdAt}</span>
+                      <Badge variant="secondary" className="text-xs">共 {createdAt.keyCount} 条 Key 记录</Badge>
+                    </div>
+                  ) : (
+                    <span className="text-muted-foreground">该账号暂无 Key 记录</span>
+                  )}
+                </div>
+              </div>
+
+              {/* 系统库存 */}
+              <div className="space-y-1.5">
+                <h3 className="text-sm font-medium">系统状态 / 库存</h3>
+                {status ? (
+                  <div className="flex flex-wrap gap-2">
+                    {statusBadges(status)}
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">未获取到系统状态</p>
+                )}
+              </div>
+
+              {/* 最近订单 */}
+              <div className="space-y-1.5">
+                <h3 className="text-sm font-medium">最近提取订单（{orders.length}）</h3>
+                {orders.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">暂无订单</p>
+                ) : (
+                  <div className="border rounded-md divide-y max-h-[220px] overflow-y-auto">
+                    {orders.map((o, i) => (
+                      <div key={o.clientOrderId ?? i} className="flex items-center justify-between gap-2 p-2 text-xs">
+                        <span className="font-mono truncate" title={o.clientOrderId}>
+                          {o.clientOrderId ? `${o.clientOrderId.slice(0, 8)}…` : `#${i + 1}`}
+                        </span>
+                        <span className="text-muted-foreground">
+                          请求 {o.requested ?? '-'} / 交付 {o.purchased ?? '-'}
+                        </span>
+                        <span className="text-muted-foreground shrink-0">{o.createdAt ?? ''}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>关闭</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// 把 /api/status 里的常见数值字段渲染成 Badge（宽松，未知结构也不报错）
+function statusBadges(status: Record<string, unknown>) {
+  const labels: Record<string, string> = {
+    keys_active: '可用',
+    keys_dead: '失效',
+    keys_stock: '库存',
+    generating: '生成中',
+  }
+  const items = Object.entries(labels)
+    .filter(([k]) => k in status)
+    .map(([k, label]) => {
+      const v = status[k]
+      const text = typeof v === 'boolean' ? (v ? '是' : '否') : String(v)
+      return (
+        <Badge key={k} variant="secondary" className="text-xs">
+          {label} {text}
+        </Badge>
+      )
+    })
+  return items.length > 0 ? (
+    items
+  ) : (
+    <span className="text-sm text-muted-foreground">（无可识别的库存字段）</span>
+  )
+}
+
+// ── 事件日志 ─────────────────────────────────────────────────────────────────
+
+function eventIcon(e: UpstreamEvent) {
+  if (!e.ok) return <XCircle className="h-4 w-4 text-red-500 shrink-0" />
+  switch (e.kind) {
+    case 'new_keys_available':
+      return <Zap className="h-4 w-4 text-sky-500 shrink-0" />
+    case 'all_keys_dead':
+      return <AlertCircle className="h-4 w-4 text-yellow-500 shrink-0" />
+    case 'auto_purchase':
+    case 'manual_purchase':
+      return <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
+    default:
+      return <Info className="h-4 w-4 text-muted-foreground shrink-0" />
+  }
+}
+
+function EventLog({ events }: { events: UpstreamEvent[] }) {
+  return (
+    <Card>
+      <CardContent className="p-4 space-y-2">
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold">事件日志</h2>
+          <Badge variant="secondary" className="text-xs">{events.length}</Badge>
+        </div>
+        {events.length === 0 ? (
+          <p className="py-6 text-center text-sm text-muted-foreground">暂无事件</p>
+        ) : (
+          <div className="border rounded-md divide-y max-h-[360px] overflow-y-auto">
+            {events.map((e) => (
+              <div key={e.id} className="flex items-start gap-2 p-2.5">
+                {eventIcon(e)}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs font-medium">{e.upstreamName}</span>
+                    <span className="text-[11px] text-muted-foreground">{new Date(e.createdAt).toLocaleString()}</span>
+                  </div>
+                  <div className="text-xs text-muted-foreground">{e.message}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+// ── 高峰时段规则编辑器（多条：星期几 + 起止整点）────────────────────────────
+
+const HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => h)
+
+function PeakWindowEditor({
+  windows,
+  onChange,
+  disabled,
+}: {
+  windows: PeakWindow[]
+  onChange: (w: PeakWindow[]) => void
+  disabled?: boolean
+}) {
+  const addWindow = () =>
+    onChange([...windows, { weekdays: [1, 2, 3, 4, 5], startHour: 9, endHour: 18 }])
+
+  const removeWindow = (i: number) => onChange(windows.filter((_, idx) => idx !== i))
+
+  const patch = (i: number, p: Partial<PeakWindow>) =>
+    onChange(windows.map((w, idx) => (idx === i ? { ...w, ...p } : w)))
+
+  const toggleDay = (i: number, day: number) => {
+    const w = windows[i]
+    const has = w.weekdays.includes(day)
+    const next = has ? w.weekdays.filter((d) => d !== day) : [...w.weekdays, day].sort((a, b) => a - b)
+    patch(i, { weekdays: next })
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <label className="text-xs font-medium text-muted-foreground">高峰时段规则（命中任一即为高峰）</label>
+        <Button type="button" size="sm" variant="outline" className="h-7 text-xs" onClick={addWindow} disabled={disabled}>
+          <Plus className="h-3 w-3" />
+          添加时段
+        </Button>
+      </div>
+
+      {windows.length === 0 ? (
+        <p className="text-xs text-muted-foreground rounded-md border border-dashed p-2 text-center">
+          未添加高峰时段。点「添加时段」新增（可加多条，不同星期几 / 不同时间段）。
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {windows.map((w, i) => (
+            <div key={i} className="space-y-1.5 rounded-md border p-2">
+              {/* 星期几多选 */}
+              <div className="flex flex-wrap items-center gap-1">
+                {WEEKDAY_LABELS.map((label, day) => {
+                  const active = w.weekdays.length === 0 || w.weekdays.includes(day)
+                  const allDays = w.weekdays.length === 0
+                  return (
+                    <button
+                      key={day}
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => toggleDay(i, day)}
+                      title={allDays ? '当前为每天，点击将改为仅选中此天' : undefined}
+                      className={`h-6 w-6 rounded-full text-xs transition-colors ${
+                        active
+                          ? 'bg-primary text-primary-foreground'
+                          : 'bg-secondary text-muted-foreground hover:bg-accent'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  )
+                })}
+                <span className="ml-1 text-[11px] text-muted-foreground">
+                  {w.weekdays.length === 0 ? '每天' : ''}
+                </span>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="ml-auto h-6 w-6 text-destructive hover:text-destructive"
+                  onClick={() => removeWindow(i)}
+                  disabled={disabled}
+                  title="删除此时段"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </Button>
+              </div>
+              {/* 起止整点 */}
+              <div className="flex items-center gap-2">
+                <HourSelect
+                  value={w.startHour}
+                  onChange={(h) => patch(i, { startHour: h })}
+                  disabled={disabled}
+                />
+                <span className="text-muted-foreground text-sm shrink-0">→</span>
+                <HourSelect
+                  value={w.endHour}
+                  onChange={(h) => patch(i, { endHour: h })}
+                  disabled={disabled}
+                />
+                <span className="text-[11px] text-muted-foreground shrink-0">
+                  {w.startHour === w.endHour
+                    ? '（起止相同=空窗）'
+                    : w.startHour > w.endHour
+                      ? '（跨天）'
+                      : ''}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function HourSelect({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: number
+  onChange: (h: number) => void
+  disabled?: boolean
+}) {
+  return (
+    <Select value={String(value)} onValueChange={(v) => onChange(parseInt(v, 10))} disabled={disabled}>
+      <SelectTrigger className="h-8 flex-1 rounded-lg px-2.5 text-xs">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent className="max-h-[240px]">
+        {HOUR_OPTIONS.map((h) => (
+          <SelectItem key={h} value={String(h)}>
+            {String(h).padStart(2, '0')}:00
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   )
 }
 
@@ -302,258 +876,212 @@ function UpstreamCard({
 function UpstreamEditDialog({
   open,
   onOpenChange,
-  target,
+  edit,
   onChange,
   onSave,
   saving,
+  groupOptions,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  target: EditTarget
-  onChange: (t: EditTarget) => void
+  edit: EditState
+  onChange: (e: EditState) => void
   onSave: () => void
   saving: boolean
+  groupOptions: string[]
 }) {
-  if (!target) return null
-  const set = (patch: Partial<UpstreamConfig>) => onChange({ ...target, ...patch })
-
-  const field = (
-    label: string,
-    key: keyof UpstreamConfig,
-    placeholder: string,
-    opts?: { type?: string; mono?: boolean },
-  ) => (
-    <div className="space-y-1.5">
-      <label className="text-sm font-medium">{label}</label>
-      <Input
-        type={opts?.type ?? 'text'}
-        placeholder={placeholder}
-        value={(target[key] as string) ?? ''}
-        onChange={(e) => set({ [key]: e.target.value } as Partial<UpstreamConfig>)}
-        disabled={saving}
-        className={opts?.mono ? 'font-mono text-sm' : undefined}
-      />
-    </div>
-  )
+  const set = (patch: Partial<EditState>) => onChange({ ...edit, ...patch })
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
+      <DialogContent className="sm:max-w-lg max-h-[88vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>{target.id ? '编辑上游' : '添加上游'}</DialogTitle>
-          <DialogDescription>配置上游提货渠道。当前为 Mock，URL/Key 仅本地保存。</DialogDescription>
+          <DialogTitle>{edit.id ? '编辑上游' : '添加上游'}</DialogTitle>
+          <DialogDescription>配置上游提货渠道。API Key 存于服务端，不会明文回显。</DialogDescription>
         </DialogHeader>
         <div className="space-y-3 overflow-y-auto py-2 pr-1">
           <div className="space-y-1.5">
             <label className="text-sm font-medium">上游名称 <span className="text-red-500">*</span></label>
             <Input
               placeholder="例: 转售商A、采购平台X"
-              value={target.name}
+              value={edit.name}
               onChange={(e) => set({ name: e.target.value })}
               disabled={saving}
               autoFocus
+              autoComplete="off"
             />
           </div>
-          {field('API 基础地址', 'baseUrl', 'https://api.example.com', { mono: true })}
-          {field('上游 API Key', 'apiKey', '上游鉴权 Key', { type: 'password', mono: true })}
-          <div className="grid grid-cols-2 gap-2">
-            {field('查询余额路径', 'balancePath', '/v1/balance', { mono: true })}
-            {field('提取 KEY 路径', 'extractPath', '/v1/keys/issue', { mono: true })}
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">API 基础地址</label>
+            <Input
+              placeholder="https://api.example.com"
+              value={edit.baseUrl}
+              onChange={(e) => set({ baseUrl: e.target.value })}
+              disabled={saving}
+              className="font-mono text-sm"
+              autoComplete="off"
+            />
           </div>
-          {field('Webhook 地址', 'webhookUrl', 'https://.../webhook（可选）', { mono: true })}
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">
+              上游 API Key {edit.id ? <span className="text-xs text-muted-foreground">（留空不修改）</span> : <span className="text-red-500">*</span>}
+            </label>
+            <Input
+              type="password"
+              placeholder="usr-xxxxxxxx"
+              value={edit.apiKey}
+              onChange={(e) => set({ apiKey: e.target.value })}
+              disabled={saving}
+              className="font-mono text-sm"
+              autoComplete="new-password"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">本服务对外地址</label>
+            <Input
+              placeholder="https://your-host:8990（用于生成 webhook 接收地址）"
+              value={edit.receiverBaseUrl}
+              onChange={(e) => set({ receiverBaseUrl: e.target.value })}
+              disabled={saving}
+              className="font-mono text-sm"
+              autoComplete="off"
+            />
+            <p className="text-xs text-muted-foreground">
+              上游回调本服务用。留空则不生成接收地址、无法注册 Webhook。
+            </p>
+          </div>
+
+          {/* 自动提号配置 */}
+          <div className="space-y-2 rounded-xl border p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-sm font-medium">自动提号（低消）</div>
+                <p className="text-xs text-muted-foreground leading-snug">
+                  收到 new_keys_available 时按「最低提货量」自动提取并入库（代理池轮询分配）；
+                  收到 all_keys_dead 仅在事件日志记录，不提货
+                </p>
+              </div>
+              <Switch
+                checked={edit.autoPurchaseEnabled}
+                onCheckedChange={(v) => set({ autoPurchaseEnabled: v })}
+                disabled={saving}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">默认提货量（低消）</label>
+              <Input
+                type="number"
+                min={0}
+                placeholder="0 = 按可提取上限提满"
+                value={edit.autoPurchaseCount}
+                onChange={(e) => set({ autoPurchaseCount: e.target.value })}
+                disabled={saving || !edit.autoPurchaseEnabled}
+                autoComplete="off"
+              />
+              <p className="text-xs text-muted-foreground">
+                未开启「分时段」时用此数量；填 0 表示按上游本轮可提取上限（stock.max）尽量提满。
+              </p>
+            </div>
+
+            {/* 分时段提货量：多条高峰规则 + 高峰/低谷两档 */}
+            <div className="space-y-2 rounded-lg border p-2.5 bg-secondary/20">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium">按时间设置提货量（高峰 / 低谷）</div>
+                  <p className="text-xs text-muted-foreground leading-snug">
+                    自定义"哪几天 + 几点到几点"为高峰；命中任一高峰规则用高峰量，其余用低谷量
+                  </p>
+                </div>
+                <Switch
+                  checked={edit.scheduleEnabled}
+                  onCheckedChange={(v) => set({ scheduleEnabled: v })}
+                  disabled={saving || !edit.autoPurchaseEnabled}
+                />
+              </div>
+              {edit.scheduleEnabled && (
+                <div className="space-y-3">
+                  <PeakWindowEditor
+                    windows={edit.peakWindows}
+                    onChange={(w) => set({ peakWindows: w })}
+                    disabled={saving}
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-muted-foreground">高峰提货量</label>
+                      <Input
+                        type="number" min={0}
+                        placeholder="0 = 提满"
+                        value={edit.peakCount}
+                        onChange={(e) => set({ peakCount: e.target.value })}
+                        disabled={saving} autoComplete="off" className="h-9"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-muted-foreground">低谷提货量</label>
+                      <Input
+                        type="number" min={0}
+                        placeholder="0 = 提满"
+                        value={edit.offpeakCount}
+                        onChange={(e) => set({ offpeakCount: e.target.value })}
+                        disabled={saving} autoComplete="off" className="h-9"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    各档填 0 表示该时段按上游可提取上限提满。时间为服务器本地整点，右开区间；起 &gt; 止表示跨天（如 22→6）。
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">默认端点</label>
+            <Select
+              value={edit.endpoint === '' ? '__default__' : edit.endpoint}
+              onValueChange={(v) => set({ endpoint: v === '__default__' ? '' : v })}
+              disabled={saving}
+            >
+              <SelectTrigger className="h-10 rounded-xl px-3.5">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__default__">使用全局默认端点</SelectItem>
+                <SelectItem value="cli">cli</SelectItem>
+                <SelectItem value="ide">ide</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              提号入库的 ksk 凭据使用的端点。ksk key 通常走 <b>cli</b>；留空则用全局 defaultEndpoint。
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">入库分组</label>
+            <GroupMultiSelect
+              value={edit.groups}
+              options={groupOptions}
+              onChange={(g) => set({ groups: g })}
+              disabled={saving}
+            />
+            <p className="text-xs text-muted-foreground">自动/手动提号入库的凭据会打上这些分组。</p>
+          </div>
+
           <div className="space-y-1.5">
             <label className="text-sm font-medium">备注</label>
             <Input
               placeholder="渠道说明、结算方式等（可选）"
-              value={target.note ?? ''}
+              value={edit.note}
               onChange={(e) => set({ note: e.target.value })}
               disabled={saving}
+              autoComplete="off"
             />
           </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>取消</Button>
-          <Button onClick={onSave} disabled={saving || !target.name.trim()}>
+          <Button onClick={onSave} disabled={saving || !edit.name.trim()}>
             {saving ? '保存中…' : '保存'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-// ── 提取新 KEY 弹窗（此页仅提取展示，批量入库走凭据页「一键补货」）──────────
-
-function ExtractKeysDialog({ upstream, onClose }: { upstream: UpstreamConfig | null; onClose: () => void }) {
-  const [count, setCount] = useState('5')
-  const [extracting, setExtracting] = useState(false)
-  const [keys, setKeys] = useState<string[]>([])
-
-  const open = !!upstream
-
-  const handleExtract = async () => {
-    if (!upstream) return
-    const n = parseInt(count, 10)
-    if (Number.isNaN(n) || n <= 0) {
-      toast.error('请输入有效数量')
-      return
-    }
-    setExtracting(true)
-    try {
-      const res = await extractUpstreamKeys(upstream.id, n)
-      setKeys(res.keys)
-      toast.success(`已提取 ${res.keys.length} 个 KEY，消耗 ¥${res.cost}，剩余 ${res.remainingKeys} 个`)
-    } catch (e) {
-      toast.error('提取失败: ' + extractErrorMessage(e))
-    } finally {
-      setExtracting(false)
-    }
-  }
-
-  const handleClose = (o: boolean) => {
-    if (!o) {
-      setKeys([])
-      setCount('5')
-      onClose()
-    }
-  }
-
-  const copyAll = async () => {
-    try {
-      await navigator.clipboard.writeText(keys.join('\n'))
-      toast.success('已复制全部 KEY')
-    } catch {
-      toast.error('复制失败')
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-md max-h-[85vh] flex flex-col">
-        <DialogHeader>
-          <DialogTitle>提取新 KEY · {upstream?.name}</DialogTitle>
-          <DialogDescription>
-            此处仅提取并展示 KEY。要提货后直接批量入库并指定代理，请到「凭据管理 → 一键补货」。
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-3 overflow-y-auto py-2">
-          <div className="flex items-end gap-2">
-            <div className="flex-1 space-y-1.5">
-              <label className="text-sm font-medium">提取数量</label>
-              <Input
-                type="number"
-                min={1}
-                value={count}
-                onChange={(e) => setCount(e.target.value)}
-                disabled={extracting}
-              />
-            </div>
-            <Button onClick={handleExtract} disabled={extracting}>
-              {extracting ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
-              提取
-            </Button>
-          </div>
-
-          {keys.length > 0 && (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-sm text-muted-foreground">已提取 {keys.length} 个</span>
-                <Button size="sm" variant="outline" className="h-7 text-xs" onClick={copyAll}>
-                  <Copy className="h-3.5 w-3.5 mr-1" />
-                  复制全部
-                </Button>
-              </div>
-              <div className="border rounded-md divide-y max-h-[240px] overflow-y-auto">
-                {keys.map((k, i) => (
-                  <div key={i} className="flex items-center gap-2 p-2 font-mono text-xs">
-                    <span className="w-6 shrink-0 text-center text-muted-foreground tabular-nums">{i + 1}</span>
-                    <span className="truncate">{k}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => handleClose(false)}>关闭</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-// ── Webhook 配置 / 测试弹窗 ──────────────────────────────────────────────────
-
-function WebhookDialog({ upstream, onClose }: { upstream: UpstreamConfig | null; onClose: () => void }) {
-  const saveUpstream = useSaveUpstream()
-  const [url, setUrl] = useState('')
-  const [testing, setTesting] = useState(false)
-
-  const open = !!upstream
-
-  // 弹窗目标切换时回填当前上游的 webhookUrl
-  useEffect(() => {
-    if (upstream) setUrl(upstream.webhookUrl ?? '')
-  }, [upstream])
-
-  const handleClose = (o: boolean) => {
-    if (!o) {
-      setUrl('')
-      onClose()
-    }
-  }
-
-  const handleTest = async () => {
-    setTesting(true)
-    try {
-      const res = await testUpstreamWebhook(url)
-      if (res.ok) toast.success(`${res.message}（${res.latencyMs}ms）`)
-      else toast.error(res.message)
-    } catch (e) {
-      toast.error('测试失败: ' + extractErrorMessage(e))
-    } finally {
-      setTesting(false)
-    }
-  }
-
-  const handleSave = async () => {
-    if (!upstream) return
-    try {
-      await saveUpstream.mutateAsync({ id: upstream.id, name: upstream.name, webhookUrl: url.trim() })
-      toast.success('Webhook 已保存')
-      handleClose(false)
-    } catch (e) {
-      toast.error(extractErrorMessage(e))
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Webhook · {upstream?.name}</DialogTitle>
-          <DialogDescription>
-            上游异步通知（如补货完成、库存变动）回调本服务的地址。当前为 Mock 测试。
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-3 py-2">
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">Webhook 地址</label>
-            <Input
-              placeholder="https://your-host/api/admin/upstream/webhook"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              disabled={saveUpstream.isPending}
-              className="font-mono text-sm"
-            />
-          </div>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={handleTest} disabled={testing}>
-            {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Webhook className="h-4 w-4" />}
-            测试连通
-          </Button>
-          <Button onClick={handleSave} disabled={saveUpstream.isPending}>
-            {saveUpstream.isPending ? '保存中…' : '保存'}
           </Button>
         </DialogFooter>
       </DialogContent>

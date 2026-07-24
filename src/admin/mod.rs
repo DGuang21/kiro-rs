@@ -18,6 +18,7 @@
 
 mod error;
 mod handlers;
+mod upstream_handlers;
 mod middleware;
 pub mod proxy_pool;
 mod router;
@@ -26,13 +27,15 @@ pub mod types;
 mod binary_update;
 pub mod client_keys;
 pub mod groups;
+pub mod upstream;
 pub mod usage_stats;
 pub mod trace_db;
 
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;
 pub use middleware::AdminState;
-pub use router::create_admin_router;
+pub use router::{create_admin_router, create_upstream_webhook_router};
 pub use service::AdminService;
+pub use upstream::{UpstreamEventLog, UpstreamManager};
 pub use usage_stats::{UsageAggregator, UsageRecorder};
 pub use trace_db::{SharedTraceStore, TraceStore};

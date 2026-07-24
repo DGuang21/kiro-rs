@@ -1,12 +1,14 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   listUpstreams,
-  saveUpstream,
+  createUpstream,
+  updateUpstream,
   deleteUpstream,
-  type UpstreamConfig,
+  listUpstreamEvents,
+  type UpsertUpstreamRequest,
 } from '@/api/upstream'
 
-/** 补货上游配置列表（Mock：localStorage） */
+/** 补货上游配置列表 */
 export function useUpstreams() {
   return useQuery({
     queryKey: ['upstreams'],
@@ -15,10 +17,29 @@ export function useUpstreams() {
   })
 }
 
-export function useSaveUpstream() {
+/** 上游事件日志（自动刷新，便于观察自动提号结果） */
+export function useUpstreamEvents(enabled = true) {
+  return useQuery({
+    queryKey: ['upstream-events'],
+    queryFn: listUpstreamEvents,
+    enabled,
+    refetchInterval: 15000,
+  })
+}
+
+export function useCreateUpstream() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (config: Partial<UpstreamConfig> & { name: string }) => saveUpstream(config),
+    mutationFn: (req: UpsertUpstreamRequest) => createUpstream(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['upstreams'] }),
+  })
+}
+
+export function useUpdateUpstream() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, req }: { id: string; req: UpsertUpstreamRequest }) =>
+      updateUpstream(id, req),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['upstreams'] }),
   })
 }

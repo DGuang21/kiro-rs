@@ -222,6 +222,18 @@ async fn main() {
         }
     }
 
+    // 补货上游配置与事件日志（持久化到 upstreams.json / upstream_events.json）
+    let upstreams_path = admin::upstream::default_config_path_in(&cache_dir);
+    let upstream_manager = std::sync::Arc::new(
+        admin::UpstreamManager::load(&upstreams_path).unwrap_or_else(|e| {
+            tracing::warn!("加载补货上游配置失败 ({}): {}", upstreams_path.display(), e);
+            admin::UpstreamManager::new()
+        }),
+    );
+    let upstream_events_path = admin::upstream::default_events_path_in(&cache_dir);
+    let upstream_event_log =
+        std::sync::Arc::new(admin::UpstreamEventLog::load(&upstream_events_path));
+
     // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
         cache_dir.join("traces.db"),
@@ -305,6 +317,8 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
+                upstream_manager.clone(),
+                upstream_event_log.clone(),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
@@ -321,15 +335,20 @@ async fn main() {
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
             admin_state.service.start_auto_update_scheduler();
 
-            let admin_app = admin::create_admin_router(admin_state);
+            let admin_app = admin::create_admin_router(admin_state.clone());
+
+            // 公共 webhook 接收路由（免 admin 鉴权，靠 path token 鉴别来源）
+            let upstream_webhook_app = admin::create_upstream_webhook_router(admin_state);
 
             // 创建 Admin UI 路由
             let admin_ui_app = admin_ui::create_admin_ui_router();
 
             tracing::info!("Admin API 已启用");
             tracing::info!("Admin UI 已启用: /admin");
+            tracing::info!("补货上游 webhook 接收: POST /api/upstream/webhook/{{token}}");
             anthropic_app
                 .nest("/api/admin", admin_app)
+                .nest("/api/upstream", upstream_webhook_app)
                 .nest("/admin", admin_ui_app)
         }
     } else {

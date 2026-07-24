@@ -2960,6 +2960,93 @@ impl AdminService {
         })
     }
 
+    // ============ 补货上游：提号并入库 ============
+
+    /// 构建访问上游 API 的客户端（走全局代理 + 全局 tls 后端）
+    pub fn build_upstream_client(
+        &self,
+        cfg: &crate::admin::upstream::UpstreamConfig,
+    ) -> crate::admin::upstream::UpstreamClient {
+        let proxy = self.token_manager.proxy();
+        let tls_backend = self.token_manager.config().tls_backend;
+        crate::admin::upstream::UpstreamClient::new(
+            cfg.base_url.clone(),
+            cfg.api_key.clone(),
+            proxy,
+            tls_backend,
+        )
+    }
+
+    /// 提号并把返回的 ksk_ Key 作为 api_key 凭据入库，代理池轮询分配。
+    ///
+    /// - `count`：期望提取数量；传 `None` 或 0 时按上游 `GET /api/my/stock` 的 max 尽量提满。
+    /// - `client_order_id`：幂等键（自动提号必须传 webhook 的 purchase_order_id）。
+    /// - `groups` / `source_channel`：入库凭据的分组与来源渠道备注。
+    ///
+    /// 返回 `(purchased, imported)`：实际出 Key 数与成功入库数。
+    ///
+    /// 返回 `anyhow::Result` 而非 `AdminServiceError`：上游是用户自己配置的提号服务，
+    /// 其错误（如"余额不足""暂无可用 Key"）应原样透出给用户排查，不做脱敏。
+    pub async fn upstream_purchase_and_import(
+        &self,
+        cfg: &crate::admin::upstream::UpstreamConfig,
+        count: Option<u32>,
+        client_order_id: &str,
+        groups: Vec<String>,
+        source_channel: Option<String>,
+    ) -> anyhow::Result<(u32, u32)> {
+        let client = self.build_upstream_client(cfg);
+
+        // 计算数量：显式指定则用之；否则（仅 webhook 自动提号会传 None）按 stock.max 提满
+        let want = match count {
+            Some(n) if n > 0 => n,
+            _ => {
+                let stock = client.get_stock().await?;
+                stock.max
+            }
+        };
+        if want == 0 {
+            return Ok((0, 0));
+        }
+
+        // 提号（真实错误原样透出）
+        let resp = client.purchase(want, client_order_id).await?;
+
+        let keys: Vec<String> = resp.keys.into_iter().map(|k| k.key).collect();
+        let purchased = resp.purchased;
+        if keys.is_empty() {
+            return Ok((purchased, 0));
+        }
+
+        // 代理池可分配 URL（轮询）；为空则不分配（用全局配置）
+        let proxy_urls = self.proxy_pool.assignable_urls();
+
+        let mut imported = 0u32;
+        for (i, key) in keys.iter().enumerate() {
+            let proxy_url = if proxy_urls.is_empty() {
+                None
+            } else {
+                Some(proxy_urls[i % proxy_urls.len()].clone())
+            };
+            let req = build_api_key_credential_request(
+                key.clone(),
+                proxy_url,
+                cfg.endpoint.clone(),
+                groups.clone(),
+                source_channel.clone(),
+            );
+            // 自动入库不阻塞在余额校验上（fetch_balance = false），失败仅记录不中断整体
+            match self.add_credential_inner(req, false).await {
+                Ok(_) => imported += 1,
+                Err(e) => {
+                    tracing::warn!("补货入库单个 Key 失败（{}）: {}", cfg.name, e);
+                }
+            }
+        }
+
+        Ok((purchased, imported))
+    }
+
     // ============ 错误分类 ============
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
@@ -3668,6 +3755,44 @@ impl AdminService {
             Some(target_id),
         )
         .await
+    }
+}
+
+/// 构建 api_key 凭据的 AddCredentialRequest（补货入库用）。
+/// `AddCredentialRequest` 无 Default，字段较多，这里集中构造，proxy_url 逐个不同。
+fn build_api_key_credential_request(
+    kiro_api_key: String,
+    proxy_url: Option<String>,
+    endpoint: Option<String>,
+    groups: Vec<String>,
+    source_channel: Option<String>,
+) -> AddCredentialRequest {
+    AddCredentialRequest {
+        refresh_token: None,
+        access_token: None,
+        profile_arn: None,
+        expires_at: None,
+        auth_method: "api_key".to_string(),
+        provider: None,
+        client_id: None,
+        client_secret: None,
+        start_url: None,
+        token_endpoint: None,
+        issuer_url: None,
+        scopes: None,
+        priority: 0,
+        region: None,
+        auth_region: None,
+        api_region: None,
+        machine_id: None,
+        email: None,
+        proxy_url,
+        proxy_username: None,
+        proxy_password: None,
+        kiro_api_key: Some(kiro_api_key),
+        endpoint,
+        groups,
+        source_channel,
     }
 }
 
