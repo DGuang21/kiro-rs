@@ -1,209 +1,248 @@
-// 补货上游（Restock Upstream）API 层。
+// 补货上游（Restock Upstream）API 层 —— 对接后端 /api/admin/upstream/*。
 //
-// ⚠️ 目前为 Mock 实现：上游配置存 localStorage，查询余额 / 提取 KEY / Webhook
-// 均返回模拟数据。等拿到真实上游 API 后，只需把下方几个 `mock*` 函数替换为
-// 真正的 fetch(config.baseUrl + path, { headers: { apiKey } }) 调用即可，
-// 组件与 hooks 无需改动。
+// 后端持久化上游配置（upstreams.json）与事件日志（upstream_events.json）；
+// 查询库存/余额、提号、注册/测试 webhook 均由后端调用真实上游 API 完成。
 
-const STORAGE_KEY = 'restockUpstreams'
-const MOCK_STATE_KEY = 'restockUpstreamMockState'
+import axios from 'axios'
+import { storage } from '@/lib/storage'
 
-/** 单个上游配置 */
+const api = axios.create({
+  baseURL: '/api/admin',
+  timeout: 30000,
+  headers: { 'Content-Type': 'application/json' },
+})
+
+api.interceptors.request.use((config) => {
+  const apiKey = storage.getApiKey()
+  if (apiKey) config.headers['x-api-key'] = apiKey
+  return config
+})
+
+/** 单条高峰时段规则：某些星期几的 [startHour, endHour)（整点，服务器本地时间） */
+export interface PeakWindow {
+  /** 生效星期几，0=周日…6=周六；空数组 = 每天 */
+  weekdays: number[]
+  /** 起始小时 0-23（含） */
+  startHour: number
+  /** 结束小时 0-23（不含）；支持跨天（start > end，如 22→6） */
+  endHour: number
+}
+
+/** 分时段自动提货量：多条高峰规则 + 高峰/低谷两档 */
+export interface PurchaseSchedule {
+  enabled: boolean
+  /** 高峰时段规则（命中任一即为高峰） */
+  peakWindows: PeakWindow[]
+  /** 高峰提货量（0 = 提满） */
+  peakCount: number
+  /** 低谷提货量（0 = 提满） */
+  offpeakCount: number
+}
+
+/** 上游配置（脱敏视图，后端返回；不含明文 apiKey） */
 export interface UpstreamConfig {
   id: string
-  /** 展示名，如 "转售商A" */
   name: string
-  /** 上游 API 基础地址，如 https://api.example.com */
   baseUrl: string
-  /** 上游鉴权 API Key */
-  apiKey: string
-  /** 查询余额的路径（附加到 baseUrl 之后），如 /v1/balance */
-  balancePath: string
-  /** 提取新 KEY 的路径，如 /v1/keys/issue */
-  extractPath: string
-  /** Webhook 回调地址（上游 → 本服务通知） */
-  webhookUrl?: string
-  /** 备注 */
+  /** 脱敏后的 apiKey（仅展示） */
+  maskedApiKey: string
+  /** 本服务对外可达地址（用于拼 webhook 接收地址） */
+  receiverBaseUrl?: string
+  /** 完整 webhook 接收地址（receiverBaseUrl + 路径 + token）；未配置 receiverBaseUrl 时为空 */
+  webhookReceiverUrl?: string
+  /** 是否开启自动提号 */
+  autoPurchaseEnabled: boolean
+  /** 自动提号数量（0 = 按 stock.max 提满） */
+  autoPurchaseCount: number
+  /** 分时段自动提货量（enabled 时覆盖 autoPurchaseCount） */
+  schedule?: PurchaseSchedule
+  /** 入库凭据使用的端点（cli / ide 等）；留空回退全局默认 */
+  endpoint?: string
+  /** 自动入库凭据的分组 */
+  groups: string[]
+  enabled: boolean
   note?: string
   createdAt: string
 }
 
-/** 查询余额响应 */
-export interface UpstreamBalance {
-  /** 账户余额（金额，单位由上游定义，Mock 用元） */
-  balance: number
-  /** 货币符号 / 单位 */
-  currency: string
-  /** 剩余可提取的 KEY 数量 */
-  remainingKeys: number
-  /** 单个 KEY 单价（用于估算） */
-  unitPrice: number
+export interface UpstreamsResponse {
+  total: number
+  upstreams: UpstreamConfig[]
 }
 
-/** 提取新 KEY 响应 */
-export interface ExtractKeysResponse {
-  keys: string[]
-  /** 本次消耗金额 */
-  cost: number
-  /** 提取后剩余 KEY 数量 */
-  remainingKeys: number
+/** 创建 / 更新上游的请求体 */
+export interface UpsertUpstreamRequest {
+  name: string
+  baseUrl?: string
+  /** 明文 apiKey；更新时留空表示不改 */
+  apiKey?: string
+  receiverBaseUrl?: string | null
+  autoPurchaseEnabled?: boolean
+  autoPurchaseCount?: number
+  schedule?: PurchaseSchedule
+  endpoint?: string | null
+  groups?: string[]
+  enabled?: boolean
+  note?: string | null
 }
 
-/** Webhook 测试响应 */
-export interface WebhookTestResponse {
-  ok: boolean
+export interface StockResponse {
+  max: number
+}
+
+export interface UpstreamProfile {
+  name?: string
+  quota?: number
+  remaining?: number
+  usedQuota?: number
+  webhookUrl?: string
+}
+
+export interface PurchaseResult {
+  clientOrderId: string
+  purchased: number
+  imported: number
+}
+
+/** GET /api/my/keys 单条 */
+export interface UpstreamKeyItem {
+  key: string
+  status?: string
+  createdAt?: string
+}
+
+export interface UpstreamKeysResponse {
+  count: number
+  active: number
+  keys: UpstreamKeyItem[]
+}
+
+/** 账号有效期起点 */
+export interface KeysCreatedAt {
+  createdAt: string | null
+  keyCount: number
+}
+
+/** 最近提取订单 */
+export interface UpstreamOrder {
+  clientOrderId?: string
+  requested?: number
+  purchased?: number
+  createdAt?: string
+}
+
+/** 事件类型 */
+export type UpstreamEventKind =
+  | 'new_keys_available'
+  | 'all_keys_dead'
+  | 'auto_purchase'
+  | 'manual_purchase'
+  | 'error'
+
+export interface UpstreamEvent {
+  id: string
+  upstreamId: string
+  upstreamName: string
+  kind: UpstreamEventKind
   message: string
-  /** 往返延迟（ms） */
-  latencyMs: number
+  orderId?: string
+  requested?: number
+  imported?: number
+  ok: boolean
+  createdAt: string
 }
 
-// ── localStorage 配置读写 ────────────────────────────────────────────────────
-
-function readConfigs(): UpstreamConfig[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    return []
-  }
+export interface UpstreamEventsResponse {
+  total: number
+  events: UpstreamEvent[]
 }
-
-function writeConfigs(list: UpstreamConfig[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(list))
-}
-
-/** 模拟网络延迟，让 Mock 更真实 */
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-// ── Mock 库存状态（按上游 id 记录剩余 KEY 数，提取后递减）────────────────────
-
-interface MockState {
-  [upstreamId: string]: { remainingKeys: number; balance: number }
-}
-
-function readMockState(): MockState {
-  try {
-    const raw = localStorage.getItem(MOCK_STATE_KEY)
-    return raw ? JSON.parse(raw) : {}
-  } catch {
-    return {}
-  }
-}
-
-function writeMockState(state: MockState) {
-  localStorage.setItem(MOCK_STATE_KEY, JSON.stringify(state))
-}
-
-/** 由字符串派生一个稳定的伪随机种子，保证同一上游的初始库存一致 */
-function seedFromId(id: string): number {
-  let h = 0
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) & 0x7fffffff
-  return h
-}
-
-/** 取（或初始化）某上游的 Mock 库存 */
-function ensureMockEntry(id: string): { remainingKeys: number; balance: number } {
-  const state = readMockState()
-  if (!state[id]) {
-    const seed = seedFromId(id)
-    state[id] = {
-      remainingKeys: 20 + (seed % 80), // 20~99 个
-      balance: 100 + (seed % 900), // 100~999 元
-    }
-    writeMockState(state)
-  }
-  return state[id]
-}
-
-const MOCK_UNIT_PRICE = 5 // 元/个
 
 // ── CRUD ─────────────────────────────────────────────────────────────────────
 
 export async function listUpstreams(): Promise<UpstreamConfig[]> {
-  await delay(120)
-  return readConfigs()
+  const { data } = await api.get<UpstreamsResponse>('/upstream')
+  return data.upstreams
 }
 
-export async function saveUpstream(config: Partial<UpstreamConfig> & { name: string }): Promise<UpstreamConfig> {
-  await delay(120)
-  const list = readConfigs()
-  if (config.id) {
-    const idx = list.findIndex((u) => u.id === config.id)
-    if (idx < 0) throw new Error('上游不存在')
-    list[idx] = { ...list[idx], ...config } as UpstreamConfig
-    writeConfigs(list)
-    return list[idx]
-  }
-  const created: UpstreamConfig = {
-    id: `up_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-    name: config.name,
-    baseUrl: config.baseUrl ?? '',
-    apiKey: config.apiKey ?? '',
-    balancePath: config.balancePath ?? '/v1/balance',
-    extractPath: config.extractPath ?? '/v1/keys/issue',
-    webhookUrl: config.webhookUrl,
-    note: config.note,
-    createdAt: new Date().toISOString(),
-  }
-  list.push(created)
-  writeConfigs(list)
-  return created
+export async function createUpstream(req: UpsertUpstreamRequest): Promise<UpstreamConfig> {
+  const { data } = await api.post<UpstreamConfig>('/upstream', req)
+  return data
+}
+
+export async function updateUpstream(
+  id: string,
+  req: UpsertUpstreamRequest,
+): Promise<UpstreamConfig> {
+  const { data } = await api.put<UpstreamConfig>(`/upstream/${id}`, req)
+  return data
 }
 
 export async function deleteUpstream(id: string): Promise<void> {
-  await delay(80)
-  writeConfigs(readConfigs().filter((u) => u.id !== id))
+  await api.delete(`/upstream/${id}`)
 }
 
-// ── Mock 业务 API（后续替换为真实 fetch）─────────────────────────────────────
+// ── 动作 ─────────────────────────────────────────────────────────────────────
 
-/** 查询上游余额与剩余可提取 KEY 数量。TODO: 替换为真实 GET baseUrl+balancePath */
-export async function queryUpstreamBalance(id: string): Promise<UpstreamBalance> {
-  await delay(500)
-  const entry = ensureMockEntry(id)
-  return {
-    balance: entry.balance,
-    currency: '¥',
-    remainingKeys: entry.remainingKeys,
-    unitPrice: MOCK_UNIT_PRICE,
-  }
+export async function queryUpstreamStock(id: string): Promise<StockResponse> {
+  const { data } = await api.get<StockResponse>(`/upstream/${id}/stock`)
+  return data
 }
 
-/** 从上游提取 count 个新 API KEY。TODO: 替换为真实 POST baseUrl+extractPath */
-export async function extractUpstreamKeys(id: string, count: number): Promise<ExtractKeysResponse> {
-  await delay(900)
-  const state = readMockState()
-  const entry = state[id] ?? ensureMockEntry(id)
-  if (count <= 0) throw new Error('数量必须大于 0')
-  if (count > entry.remainingKeys) {
-    throw new Error(`上游剩余不足：仅剩 ${entry.remainingKeys} 个`)
-  }
-  const cost = count * MOCK_UNIT_PRICE
-  if (cost > entry.balance) {
-    throw new Error(`余额不足：需 ${cost} 元，仅剩 ${entry.balance} 元`)
-  }
-  // 生成 mock KEY
-  const keys = Array.from({ length: count }, () => {
-    const rand = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10)
-    return `ksk_mock_${rand}`
+export async function queryUpstreamProfile(id: string): Promise<UpstreamProfile> {
+  const { data } = await api.get<UpstreamProfile>(`/upstream/${id}/profile`)
+  return data
+}
+
+/** GET 全部 Key（history=true 含已失效） */
+export async function queryUpstreamKeys(
+  id: string,
+  history = false,
+): Promise<UpstreamKeysResponse> {
+  const { data } = await api.get<UpstreamKeysResponse>(`/upstream/${id}/keys`, {
+    params: history ? { history: '1' } : undefined,
   })
-  entry.remainingKeys -= count
-  entry.balance -= cost
-  state[id] = entry
-  writeMockState(state)
-  return { keys, cost, remainingKeys: entry.remainingKeys }
+  return data
 }
 
-/** 测试 Webhook 连通性。TODO: 替换为真实 POST webhookUrl */
-export async function testUpstreamWebhook(url: string): Promise<WebhookTestResponse> {
-  await delay(600)
-  if (!url.trim()) throw new Error('请先填写 Webhook 地址')
-  if (!/^https?:\/\//.test(url.trim())) {
-    return { ok: false, message: '地址需以 http(s):// 开头', latencyMs: 0 }
-  }
-  return { ok: true, message: 'Webhook 可达（Mock）', latencyMs: 40 + Math.floor(Math.random() * 120) }
+/** 账号有效期起点（最早一条 Key 的创建时间） */
+export async function queryUpstreamCreatedAt(id: string): Promise<KeysCreatedAt> {
+  const { data } = await api.get<KeysCreatedAt>(`/upstream/${id}/created-at`)
+  return data
+}
+
+/** 最近提取订单 */
+export async function queryUpstreamOrders(id: string): Promise<UpstreamOrder[]> {
+  const { data } = await api.get<{ orders: UpstreamOrder[] }>(`/upstream/${id}/orders`)
+  return data.orders
+}
+
+/** 上游系统状态与库存（原样透传） */
+export async function queryUpstreamStatus(id: string): Promise<Record<string, unknown>> {
+  const { data } = await api.get<Record<string, unknown>>(`/upstream/${id}/status`)
+  return data
+}
+
+/** 手动提号并入库。count 传 0 表示按 stock.max 提满 */
+export async function purchaseUpstream(id: string, count: number): Promise<PurchaseResult> {
+  const { data } = await api.post<PurchaseResult>(`/upstream/${id}/purchase`, { count })
+  return data
+}
+
+export async function registerUpstreamWebhook(
+  id: string,
+): Promise<{ success: boolean; message: string; webhookUrl: string }> {
+  const { data } = await api.post(`/upstream/${id}/webhook/register`)
+  return data
+}
+
+export async function testUpstreamWebhook(
+  id: string,
+): Promise<{ success: boolean; message: string }> {
+  const { data } = await api.post(`/upstream/${id}/webhook/test`)
+  return data
+}
+
+export async function listUpstreamEvents(): Promise<UpstreamEvent[]> {
+  const { data } = await api.get<UpstreamEventsResponse>('/upstream/events')
+  return data.events
 }
