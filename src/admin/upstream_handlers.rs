@@ -379,10 +379,15 @@ pub async fn upstream_test_webhook(
     }
 }
 
-/// GET /api/admin/upstream/events —— 最近事件日志
+/// GET /api/admin/upstream/events —— 最近事件日志 + 取货统计
 pub async fn upstream_events(State(state): State<AdminState>) -> impl IntoResponse {
     let events = state.upstream_events.recent(200);
-    Json(serde_json::json!({ "total": events.len(), "events": events }))
+    let stats = state.upstream_events.stats();
+    Json(serde_json::json!({
+        "total": events.len(),
+        "events": events,
+        "stats": stats,
+    }))
 }
 
 // ── 公共 webhook 接收端点（免 admin 鉴权，靠 path 中的 token 鉴别来源）──────────

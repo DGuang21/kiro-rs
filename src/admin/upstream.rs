@@ -515,6 +515,71 @@ impl UpstreamEventLog {
         let inner = self.inner.read();
         inner.iter().take(limit).cloned().collect()
     }
+
+    /// 取货数据统计：累计 / 今日 / 本周成功入库的 Key 数与提货次数。
+    ///
+    /// 基于事件日志聚合（成功的自动 / 手动提号事件的 `imported` 求和）。
+    /// 时间按服务器本地时区划界；"本周"以周一为起点。
+    /// 注意：事件日志为环形上限（MAX_EVENTS），"累计"是保留窗口内的合计。
+    pub fn stats(&self) -> PickupStats {
+        use chrono::{Datelike, Local, TimeZone};
+
+        let now = Local::now();
+        let today_start = Local
+            .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+            .single()
+            .unwrap_or(now);
+        // 本周一 00:00：weekday().num_days_from_monday() = 距周一的天数
+        let days_from_monday = now.weekday().num_days_from_monday() as i64;
+        let week_start = today_start - chrono::Duration::days(days_from_monday);
+
+        let mut s = PickupStats::default();
+        let inner = self.inner.read();
+        for e in inner.iter() {
+            // 只统计成功的提号事件
+            if !e.ok {
+                continue;
+            }
+            if !matches!(
+                e.kind,
+                UpstreamEventKind::AutoPurchase | UpstreamEventKind::ManualPurchase
+            ) {
+                continue;
+            }
+            let imported = e.imported.unwrap_or(0);
+            if imported == 0 {
+                continue;
+            }
+            // 解析 created_at（RFC3339，UTC）→ 本地时区
+            let ts = match chrono::DateTime::parse_from_rfc3339(&e.created_at) {
+                Ok(t) => t.with_timezone(&Local),
+                Err(_) => continue,
+            };
+            s.total_keys += imported as u64;
+            s.total_orders += 1;
+            if ts >= week_start {
+                s.week_keys += imported as u64;
+                s.week_orders += 1;
+            }
+            if ts >= today_start {
+                s.today_keys += imported as u64;
+                s.today_orders += 1;
+            }
+        }
+        s
+    }
+}
+
+/// 取货数据统计（累计 / 今日 / 本周）
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickupStats {
+    pub total_keys: u64,
+    pub total_orders: u64,
+    pub today_keys: u64,
+    pub today_orders: u64,
+    pub week_keys: u64,
+    pub week_orders: u64,
 }
 
 /// 便捷构造事件
