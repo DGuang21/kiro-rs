@@ -491,9 +491,9 @@ async fn run_auto_purchase(
     cfg: super::upstream::UpstreamConfig,
     order_id: String,
 ) {
-    // 按服务器本地当前 (星期几, 小时) 决定提货量（分时段：命中任一高峰规则用高峰量，
-    // 否则用低谷量；未启用分时段则用固定量）。None 表示按 stock.max 提满。
-    let now = chrono::Local::now();
+    // 按**北京时间 UTC+8** 当前 (星期几, 小时) 决定提货量（分时段：命中任一高峰规则用高峰量，
+    // 否则用低谷量；未启用分时段则用固定量）。不依赖服务器/容器时区。None 表示按 stock.max 提满。
+    let now = super::upstream::beijing_now();
     let weekday = now.weekday().num_days_from_sunday() as u8; // 0=周日…6=周六
     let hour = now.hour() as u8;
     let count = cfg.resolve_auto_count(weekday, hour);
