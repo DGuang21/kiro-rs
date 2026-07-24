@@ -155,6 +155,17 @@ export interface UpstreamEvent {
 export interface UpstreamEventsResponse {
   total: number
   events: UpstreamEvent[]
+  stats: PickupStats
+}
+
+/** 取货数据统计（累计 / 今日 / 本周） */
+export interface PickupStats {
+  totalKeys: number
+  totalOrders: number
+  todayKeys: number
+  todayOrders: number
+  weekKeys: number
+  weekOrders: number
 }
 
 // ── CRUD ─────────────────────────────────────────────────────────────────────
@@ -242,7 +253,7 @@ export async function testUpstreamWebhook(
   return data
 }
 
-export async function listUpstreamEvents(): Promise<UpstreamEvent[]> {
+export async function listUpstreamEvents(): Promise<UpstreamEventsResponse> {
   const { data } = await api.get<UpstreamEventsResponse>('/upstream/events')
-  return data.events
+  return data
 }

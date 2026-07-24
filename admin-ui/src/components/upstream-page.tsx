@@ -63,6 +63,7 @@ import {
   type UpstreamOrder,
   type PurchaseSchedule,
   type PeakWindow,
+  type PickupStats,
 } from '@/api/upstream'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -115,7 +116,9 @@ const WEEKDAY_LABELS = ['日', '一', '二', '三', '四', '五', '六']
  */
 export function UpstreamPage() {
   const { data: upstreams, isLoading, isFetching, refetch } = useUpstreams()
-  const { data: events } = useUpstreamEvents()
+  const { data: eventsData } = useUpstreamEvents()
+  const events = eventsData?.events ?? []
+  const stats = eventsData?.stats
   const createUpstream = useCreateUpstream()
   const updateUpstream = useUpdateUpstream()
   const deleteUpstream = useDeleteUpstream()
@@ -303,6 +306,9 @@ export function UpstreamPage() {
         </div>
       </div>
 
+      {/* 取货数据统计 */}
+      <PickupStatsPanel stats={stats} />
+
       {/* 列表 */}
       {isLoading ? (
         <Card><CardContent className="py-10 text-sm text-center text-muted-foreground">加载中…</CardContent></Card>
@@ -332,7 +338,7 @@ export function UpstreamPage() {
       )}
 
       {/* 事件日志 */}
-      <EventLog events={events ?? []} />
+      <EventLog events={events} />
 
       <UpstreamEditDialog
         open={editOpen}
@@ -385,6 +391,31 @@ export function UpstreamPage() {
     </div>
   )
 }
+// ── 取货数据统计面板（累计 / 今日 / 本周）───────────────────────────────────
+
+function PickupStatsPanel({ stats }: { stats?: PickupStats }) {
+  const items: { label: string; keys: number; orders: number; accent?: string }[] = [
+    { label: '今日取货', keys: stats?.todayKeys ?? 0, orders: stats?.todayOrders ?? 0, accent: 'text-emerald-600 dark:text-emerald-400' },
+    { label: '本周取货', keys: stats?.weekKeys ?? 0, orders: stats?.weekOrders ?? 0, accent: 'text-blue-600 dark:text-blue-400' },
+    { label: '累计取货', keys: stats?.totalKeys ?? 0, orders: stats?.totalOrders ?? 0 },
+  ]
+  return (
+    <div className="grid grid-cols-3 gap-2 sm:gap-4">
+      {items.map((it) => (
+        <Card key={it.label}>
+          <CardContent className="p-3 sm:p-5">
+            <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">{it.label}</div>
+            <div className={`mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl ${it.accent ?? ''}`}>
+              {it.keys}
+            </div>
+            <div className="mt-0.5 text-[11px] text-muted-foreground">{it.orders} 单</div>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  )
+}
+
 // ── 上游卡片 ─────────────────────────────────────────────────────────────────
 
 function UpstreamCard({
@@ -461,7 +492,6 @@ function UpstreamCard({
                 </Badge>
               )}
             </div>
-            <div className="text-xs text-muted-foreground font-mono truncate">{upstream.baseUrl || '未配置 URL'}</div>
             <div className="text-xs text-muted-foreground font-mono truncate">Key: {upstream.maskedApiKey}</div>
             {upstream.note && <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{upstream.note}</p>}
           </div>
@@ -493,14 +523,12 @@ function UpstreamCard({
           </div>
         )}
 
-        {/* Webhook 接收地址 */}
+        {/* Webhook 接收地址：全打码短展示，完整地址仅通过复制获取 */}
         {upstream.webhookReceiverUrl ? (
           <div className="flex items-center gap-1.5 rounded-md bg-secondary/40 px-2 py-1.5">
             <Webhook className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <span className="flex-1 min-w-0 truncate font-mono text-[11px]" title={upstream.webhookReceiverUrl}>
-              {upstream.webhookReceiverUrl}
-            </span>
-            <Button size="icon" variant="ghost" className="h-6 w-6" onClick={copyWebhook} title="复制接收地址">
+            <span className="flex-1 min-w-0 truncate text-[11px] text-muted-foreground">回调地址已配置 ·····</span>
+            <Button size="icon" variant="ghost" className="h-6 w-6" onClick={copyWebhook} title="复制完整接收地址">
               <Copy className="h-3 w-3" />
             </Button>
           </div>
