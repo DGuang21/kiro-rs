@@ -26,7 +26,7 @@ const MAX_EVENTS: usize = 500;
 
 // ── 配置实体 ─────────────────────────────────────────────────────────────────
 
-/// 单条高峰时段规则：某些星期几的 `[start_hour, end_hour)`（整点，按服务器本地时间）。
+/// 单条高峰时段规则：某些星期几的 `[start_hour, end_hour)`（整点，**按北京时间 UTC+8**）。
 ///
 /// - `weekdays`：0=周日 … 6=周六（与前端 JS `Date.getDay()` 一致）。空表示每天。
 /// - 时间为整点，`[start_hour, end_hour)` 左闭右开。支持跨天（start > end，如 22→6）。
@@ -519,13 +519,14 @@ impl UpstreamEventLog {
     /// 取货数据统计：累计 / 今日 / 本周成功入库的 Key 数与提货次数。
     ///
     /// 基于事件日志聚合（成功的自动 / 手动提号事件的 `imported` 求和）。
-    /// 时间按服务器本地时区划界；"本周"以周一为起点。
+    /// 时间**固定按北京时间 UTC+8** 划界；"本周"以周一为起点。
     /// 注意：事件日志为环形上限（MAX_EVENTS），"累计"是保留窗口内的合计。
     pub fn stats(&self) -> PickupStats {
-        use chrono::{Datelike, Local, TimeZone};
+        use chrono::{Datelike, TimeZone};
 
-        let now = Local::now();
-        let today_start = Local
+        let now = beijing_now();
+        let tz = beijing_offset();
+        let today_start = tz
             .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
             .single()
             .unwrap_or(now);
@@ -550,9 +551,9 @@ impl UpstreamEventLog {
             if imported == 0 {
                 continue;
             }
-            // 解析 created_at（RFC3339，UTC）→ 本地时区
+            // 解析 created_at（RFC3339）→ 北京时间
             let ts = match chrono::DateTime::parse_from_rfc3339(&e.created_at) {
-                Ok(t) => t.with_timezone(&Local),
+                Ok(t) => t.with_timezone(&tz),
                 Err(_) => continue,
             };
             s.total_keys += imported as u64;
@@ -610,6 +611,18 @@ pub fn make_event(
 
 fn normalize_opt(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// 固定北京时间 UTC+8 时区偏移。
+///
+/// 高峰时段与取货统计均按北京时间划界，不依赖服务器 / 容器时区（Docker 默认 UTC）。
+pub fn beijing_offset() -> chrono::FixedOffset {
+    chrono::FixedOffset::east_opt(8 * 3600).expect("UTC+8 是合法偏移")
+}
+
+/// 当前北京时间
+pub fn beijing_now() -> chrono::DateTime<chrono::FixedOffset> {
+    chrono::Utc::now().with_timezone(&beijing_offset())
 }
 
 /// 生成长度为 `len` 的十六进制随机串

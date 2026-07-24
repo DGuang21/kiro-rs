@@ -1017,7 +1017,7 @@ function UpstreamEditDialog({
                 <div className="min-w-0">
                   <div className="text-sm font-medium">按时间设置提货量（高峰 / 低谷）</div>
                   <p className="text-xs text-muted-foreground leading-snug">
-                    自定义"哪几天 + 几点到几点"为高峰；命中任一高峰规则用高峰量，其余用低谷量
+                    自定义"哪几天 + 几点到几点"为高峰（北京时间）；命中任一高峰规则用高峰量，其余用低谷量
                   </p>
                 </div>
                 <Switch
@@ -1056,7 +1056,7 @@ function UpstreamEditDialog({
                     </div>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    各档填 0 表示该时段按上游可提取上限提满。时间为服务器本地整点，右开区间；起 &gt; 止表示跨天（如 22→6）。
+                    各档填 0 表示该时段按上游可提取上限提满。时间为<b>北京时间(UTC+8)</b>整点，右开区间；起 &gt; 止表示跨天（如 22→6）。
                   </p>
                 </div>
               )}
