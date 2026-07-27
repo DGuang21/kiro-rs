@@ -1011,6 +1011,22 @@ export function CredentialCard({
             {credential.inFlight}
           </div>
         </div>
+
+        <div className="w-14 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            RPM
+          </div>
+          <div
+            className={`mt-0.5 text-sm font-medium tabular-nums ${
+              (credential.rpm ?? 0) > 0
+                ? "text-emerald-600 dark:text-emerald-400"
+                : "text-muted-foreground"
+            }`}
+            title="该凭据最近 60 秒的请求数"
+          >
+            {credential.rpm ?? 0}
+          </div>
+        </div>
       </div>
 
       <div className="hidden w-44 shrink-0 xl:block">
@@ -1310,6 +1326,15 @@ export function CredentialCard({
                 title="该凭据当前的在途请求数（并发）"
               >
                 {credential.inFlight}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">RPM</dt>
+              <dd
+                className={`tabular-nums font-medium ${(credential.rpm ?? 0) > 0 ? "text-emerald-600 dark:text-emerald-400" : ""}`}
+                title="该凭据最近 60 秒的请求数"
+              >
+                {credential.rpm ?? 0}
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">

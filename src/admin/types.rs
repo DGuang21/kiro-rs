@@ -82,6 +82,9 @@ pub struct CredentialStatusItem {
     pub source_channel: Option<String>,
     /// 该凭据当前的在途请求数（并发）
     pub in_flight: u32,
+    /// 该凭据最近 60 秒的请求数（瞬时 RPM）
+    #[serde(default)]
+    pub rpm: u64,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,

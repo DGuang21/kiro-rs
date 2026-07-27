@@ -98,6 +98,8 @@ export interface CredentialStatusItem {
   sourceChannel?: string
   /** 该凭据当前的在途请求数（并发） */
   inFlight: number
+  /** 该凭据最近 60 秒的请求数（瞬时 RPM） */
+  rpm?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -521,6 +523,8 @@ export interface OverviewStats {
   weekCredits: number
   activeClientKeys: number
   activeCredentials: number
+  /** 最近 60 秒的瞬时请求速率（每分钟请求数） */
+  rpm?: number
 }
 
 export interface TimeSeriesPoint {

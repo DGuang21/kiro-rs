@@ -2,10 +2,8 @@ import { useCallback, useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
-import { useByCredential, useByKey, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
-import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
-import { PageHeader } from '@/components/console/page-header'
+import { Activity, Calendar, Coins, Cpu, Gauge, KeyRound, Server } from 'lucide-react'
+import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import type {
@@ -140,6 +138,7 @@ export function OverviewPage() {
       <StatsCards
         activeCredentials={overview?.activeCredentials ?? 0}
         activeKeys={overview?.activeClientKeys ?? 0}
+        rpm={overview?.rpm ?? 0}
         stats={rangeStats}
         timeText={timeLabel(filters.timeFilter)}
       />
@@ -263,11 +262,13 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
 function StatsCards({
   activeCredentials,
   activeKeys,
+  rpm,
   stats,
   timeText,
 }: {
   activeCredentials: number
   activeKeys: number
+  rpm: number
   stats: RangeStats
   timeText: string
 }) {
@@ -279,6 +280,14 @@ function StatsCards({
       extra: stats.errors > 0 ? (
         <Badge variant="destructive">异常 {formatNumber(stats.errors)}</Badge>
       ) : null,
+    },
+    {
+      icon: <Gauge className="h-4 w-4" />,
+      label: 'RPM',
+      // RPM 是实时瞬时值，不受上方时间筛选影响，需覆盖默认的 meta 文案
+      meta: '最近 60 秒',
+      value: formatNumber(rpm),
+      extra: <span className="text-[11px] text-muted-foreground">请求/分钟</span>,
     },
     { icon: <Cpu className="h-4 w-4" />, label: '输入 Token', value: formatNumber(stats.inputTokens) },
     { icon: <Cpu className="h-4 w-4" />, label: '输出 Token', value: formatNumber(stats.outputTokens) },
@@ -303,7 +312,7 @@ function StatsCards({
   ]
 
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-5">
+    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-6">
       {cards.map((card) => (
         <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
       ))}

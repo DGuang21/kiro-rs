@@ -42,7 +42,12 @@ type CredSessionPath = (u64, String);
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_all_credentials();
+    let mut response = state.service.get_all_credentials();
+    // 补齐每个凭据最近 60 秒的瞬时 RPM
+    let (_, by_cred) = state.usage_aggregator.rpm_snapshot();
+    for cred in &mut response.credentials {
+        cred.rpm = by_cred.get(&cred.id).copied().unwrap_or(0);
+    }
     Json(response)
 }
 
@@ -1316,6 +1321,8 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     let active_keys = state.client_keys.active_count() as u64;
     let snapshot = state.service.get_all_credentials();
     let active_credentials = snapshot.credentials.iter().filter(|c| !c.disabled).count() as u64;
+    // 最近 60 秒的瞬时 RPM
+    let (rpm, _) = state.usage_aggregator.rpm_snapshot();
     let response = serde_json::json!({
         "todayCalls": overview.today_calls,
         "todayInputTokens": overview.today_input_tokens,
@@ -1328,6 +1335,7 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
         "weekCredits": overview.week_credits,
         "activeClientKeys": active_keys,
         "activeCredentials": active_credentials,
+        "rpm": rpm,
     });
     Json(response)
 }

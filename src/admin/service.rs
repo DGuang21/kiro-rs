@@ -768,6 +768,8 @@ impl AdminService {
                     groups: entry.groups,
                     source_channel: entry.source_channel,
                     in_flight: entry.in_flight,
+                    // RPM 由 handler 层用 UsageAggregator 补齐（service 不持有聚合器）
+                    rpm: 0,
                     balance,
                     balance_updated_at,
                     created_at: entry.created_at,

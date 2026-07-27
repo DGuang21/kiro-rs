@@ -22,6 +22,8 @@ const RETENTION_DAYS: i64 = 31;
 const HOUR_BUCKETS: usize = 24 * 31;
 /// 天桶数量（31 天）
 const DAY_BUCKETS: usize = 31;
+/// RPM 采样窗口（秒）：统计最近 60 秒的请求数作为瞬时 RPM
+const RPM_WINDOW_SECS: i64 = 60;
 
 /// 单次请求的用量记录（与 JSONL 一行一一对应）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,11 +227,82 @@ pub struct UsageAggregator {
     inner: parking_lot::RwLock<AggregatorInner>,
 }
 
+/// RPM 秒级采样槽
+///
+/// 每个槽代表一个 Unix 秒。槽是"可复用"的：`ts` 不在当前窗口内时视为过期，
+/// 下次写入直接覆盖，因此固定 60 个槽即可表达最近 60 秒的滑动窗口，
+/// 无需分配或淘汰。
+#[derive(Debug, Default, Clone)]
+struct RpmSlot {
+    /// 该槽对应的 Unix 秒；0 表示空槽
+    ts: i64,
+    /// 该秒内的总请求数
+    calls: u64,
+    /// 该秒内按上游凭据 id 的请求数（不含未走到上游的请求）
+    by_credential: HashMap<u64, u64>,
+}
+
+/// 最近 60 秒的请求速率采样环
+///
+/// 用秒级槽而非分钟桶：RPM 需要滑动窗口语义（"最近 60 秒"），
+/// 分钟对齐的桶在整分边界会瞬间归零，读数不可用。
+struct RpmRing {
+    slots: Vec<RpmSlot>,
+}
+
+impl RpmRing {
+    fn new() -> Self {
+        Self {
+            slots: vec![RpmSlot::default(); RPM_WINDOW_SECS as usize],
+        }
+    }
+
+    fn slot_index(ts: i64) -> usize {
+        ts.rem_euclid(RPM_WINDOW_SECS) as usize
+    }
+
+    /// 记录一次发生在 `ts`（Unix 秒）的请求
+    fn record(&mut self, ts: i64, credential_id: u64) {
+        let idx = Self::slot_index(ts);
+        let slot = &mut self.slots[idx];
+        // 槽被上一轮（≥60s 前）占用：先清空再复用
+        if slot.ts != ts {
+            slot.ts = ts;
+            slot.calls = 0;
+            slot.by_credential.clear();
+        }
+        slot.calls += 1;
+        if credential_id != 0 {
+            *slot.by_credential.entry(credential_id).or_insert(0) += 1;
+        }
+    }
+
+    /// 汇总窗口内（`now - 60s < ts <= now`）的总请求数与各凭据请求数
+    fn snapshot(&self, now: i64) -> (u64, HashMap<u64, u64>) {
+        let cutoff = now - RPM_WINDOW_SECS;
+        let mut total = 0u64;
+        let mut by_credential: HashMap<u64, u64> = HashMap::new();
+        for slot in &self.slots {
+            // 过期槽（上一轮残留）与未来时间戳（时钟回拨）都跳过
+            if slot.ts <= cutoff || slot.ts > now {
+                continue;
+            }
+            total += slot.calls;
+            for (id, n) in &slot.by_credential {
+                *by_credential.entry(*id).or_insert(0) += n;
+            }
+        }
+        (total, by_credential)
+    }
+}
+
 struct AggregatorInner {
     /// 小时桶（环形数组按桶起始时间索引），最近 31 天
     hour_buckets: Vec<BucketEntry>,
     /// 天桶（按本地日期），最近 31 天
     day_buckets: Vec<BucketEntry>,
+    /// 最近 60 秒的请求速率采样（不持久化，重启后从 0 开始累积）
+    rpm: RpmRing,
 }
 
 /// 预设聚合查询时间范围
@@ -363,6 +436,7 @@ impl UsageAggregator {
             inner: parking_lot::RwLock::new(AggregatorInner {
                 hour_buckets: Vec::new(),
                 day_buckets: Vec::new(),
+                rpm: RpmRing::new(),
             }),
         }
     }
@@ -442,6 +516,17 @@ impl UsageAggregator {
 
         upsert_bucket(&mut inner.hour_buckets, hour_ts, rec, HOUR_BUCKETS);
         upsert_bucket(&mut inner.day_buckets, day_ts, rec, DAY_BUCKETS);
+        // RPM 秒级采样：历史记录（重建时装载）的时间戳落在窗口外，读取时自然被跳过
+        inner.rpm.record(dt.timestamp(), rec.credential_id);
+    }
+
+    /// 最近 60 秒的瞬时 RPM（总量 + 按上游凭据）
+    ///
+    /// 返回 `(总 RPM, 各凭据 RPM)`。窗口为滑动的"最近 60 秒"，
+    /// 因此数值即为每分钟请求数，无需再做换算。
+    pub fn rpm_snapshot(&self) -> (u64, HashMap<u64, u64>) {
+        let inner = self.inner.read();
+        inner.rpm.snapshot(Utc::now().timestamp())
     }
 
     /// 时序数据查询
@@ -773,6 +858,79 @@ pub type SharedAggregator = Arc<UsageAggregator>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造一条指定时间/凭据的记录
+    fn rec_at(ts: DateTime<Utc>, credential_id: u64) -> UsageRecord {
+        UsageRecord {
+            ts: ts.to_rfc3339(),
+            key_id: 1,
+            credential_id,
+            model: "claude-opus-4-7".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            duration_ms: 100,
+            status: "success".to_string(),
+        }
+    }
+
+    #[test]
+    fn rpm_counts_only_last_60_seconds() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now();
+
+        // 窗口内：3 次（凭据 5 两次、凭据 7 一次）
+        agg.ingest(&rec_at(now, 5));
+        agg.ingest(&rec_at(now - Duration::seconds(10), 5));
+        agg.ingest(&rec_at(now - Duration::seconds(30), 7));
+        // 窗口外：应被排除
+        agg.ingest(&rec_at(now - Duration::seconds(90), 5));
+        agg.ingest(&rec_at(now - Duration::seconds(3600), 5));
+
+        let (total, by_cred) = agg.rpm_snapshot();
+        assert_eq!(total, 3, "只应统计最近 60 秒内的请求");
+        assert_eq!(by_cred.get(&5).copied(), Some(2));
+        assert_eq!(by_cred.get(&7).copied(), Some(1));
+    }
+
+    #[test]
+    fn rpm_slot_reuse_does_not_double_count_previous_minute() {
+        // 同一秒槽被上一轮（恰好 60s 前）占用时，必须清空后复用，
+        // 否则 60s 前的请求会被算进当前 RPM。
+        let mut ring = RpmRing::new();
+        let now = 1_700_000_000i64;
+
+        ring.record(now - RPM_WINDOW_SECS, 5); // 落在同一 slot index
+        ring.record(now, 5);
+
+        let (total, by_cred) = ring.snapshot(now);
+        assert_eq!(total, 1, "上一轮同槽记录必须被覆盖，不得重复计数");
+        assert_eq!(by_cred.get(&5).copied(), Some(1));
+    }
+
+    #[test]
+    fn rpm_ignores_credential_zero_but_counts_total() {
+        // credential_id = 0 表示请求未走到上游：计入总量，但不归属任何凭据
+        let mut ring = RpmRing::new();
+        let now = 1_700_000_000i64;
+        ring.record(now, 0);
+
+        let (total, by_cred) = ring.snapshot(now);
+        assert_eq!(total, 1);
+        assert!(by_cred.is_empty());
+    }
+
+    #[test]
+    fn rpm_skips_future_timestamps_from_clock_skew() {
+        let mut ring = RpmRing::new();
+        let now = 1_700_000_000i64;
+        ring.record(now + 5, 5);
+
+        let (total, _) = ring.snapshot(now);
+        assert_eq!(total, 0, "时钟回拨产生的未来时间戳不应计入");
+    }
 
     #[test]
     fn parse_log_filename() {
