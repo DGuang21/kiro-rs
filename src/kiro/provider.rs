@@ -921,7 +921,7 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
+            // 401/403 - 凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
                 // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
                 if status.as_u16() == 403

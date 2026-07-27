@@ -6106,6 +6106,39 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
     }
 
+    /// 混合场景：封禁死号与"失败过多"死号共存时，自愈只复活后者。
+    #[tokio::test]
+    async fn test_self_heal_skips_suspended_but_recovers_too_many_failures() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // id=1 因封禁永久禁用；id=2 因连续失败被自动禁用
+        manager.report_suspended(1);
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(2);
+        }
+        assert_eq!(manager.available_count(), 0);
+
+        // 自愈只应复活 id=2
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx.id, 2, "自愈只应复活 TooManyFailures 的凭据");
+        assert_eq!(manager.available_count(), 1);
+
+        let snapshot = manager.snapshot();
+        let suspended = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(suspended.disabled, "封禁死号必须保持禁用");
+        assert_eq!(suspended.disabled_reason.as_deref(), Some("Suspended"));
+    }
+
     // ============ 凭据级 Region 优先级测试 ============
 
     #[test]

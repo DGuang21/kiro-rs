@@ -492,6 +492,7 @@ fn model_supports_xhigh_effort(model_id: &str) -> bool {
     // Anthropic documents xhigh for Opus 4.7/4.8, Fable 5, and Mythos 5.
     if model.contains("opus-4.7")
         || model.contains("opus-4.8")
+        || model.contains("opus-5")
         || model.contains("fable-5")
         || model.contains("mythos-5")
         || model.contains("claude-5")
@@ -1954,6 +1955,24 @@ mod tests {
             map_model("claude-3-5-sonnet-20241022"),
             Some("claude-sonnet-3.5".to_string())
         );
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(
+            map_model("claude-opus-5-20260630-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        // 点号形式 opus.5 也应命中
+        assert_eq!(
+            map_model("claude-opus.5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        // opus-5 支持原生 reasoning 与 xhigh
+        assert!(model_supports_native_reasoning("claude-opus-5"));
+        assert!(model_supports_xhigh_effort("claude-opus-5"));
     }
 
     #[test]
