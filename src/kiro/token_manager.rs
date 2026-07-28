@@ -2003,11 +2003,17 @@ impl MultiTokenManager {
                 // 优先级负载均衡：先取可用集合里最高优先级层（priority 值最小），
                 // 仅在该层内做 least-used 均衡。平局再按 id 保证确定性。
                 // 该层全部不可用时，min(priority) 自动落到下一层，实现逐层降级。
-                let top_priority = available.iter().map(|(e, _)| e.credentials.priority).min()?;
-                let (entry, _) = available
-                    .iter()
-                    .filter(|(e, _)| e.credentials.priority == top_priority)
-                    .min_by_key(|(e, _)| (e.success_count, e.id))?;
+                // discovery_rank 置于键首，与 priority 模式一致：已确认支持目标模型的
+                // 凭据优先于尚未确认的，避免绕过动态模型发现的分层。
+                let (entry, _) = available.iter().min_by_key(|(e, support)| {
+                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
+                    (
+                        discovery_rank,
+                        e.credentials.priority,
+                        e.success_count,
+                        e.id,
+                    )
+                })?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -2015,10 +2021,18 @@ impl MultiTokenManager {
                 // 优先级随机：先取可用集合里最高优先级层（priority 值最小），
                 // 在该层内随机选择一个账号；该层全部不可用时，min(priority) 自动
                 // 落到下一层，继续在下一层内随机选择，实现逐层随机降级。
-                let top_priority = available.iter().map(|(e, _)| e.credentials.priority).min()?;
+                // discovery_rank 同样参与分层，保持"已确认优先"。
+                let tier_key = |e: &CredentialEntry, support: &CachedModelSupport| {
+                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
+                    (discovery_rank, e.credentials.priority)
+                };
+                let top_tier = available
+                    .iter()
+                    .map(|(e, support)| tier_key(e, support))
+                    .min()?;
                 let tier: Vec<_> = available
                     .iter()
-                    .filter(|(e, _)| e.credentials.priority == top_priority)
+                    .filter(|(e, support)| tier_key(e, support) == top_tier)
                     .collect();
                 let (entry, _) = tier[fastrand::usize(..tier.len())];
 
