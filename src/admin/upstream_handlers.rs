@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::middleware::AdminState;
 use super::upstream::{
-    UpstreamEventKind, WEBHOOK_PATH_PREFIX, make_event, new_client_order_id,
+    UpstreamEventKind, UpstreamPlatform, WEBHOOK_PATH_PREFIX, make_event, new_client_order_id,
 };
 
 // ── 请求体 ───────────────────────────────────────────────────────────────────
@@ -25,6 +25,8 @@ use super::upstream::{
 #[serde(rename_all = "camelCase")]
 pub struct CreateUpstreamRequest {
     pub name: String,
+    #[serde(default)]
+    pub platform: UpstreamPlatform,
     pub base_url: String,
     pub api_key: String,
     #[serde(default)]
@@ -50,6 +52,8 @@ pub struct CreateUpstreamRequest {
 pub struct UpdateUpstreamRequest {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub platform: Option<UpstreamPlatform>,
     #[serde(default)]
     pub base_url: Option<String>,
     /// 空串表示不修改
@@ -97,6 +101,8 @@ where
 #[serde(rename_all = "camelCase")]
 pub struct StockView {
     pub max: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_price: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +128,7 @@ pub async fn create_upstream(
 ) -> impl IntoResponse {
     match state.upstreams.create(
         req.name,
+        req.platform,
         req.base_url,
         req.api_key,
         req.receiver_base_url,
@@ -146,6 +153,7 @@ pub async fn update_upstream(
     match state.upstreams.update(
         &id,
         req.name,
+        req.platform,
         req.base_url,
         req.api_key,
         req.receiver_base_url,
@@ -193,7 +201,11 @@ pub async fn upstream_stock(
     };
     let client = state.service.build_upstream_client(&cfg);
     match client.get_stock().await {
-        Ok(s) => Json(StockView { max: s.max }).into_response(),
+        Ok(s) => Json(StockView {
+            max: s.max,
+            key_price: s.key_price,
+        })
+        .into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
     }
 }
@@ -304,7 +316,10 @@ pub async fn upstream_purchase(
                 &cfg.id,
                 &cfg.name,
                 UpstreamEventKind::ManualPurchase,
-                format!("手动提号：请求 {} 个，出 Key {} 个，入库 {} 个", req.count, purchased, imported),
+                format!(
+                    "手动提号：请求 {} 个，出 Key {} 个，入库 {} 个",
+                    req.count, purchased, imported
+                ),
                 Some(order_id.clone()),
                 count,
                 Some(imported),
@@ -342,6 +357,9 @@ pub async fn upstream_register_webhook(
     let Some(cfg) = state.upstreams.get(&id) else {
         return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
     };
+    if !cfg.platform.supports_webhook() {
+        return bad_request("KiroApp 平台不支持 Webhook");
+    }
     let Some(base) = cfg.receiver_base_url.as_ref() else {
         return bad_request("请先配置本服务对外可达地址（receiverBaseUrl）再注册");
     };
@@ -371,6 +389,9 @@ pub async fn upstream_test_webhook(
     let Some(cfg) = state.upstreams.get(&id) else {
         return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
     };
+    if !cfg.platform.supports_webhook() {
+        return bad_request("KiroApp 平台不支持 Webhook");
+    }
     let client = state.service.build_upstream_client(&cfg);
     match client.test_webhook().await {
         Ok(_) => Json(serde_json::json!({ "success": true, "message": "已触发测试推送" }))
@@ -546,5 +567,3 @@ fn err_body(msg: impl Into<String>) -> serde_json::Value {
 fn bad_request(msg: impl Into<String>) -> axum::response::Response {
     (StatusCode::BAD_REQUEST, Json(err_body(msg))).into_response()
 }
-
-

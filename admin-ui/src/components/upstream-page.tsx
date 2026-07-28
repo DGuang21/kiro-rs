@@ -64,6 +64,7 @@ import {
   type PurchaseSchedule,
   type PeakWindow,
   type PickupStats,
+  type UpstreamPlatform,
 } from '@/api/upstream'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -74,6 +75,7 @@ function fmtCount(n: number): string {
 interface EditState {
   id?: string
   name: string
+  platform: UpstreamPlatform
   baseUrl: string
   apiKey: string
   receiverBaseUrl: string
@@ -91,6 +93,7 @@ interface EditState {
 
 const emptyEdit: EditState = {
   name: '',
+  platform: 'legacy',
   baseUrl: '',
   apiKey: '',
   receiverBaseUrl: '',
@@ -129,7 +132,9 @@ export function UpstreamPage() {
   const [edit, setEdit] = useState<EditState>(emptyEdit)
 
   // 余额 / 库存缓存：id → 结果
-  const [profiles, setProfiles] = useState<Record<string, UpstreamProfile & { max?: number }>>({})
+  const [profiles, setProfiles] = useState<
+    Record<string, UpstreamProfile & { max?: number; keyPrice?: number }>
+  >({})
   const [loadingId, setLoadingId] = useState<string | null>(null)
   const [purchasingId, setPurchasingId] = useState<string | null>(null)
 
@@ -145,6 +150,7 @@ export function UpstreamPage() {
     setEdit({
       id: u.id,
       name: u.name,
+      platform: u.platform,
       baseUrl: u.baseUrl,
       apiKey: '', // 不回填明文，留空表示不改
       receiverBaseUrl: u.receiverBaseUrl ?? '',
@@ -172,7 +178,7 @@ export function UpstreamPage() {
       return Number.isNaN(n) || n < 0 ? 0 : n
     }
     // 校验：开启分时段但没配任何高峰规则
-    if (edit.scheduleEnabled && edit.peakWindows.length === 0) {
+    if (edit.platform === 'legacy' && edit.scheduleEnabled && edit.peakWindows.length === 0) {
       toast.error('已开启分时段，请至少添加一条高峰时段规则')
       return
     }
@@ -184,9 +190,12 @@ export function UpstreamPage() {
     }
     const req = {
       name: edit.name.trim(),
-      baseUrl: edit.baseUrl.trim(),
-      receiverBaseUrl: edit.receiverBaseUrl.trim() || null,
-      autoPurchaseEnabled: edit.autoPurchaseEnabled,
+      platform: edit.platform,
+      baseUrl:
+        edit.baseUrl.trim() || (edit.platform === 'kiro_app' ? 'https://kiroapp.cc' : ''),
+      receiverBaseUrl:
+        edit.platform === 'legacy' ? edit.receiverBaseUrl.trim() || null : null,
+      autoPurchaseEnabled: edit.platform === 'legacy' && edit.autoPurchaseEnabled,
       autoPurchaseCount: Number.isNaN(count) || count < 0 ? 0 : count,
       schedule,
       endpoint: edit.endpoint.trim() || null,
@@ -240,15 +249,18 @@ export function UpstreamPage() {
         queryUpstreamProfile(u.id),
         queryUpstreamStock(u.id),
       ])
-      const merged: UpstreamProfile & { max?: number } = {}
+      const merged: UpstreamProfile & { max?: number; keyPrice?: number } = {}
       if (profile.status === 'fulfilled') Object.assign(merged, profile.value)
-      if (stock.status === 'fulfilled') merged.max = stock.value.max
+      if (stock.status === 'fulfilled') {
+        merged.max = stock.value.max
+        merged.keyPrice = stock.value.keyPrice
+      }
       setProfiles((prev) => ({ ...prev, [u.id]: merged }))
       if (profile.status === 'rejected' && stock.status === 'rejected') {
         toast.error('查询失败: ' + extractErrorMessage(stock.reason))
       } else {
         toast.success(
-          `${u.name}：余额 ${merged.remaining ?? '-'}，可提取 ${merged.max ?? '-'} 个`,
+          `${u.name}：${u.platform === 'kiro_app' ? '积分' : '余额'} ${merged.remaining ?? '-'}，可提取 ${merged.max ?? '-'} 个`,
         )
       }
     } finally {
@@ -429,7 +441,7 @@ function UpstreamCard({
   onDelete,
 }: {
   upstream: UpstreamConfig
-  profile?: UpstreamProfile & { max?: number }
+  profile?: UpstreamProfile & { max?: number; keyPrice?: number }
   loading: boolean
   purchasing: boolean
   onQuery: () => void
@@ -482,6 +494,9 @@ function UpstreamCard({
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 min-w-0">
               <span className="font-medium truncate">{upstream.name}</span>
+              <Badge variant="outline" className="text-xs shrink-0">
+                {upstream.platform === 'kiro_app' ? 'KiroApp' : 'Webhook API'}
+              </Badge>
               {!upstream.enabled && <Badge variant="outline" className="text-xs text-muted-foreground">已禁用</Badge>}
               {upstream.autoPurchaseEnabled && (
                 <Badge variant="secondary" className="text-xs gap-1 shrink-0">
@@ -515,16 +530,19 @@ function UpstreamCard({
         {profile && (
           <div className="flex flex-wrap items-center gap-2 text-xs">
             {profile.remaining != null && (
-              <Badge variant="secondary" className="gap-1"><Wallet className="h-3 w-3" />余额 {profile.remaining}</Badge>
+              <Badge variant="secondary" className="gap-1"><Wallet className="h-3 w-3" />{upstream.platform === 'kiro_app' ? '积分' : '余额'} {profile.remaining}</Badge>
             )}
             {profile.max != null && (
               <Badge variant="secondary" className="gap-1"><KeyRound className="h-3 w-3" />可提取 {profile.max} 个</Badge>
+            )}
+            {profile.keyPrice != null && (
+              <Badge variant="secondary" className="gap-1">单价 {profile.keyPrice}</Badge>
             )}
           </div>
         )}
 
         {/* Webhook 接收地址：全打码短展示，完整地址仅通过复制获取 */}
-        {upstream.webhookReceiverUrl ? (
+        {upstream.platform !== 'legacy' ? null : upstream.webhookReceiverUrl ? (
           <div className="flex items-center gap-1.5 rounded-md bg-secondary/40 px-2 py-1.5">
             <Webhook className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             <span className="flex-1 min-w-0 truncate text-[11px] text-muted-foreground">回调地址已配置 ·····</span>
@@ -540,31 +558,35 @@ function UpstreamCard({
         <div className="flex flex-wrap items-center gap-1.5">
           <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onQuery} disabled={loading}>
             {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />}
-            查询余额
+            {upstream.platform === 'kiro_app' ? '查询库存' : '查询余额'}
           </Button>
           <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onPurchase} disabled={purchasing}>
             {purchasing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
             提号入库
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8 text-xs"
-            onClick={handleRegister}
-            disabled={registering || !upstream.webhookReceiverUrl}
-            title={upstream.webhookReceiverUrl ? '把接收地址注册到上游' : '请先配置本服务对外地址'}
-          >
-            {registering ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Webhook className="h-3.5 w-3.5" />}
-            注册 Webhook
-          </Button>
-          <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={handleTest} disabled={testing}>
-            {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-            测试推送
-          </Button>
-          <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={() => setDetailsOpen(true)}>
-            <Info className="h-3.5 w-3.5" />
-            详情
-          </Button>
+          {upstream.platform === 'legacy' && (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 text-xs"
+                onClick={handleRegister}
+                disabled={registering || !upstream.webhookReceiverUrl}
+                title={upstream.webhookReceiverUrl ? '把接收地址注册到上游' : '请先配置本服务对外地址'}
+              >
+                {registering ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Webhook className="h-3.5 w-3.5" />}
+                注册 Webhook
+              </Button>
+              <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={handleTest} disabled={testing}>
+                {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                测试推送
+              </Button>
+              <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={() => setDetailsOpen(true)}>
+                <Info className="h-3.5 w-3.5" />
+                详情
+              </Button>
+            </>
+          )}
         </div>
       </CardContent>
       <UpstreamDetailsDialog upstream={upstream} open={detailsOpen} onOpenChange={setDetailsOpen} />
@@ -919,6 +941,22 @@ function UpstreamEditDialog({
   groupOptions: string[]
 }) {
   const set = (patch: Partial<EditState>) => onChange({ ...edit, ...patch })
+  const setPlatform = (platform: UpstreamPlatform) => {
+    if (platform === 'kiro_app') {
+      set({
+        platform,
+        baseUrl: 'https://kiroapp.cc',
+        receiverBaseUrl: '',
+        autoPurchaseEnabled: false,
+        scheduleEnabled: false,
+      })
+    } else {
+      set({
+        platform,
+        baseUrl: edit.baseUrl === 'https://kiroapp.cc' ? '' : edit.baseUrl,
+      })
+    }
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -940,9 +978,25 @@ function UpstreamEditDialog({
             />
           </div>
           <div className="space-y-1.5">
+            <label className="text-sm font-medium">平台类型</label>
+            <Select
+              value={edit.platform}
+              onValueChange={(value) => setPlatform(value as UpstreamPlatform)}
+              disabled={saving}
+            >
+              <SelectTrigger className="h-10 rounded-xl px-3.5">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="legacy">现有 Webhook 平台</SelectItem>
+                <SelectItem value="kiro_app">KiroApp</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
             <label className="text-sm font-medium">API 基础地址</label>
             <Input
-              placeholder="https://api.example.com"
+              placeholder={edit.platform === 'kiro_app' ? 'https://kiroapp.cc' : 'https://api.example.com'}
               value={edit.baseUrl}
               onChange={(e) => set({ baseUrl: e.target.value })}
               disabled={saving}
@@ -956,7 +1010,7 @@ function UpstreamEditDialog({
             </label>
             <Input
               type="password"
-              placeholder="usr-xxxxxxxx"
+              placeholder={edit.platform === 'kiro_app' ? 'KiroApp Open API Key' : 'usr-xxxxxxxx'}
               value={edit.apiKey}
               onChange={(e) => set({ apiKey: e.target.value })}
               disabled={saving}
@@ -964,6 +1018,8 @@ function UpstreamEditDialog({
               autoComplete="new-password"
             />
           </div>
+          {edit.platform === 'legacy' && (
+            <>
           <div className="space-y-1.5">
             <label className="text-sm font-medium">本服务对外地址</label>
             <Input
@@ -1062,6 +1118,8 @@ function UpstreamEditDialog({
               )}
             </div>
           </div>
+            </>
+          )}
 
           <div className="space-y-1.5">
             <label className="text-sm font-medium">默认端点</label>
@@ -1092,7 +1150,7 @@ function UpstreamEditDialog({
               onChange={(g) => set({ groups: g })}
               disabled={saving}
             />
-            <p className="text-xs text-muted-foreground">自动/手动提号入库的凭据会打上这些分组。</p>
+            <p className="text-xs text-muted-foreground">提号入库的凭据会打上这些分组。</p>
           </div>
 
           <div className="space-y-1.5">
@@ -1116,6 +1174,3 @@ function UpstreamEditDialog({
     </Dialog>
   )
 }
-
-
-

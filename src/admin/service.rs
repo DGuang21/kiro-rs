@@ -2972,6 +2972,7 @@ impl AdminService {
         let proxy = self.token_manager.proxy();
         let tls_backend = self.token_manager.config().tls_backend;
         crate::admin::upstream::UpstreamClient::new(
+            cfg.platform,
             cfg.base_url.clone(),
             cfg.api_key.clone(),
             proxy,
