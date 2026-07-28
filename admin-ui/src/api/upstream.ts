@@ -8,9 +8,11 @@ import { storage } from '@/lib/storage'
 
 const api = axios.create({
   baseURL: '/api/admin',
-  timeout: 30000,
+  timeout: 240000,
   headers: { 'Content-Type': 'application/json' },
 })
+
+export type UpstreamPlatform = 'legacy' | 'kiro_app'
 
 api.interceptors.request.use((config) => {
   const apiKey = storage.getApiKey()
@@ -43,6 +45,7 @@ export interface PurchaseSchedule {
 export interface UpstreamConfig {
   id: string
   name: string
+  platform: UpstreamPlatform
   baseUrl: string
   /** 脱敏后的 apiKey（仅展示） */
   maskedApiKey: string
@@ -73,6 +76,7 @@ export interface UpstreamsResponse {
 /** 创建 / 更新上游的请求体 */
 export interface UpsertUpstreamRequest {
   name: string
+  platform?: UpstreamPlatform
   baseUrl?: string
   /** 明文 apiKey；更新时留空表示不改 */
   apiKey?: string
@@ -88,6 +92,7 @@ export interface UpsertUpstreamRequest {
 
 export interface StockResponse {
   max: number
+  keyPrice?: number
 }
 
 export interface UpstreamProfile {

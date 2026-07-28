@@ -23,6 +23,24 @@ use crate::model::config::TlsBackend;
 const UPSTREAM_TIMEOUT_SECS: u64 = 30;
 /// 事件日志保留上限（环形，超出丢弃最旧）
 const MAX_EVENTS: usize = 500;
+/// KiroApp 开放 API 默认地址。
+pub const KIRO_APP_DEFAULT_BASE_URL: &str = "https://kiroapp.cc";
+const KIRO_APP_DEFAULT_COOLDOWN_SECS: u64 = 180;
+
+/// 补货平台协议。`legacy` 是已有的 `/api/my/* + webhook` 协议。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamPlatform {
+    #[default]
+    Legacy,
+    KiroApp,
+}
+
+impl UpstreamPlatform {
+    pub fn supports_webhook(self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
 
 // ── 配置实体 ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +121,9 @@ pub struct UpstreamConfig {
     pub id: String,
     /// 展示名
     pub name: String,
+    /// 上游平台协议；旧配置缺失该字段时按 legacy 读取。
+    #[serde(default)]
+    pub platform: UpstreamPlatform,
     /// 上游 API 基础地址，如 https://api.example.com
     pub base_url: String,
     /// 上游鉴权 API Key（usr-xxx），敏感，不明文返回给前端
@@ -167,6 +188,7 @@ impl UpstreamConfig {
 pub struct UpstreamView {
     pub id: String,
     pub name: String,
+    pub platform: UpstreamPlatform,
     pub base_url: String,
     /// 脱敏后的 api_key（仅展示尾部）
     pub masked_api_key: String,
@@ -210,6 +232,7 @@ impl UpstreamConfig {
         UpstreamView {
             id: self.id.clone(),
             name: self.name.clone(),
+            platform: self.platform,
             base_url: self.base_url.clone(),
             masked_api_key: mask_api_key(&self.api_key),
             receiver_base_url: self.receiver_base_url.clone(),
@@ -332,7 +355,7 @@ impl UpstreamManager {
         self.inner
             .read()
             .iter()
-            .find(|u| u.webhook_token == token)
+            .find(|u| u.platform.supports_webhook() && u.webhook_token == token)
             .cloned()
     }
 
@@ -341,6 +364,7 @@ impl UpstreamManager {
     pub fn create(
         &self,
         name: String,
+        platform: UpstreamPlatform,
         base_url: String,
         api_key: String,
         receiver_base_url: Option<String>,
@@ -361,7 +385,8 @@ impl UpstreamManager {
         let cfg = UpstreamConfig {
             id: format!("up_{}", random_hex(12)),
             name,
-            base_url: base_url.trim().trim_end_matches('/').to_string(),
+            platform,
+            base_url: normalized_base_url(platform, &base_url),
             api_key: api_key.trim().to_string(),
             receiver_base_url: normalize_opt(receiver_base_url),
             webhook_token: random_hex(32),
@@ -374,6 +399,8 @@ impl UpstreamManager {
             note: normalize_opt(note),
             created_at: Utc::now().to_rfc3339(),
         };
+        let mut cfg = cfg;
+        apply_platform_capabilities(&mut cfg);
         let mut inner = self.inner.write();
         inner.push(cfg.clone());
         self.save_locked(&inner);
@@ -386,6 +413,7 @@ impl UpstreamManager {
         &self,
         id: &str,
         name: Option<String>,
+        platform: Option<UpstreamPlatform>,
         base_url: Option<String>,
         api_key: Option<String>,
         receiver_base_url: Option<Option<String>>,
@@ -409,8 +437,11 @@ impl UpstreamManager {
             }
             cfg.name = v;
         }
+        if let Some(v) = platform {
+            cfg.platform = v;
+        }
         if let Some(v) = base_url {
-            cfg.base_url = v.trim().trim_end_matches('/').to_string();
+            cfg.base_url = normalized_base_url(cfg.platform, &v);
         }
         if let Some(v) = api_key {
             let v = v.trim();
@@ -442,6 +473,7 @@ impl UpstreamManager {
         if let Some(v) = note {
             cfg.note = normalize_opt(v);
         }
+        apply_platform_capabilities(cfg);
         let cloned = cfg.clone();
         self.save_locked(&inner);
         Ok(cloned)
@@ -457,6 +489,24 @@ impl UpstreamManager {
             self.save_locked(&inner);
         }
         removed
+    }
+}
+
+fn normalized_base_url(platform: UpstreamPlatform, value: &str) -> String {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() && platform == UpstreamPlatform::KiroApp {
+        KIRO_APP_DEFAULT_BASE_URL.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn apply_platform_capabilities(cfg: &mut UpstreamConfig) {
+    cfg.base_url = normalized_base_url(cfg.platform, &cfg.base_url);
+    if !cfg.platform.supports_webhook() {
+        cfg.receiver_base_url = None;
+        cfg.auto_purchase_enabled = false;
+        cfg.schedule = PurchaseSchedule::default();
     }
 }
 
@@ -650,6 +700,8 @@ pub fn default_events_path_in(dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StockResponse {
     pub max: u32,
+    #[serde(default)]
+    pub key_price: Option<f64>,
 }
 
 /// GET /api/my/profile 响应。
@@ -685,6 +737,27 @@ pub struct PurchaseResponse {
     pub remaining: Option<f64>,
     #[serde(default)]
     pub keys: Vec<PurchasedKey>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KiroAppStockResponse {
+    available_keys: u32,
+    #[serde(default)]
+    key_price: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KiroAppBalanceResponse {
+    balance: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct KiroAppClaimResponse {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    keys: Vec<String>,
 }
 
 /// GET /api/my/keys 单条
@@ -735,6 +808,7 @@ pub struct PurchaseOrder {
 
 /// 上游 API 客户端。每次调用按需构建（无状态），可选走全局代理。
 pub struct UpstreamClient {
+    platform: UpstreamPlatform,
     base_url: String,
     api_key: String,
     proxy: Option<ProxyConfig>,
@@ -743,12 +817,14 @@ pub struct UpstreamClient {
 
 impl UpstreamClient {
     pub fn new(
+        platform: UpstreamPlatform,
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         proxy: Option<ProxyConfig>,
         tls_backend: TlsBackend,
     ) -> Self {
         Self {
+            platform,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             proxy,
@@ -768,26 +844,76 @@ impl UpstreamClient {
         }
     }
 
-    /// 统一处理：非 2xx 时读取 {"error":"..."} 并抛错
+    /// 统一处理旧平台响应；同时兼容 KiroApp 的嵌套错误结构。
     async fn parse_json<T: serde::de::DeserializeOwned>(
         resp: reqwest::Response,
     ) -> anyhow::Result<T> {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        Self::parse_json_text(status, &text)
+    }
+
+    fn parse_json_text<T: serde::de::DeserializeOwned>(
+        status: reqwest::StatusCode,
+        text: &str,
+    ) -> anyhow::Result<T> {
         if !status.is_success() {
-            // 上游失败响应格式为 {"error":"..."}
-            let msg = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-                .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+            let msg =
+                upstream_error_message(text).unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
             anyhow::bail!("上游返回错误（{}）: {}", status.as_u16(), msg);
         }
-        serde_json::from_str::<T>(&text)
-            .map_err(|e| anyhow::anyhow!("解析上游响应失败: {} (body: {})", e, truncate(&text, 200)))
+        serde_json::from_str::<T>(&text).map_err(|e| {
+            anyhow::anyhow!("解析上游响应失败: {} (body: {})", e, truncate(&text, 200))
+        })
+    }
+
+    /// KiroApp 开放 API 请求。只在服务端明确返回 429 时按 Retry-After 退避一次。
+    async fn kiro_app_json<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<T> {
+        let client = self.client()?;
+        for attempt in 0..=1 {
+            let mut request = client
+                .request(method.clone(), self.url(path))
+                .bearer_auth(&self.api_key);
+            if let Some(value) = body.as_ref() {
+                request = request.json(value);
+            }
+            let response = request.send().await?;
+            let status = response.status();
+            let retry_after_header = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let text = response.text().await.unwrap_or_default();
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
+                let retry_after = retry_after_seconds(retry_after_header.as_deref(), &text)
+                    .unwrap_or(KIRO_APP_DEFAULT_COOLDOWN_SECS);
+                tracing::warn!("KiroApp 开放 API 限流，{} 秒后重试", retry_after);
+                tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+                continue;
+            }
+            return Self::parse_json_text(status, &text);
+        }
+        unreachable!("KiroApp 请求最多执行两次")
     }
 
     /// GET /api/my/stock —— 本轮最大可提取数量
     pub async fn get_stock(&self) -> anyhow::Result<StockResponse> {
+        if self.platform == UpstreamPlatform::KiroApp {
+            let stock: KiroAppStockResponse = self
+                .kiro_app_json(reqwest::Method::GET, "/openapi/stock", None)
+                .await?;
+            return Ok(StockResponse {
+                max: stock.available_keys,
+                key_price: stock.key_price,
+            });
+        }
         let resp = self
             .client()?
             .get(self.url("/api/my/stock"))
@@ -799,6 +925,18 @@ impl UpstreamClient {
 
     /// GET /api/my/profile —— 余额与 webhook 配置
     pub async fn get_profile(&self) -> anyhow::Result<ProfileResponse> {
+        if self.platform == UpstreamPlatform::KiroApp {
+            let response: KiroAppBalanceResponse = self
+                .kiro_app_json(reqwest::Method::GET, "/openapi/balance", None)
+                .await?;
+            return Ok(ProfileResponse {
+                name: None,
+                quota: None,
+                remaining: Some(response.balance),
+                used_quota: None,
+                webhook_url: None,
+            });
+        }
         let resp = self
             .client()?
             .get(self.url("/api/my/profile"))
@@ -810,6 +948,7 @@ impl UpstreamClient {
 
     /// GET /api/my/keys —— 全部 Key（history=1 含已失效）
     pub async fn get_keys(&self, history: bool) -> anyhow::Result<KeysResponse> {
+        self.require_legacy("Key 列表")?;
         let mut req = self
             .client()?
             .get(self.url("/api/my/keys"))
@@ -822,6 +961,7 @@ impl UpstreamClient {
 
     /// GET /api/my/keys/created-at —— 账号最早 Key 创建时间（有效期起点）
     pub async fn get_keys_created_at(&self) -> anyhow::Result<KeysCreatedAtResponse> {
+        self.require_legacy("账号有效期")?;
         let resp = self
             .client()?
             .get(self.url("/api/my/keys/created-at"))
@@ -833,6 +973,7 @@ impl UpstreamClient {
 
     /// GET /api/my/purchase-orders —— 最近 50 条提取订单
     pub async fn get_purchase_orders(&self) -> anyhow::Result<Vec<PurchaseOrder>> {
+        self.require_legacy("提取订单")?;
         let resp = self
             .client()?
             .get(self.url("/api/my/purchase-orders"))
@@ -844,6 +985,7 @@ impl UpstreamClient {
 
     /// GET /api/status —— 系统运行状态、Key 数量、库存等（宽松透传原始 JSON）
     pub async fn get_status(&self) -> anyhow::Result<serde_json::Value> {
+        self.require_legacy("系统状态")?;
         let resp = self
             .client()?
             .get(self.url("/api/status"))
@@ -859,6 +1001,23 @@ impl UpstreamClient {
         count: u32,
         client_order_id: &str,
     ) -> anyhow::Result<PurchaseResponse> {
+        if self.platform == UpstreamPlatform::KiroApp {
+            let body = (count > 1).then(|| serde_json::json!({ "count": count }));
+            let response: KiroAppClaimResponse = self
+                .kiro_app_json(reqwest::Method::POST, "/openapi/claim", body)
+                .await?;
+            let mut keys = response.keys;
+            if let Some(key) = response.key {
+                keys.insert(0, key);
+            }
+            let purchased = keys.len() as u32;
+            return Ok(PurchaseResponse {
+                client_order_id: Some(client_order_id.to_string()),
+                purchased,
+                remaining: None,
+                keys: keys.into_iter().map(|key| PurchasedKey { key }).collect(),
+            });
+        }
         let resp = self
             .client()?
             .post(self.url("/api/my/purchase"))
@@ -875,6 +1034,7 @@ impl UpstreamClient {
 
     /// PUT /api/my/webhook —— 注册回调地址到上游
     pub async fn set_webhook(&self, webhook_url: &str) -> anyhow::Result<()> {
+        self.require_legacy("Webhook")?;
         let resp = self
             .client()?
             .put(self.url("/api/my/webhook"))
@@ -897,6 +1057,7 @@ impl UpstreamClient {
 
     /// POST /api/my/webhook/test —— 让上游给已保存的 webhook 推一条测试
     pub async fn test_webhook(&self) -> anyhow::Result<()> {
+        self.require_legacy("Webhook")?;
         let resp = self
             .client()?
             .post(self.url("/api/my/webhook/test"))
@@ -906,10 +1067,49 @@ impl UpstreamClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("测试 webhook 失败（{}）: {}", status.as_u16(), truncate(&text, 200));
+            anyhow::bail!(
+                "测试 webhook 失败（{}）: {}",
+                status.as_u16(),
+                truncate(&text, 200)
+            );
         }
         Ok(())
     }
+
+    fn require_legacy(&self, capability: &str) -> anyhow::Result<()> {
+        if self.platform.supports_webhook() {
+            Ok(())
+        } else {
+            anyhow::bail!("KiroApp 平台不提供{}接口", capability)
+        }
+    }
+}
+
+fn upstream_error_message(text: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    match value.get("error") {
+        Some(serde_json::Value::String(message)) => Some(message.clone()),
+        Some(serde_json::Value::Object(error)) => error
+            .get("message")
+            .and_then(|message| message.as_str())
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn retry_after_seconds(header: Option<&str>, text: &str) -> Option<u64> {
+    if let Some(seconds) = header.and_then(|value| value.trim().parse::<u64>().ok()) {
+        return Some(seconds);
+    }
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    value
+        .get("retryAfter")
+        .or_else(|| value.get("error").and_then(|error| error.get("retryAfter")))
+        .and_then(|retry_after| {
+            retry_after
+                .as_u64()
+                .or_else(|| retry_after.as_str()?.parse::<u64>().ok())
+        })
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -941,6 +1141,7 @@ mod tests {
         let cfg = mgr
             .create(
                 "test".into(),
+                UpstreamPlatform::Legacy,
                 "https://api.example.com/".into(),
                 "usr-xxx".into(),
                 Some("https://me.example.com".into()),
@@ -961,7 +1162,10 @@ mod tests {
         assert!(!view.masked_api_key.contains("usr-xxx"));
         assert_eq!(
             view.webhook_receiver_url.unwrap(),
-            format!("https://me.example.com/api/upstream/webhook/{}", cfg.webhook_token)
+            format!(
+                "https://me.example.com/api/upstream/webhook/{}",
+                cfg.webhook_token
+            )
         );
     }
 
@@ -969,12 +1173,25 @@ mod tests {
     fn update_partial_keeps_api_key_when_blank() {
         let mgr = UpstreamManager::new();
         let cfg = mgr
-            .create("t".into(), "https://a.com".into(), "usr-keep".into(), None, false, 0, None, None, vec![], None)
+            .create(
+                "t".into(),
+                UpstreamPlatform::Legacy,
+                "https://a.com".into(),
+                "usr-keep".into(),
+                None,
+                false,
+                0,
+                None,
+                None,
+                vec![],
+                None,
+            )
             .unwrap();
         let updated = mgr
             .update(
                 &cfg.id,
                 Some("t2".into()),
+                None,
                 None,
                 Some("".into()), // 空串 → 不改 api_key
                 None,
@@ -997,11 +1214,89 @@ mod tests {
     fn delete_removes() {
         let mgr = UpstreamManager::new();
         let cfg = mgr
-            .create("t".into(), "https://a.com".into(), "usr".into(), None, false, 0, None, None, vec![], None)
+            .create(
+                "t".into(),
+                UpstreamPlatform::Legacy,
+                "https://a.com".into(),
+                "usr".into(),
+                None,
+                false,
+                0,
+                None,
+                None,
+                vec![],
+                None,
+            )
             .unwrap();
         assert!(mgr.delete(&cfg.id));
         assert!(!mgr.delete(&cfg.id));
         assert!(mgr.get(&cfg.id).is_none());
+    }
+
+    #[test]
+    fn legacy_config_without_platform_remains_legacy() {
+        let cfg: UpstreamConfig = serde_json::from_value(serde_json::json!({
+            "id": "up_old",
+            "name": "old",
+            "baseUrl": "https://old.example.com",
+            "apiKey": "usr-old",
+            "webhookToken": "token",
+            "enabled": true,
+            "createdAt": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(cfg.platform, UpstreamPlatform::Legacy);
+        assert!(cfg.platform.supports_webhook());
+    }
+
+    #[test]
+    fn kiro_app_config_is_pull_only() {
+        let mgr = UpstreamManager::new();
+        let cfg = mgr
+            .create(
+                "kiroapp".into(),
+                UpstreamPlatform::KiroApp,
+                "".into(),
+                "secret".into(),
+                Some("https://receiver.example.com".into()),
+                true,
+                5,
+                Some(PurchaseSchedule {
+                    enabled: true,
+                    ..PurchaseSchedule::default()
+                }),
+                None,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(cfg.base_url, KIRO_APP_DEFAULT_BASE_URL);
+        assert!(cfg.receiver_base_url.is_none());
+        assert!(!cfg.auto_purchase_enabled);
+        assert!(!cfg.schedule.enabled);
+        assert!(!cfg.platform.supports_webhook());
+        assert!(mgr.find_by_token(&cfg.webhook_token).is_none());
+    }
+
+    #[test]
+    fn parses_kiro_app_error_and_retry_after() {
+        let body =
+            r#"{"error":{"type":"rate_limit_exceeded","message":"too fast"},"retryAfter":180}"#;
+        assert_eq!(upstream_error_message(body).as_deref(), Some("too fast"));
+        assert_eq!(retry_after_seconds(None, body), Some(180));
+        assert_eq!(retry_after_seconds(Some("12"), body), Some(12));
+    }
+
+    #[test]
+    fn parses_kiro_app_single_and_batch_claims() {
+        let single: KiroAppClaimResponse = serde_json::from_str(r#"{"key":"ksk_single"}"#).unwrap();
+        assert_eq!(single.key.as_deref(), Some("ksk_single"));
+        assert!(single.keys.is_empty());
+
+        let batch: KiroAppClaimResponse =
+            serde_json::from_str(r#"{"keys":["ksk_a","ksk_b"]}"#).unwrap();
+        assert!(batch.key.is_none());
+        assert_eq!(batch.keys, vec!["ksk_a", "ksk_b"]);
     }
 
     #[test]
@@ -1035,8 +1330,16 @@ mod tests {
         let sched = PurchaseSchedule {
             enabled: true,
             peak_windows: vec![
-                PeakWindow { weekdays: vec![1, 2, 3, 4, 5], start_hour: 9, end_hour: 12 },
-                PeakWindow { weekdays: vec![], start_hour: 19, end_hour: 22 },
+                PeakWindow {
+                    weekdays: vec![1, 2, 3, 4, 5],
+                    start_hour: 9,
+                    end_hour: 12,
+                },
+                PeakWindow {
+                    weekdays: vec![],
+                    start_hour: 19,
+                    end_hour: 22,
+                },
             ],
             peak_count: 20,
             offpeak_count: 3,
@@ -1049,6 +1352,7 @@ mod tests {
         let mut cfg = UpstreamConfig {
             id: "x".into(),
             name: "n".into(),
+            platform: UpstreamPlatform::Legacy,
             base_url: "b".into(),
             api_key: "k".into(),
             receiver_base_url: None,
@@ -1076,5 +1380,3 @@ mod tests {
         assert_eq!(cfg.resolve_auto_count(0, 10), None);
     }
 }
-
-
