@@ -3,12 +3,13 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
-import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { useByCredential, useByKey, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import type {
   ClientKeyItem,
   CredentialDistribution,
+  KeyDistribution,
   ModelDistribution,
   StatsFilter,
   StatsGranularity,
@@ -19,6 +20,7 @@ import type {
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
+import { KeyBarChart } from '@/components/charts/key-bar-chart'
 import { cn, formatCredits, formatNumber } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 import {
@@ -83,9 +85,11 @@ export function OverviewPage() {
   const { data: series } = useTimeSeries(filters.timeFilter, filters.statsFilter)
   const { data: byModel } = useByModel(filters.timeFilter, filters.statsFilter)
   const { data: byCred } = useByCredential(filters.timeFilter, filters.statsFilter)
+  const { data: byKey } = useByKey(filters.timeFilter, filters.statsFilter)
   const seriesData = useMemo(() => series ?? [], [series])
   const modelData = useMemo(() => byModel ?? [], [byModel])
   const credData = useMemo(() => byCred ?? [], [byCred])
+  const keyData = useMemo(() => byKey ?? [], [byKey])
   const rangeStats = useMemo(() => aggregateSeries(seriesData), [seriesData])
   const selectedKeyLabel = selectedStatsKeyLabel(filters.keyFilter, keysData?.keys ?? [])
   const groupFilterActive = filters.groupFilter !== 'all'
@@ -128,6 +132,7 @@ export function OverviewPage() {
         timeText={timeLabel(filters.timeFilter)}
         groupFilterActive={groupFilterActive}
       />
+      <KeyPanel data={keyData} timeText={timeLabel(filters.timeFilter)} />
     </div>
   )
 }
@@ -618,6 +623,65 @@ function CredentialPanel({ data }: { data: CredentialDistribution[] }) {
         <CredentialBarChart data={data} />
       </CardContent>
     </Card>
+  )
+}
+
+function KeyPanel({ data, timeText }: { data: KeyDistribution[]; timeText: string }) {
+  return (
+    <Card className="mb-6">
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold tracking-tight">按入口 Key 分布</h2>
+            <p className="text-[12px] text-muted-foreground">各客户端 Key 在所选时间窗内的用量对比</p>
+          </div>
+          <span className="text-[11px] text-muted-foreground inline-flex items-center gap-1">
+            <KeyRound className="h-3 w-3" />Top {Math.min(data.length, 12)} · {timeText}
+          </span>
+        </div>
+        <KeyBarChart data={data} />
+        {data.length > 0 && <KeyTable data={data} />}
+      </CardContent>
+    </Card>
+  )
+}
+
+function KeyTable({ data }: { data: KeyDistribution[] }) {
+  return (
+    <div className="mt-3 max-h-40 overflow-auto text-[12px]">
+      <table className="min-w-[520px] w-full">
+        <thead className="text-muted-foreground">
+          <tr>
+            <th className="text-left font-medium pb-1">Key</th>
+            <th className="text-right font-medium">调用</th>
+            <th className="text-right font-medium">输入</th>
+            <th className="text-right font-medium">输出</th>
+            <th className="text-right font-medium">异常</th>
+            <th className="text-right font-medium">Credit</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.map((k) => (
+            <tr key={k.keyId} className="border-t border-border/40">
+              <td className="py-1 max-w-[200px] truncate" title={k.name}>
+                {k.name}
+              </td>
+              <td className="text-right tabular-nums">{formatNumber(k.calls)}</td>
+              <td className="text-right tabular-nums">{formatNumber(k.inputTokens)}</td>
+              <td className="text-right tabular-nums">{formatNumber(k.outputTokens)}</td>
+              <td className="text-right tabular-nums">
+                {k.errors > 0 ? (
+                  <span className="text-destructive">{formatNumber(k.errors)}</span>
+                ) : (
+                  '0'
+                )}
+              </td>
+              <td className="text-right tabular-nums">{formatCredits(k.credits)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 
