@@ -842,11 +842,10 @@ function PeakWindowEditor({
                       disabled={disabled}
                       onClick={() => toggleDay(i, day)}
                       title={allDays ? '当前为每天，点击将改为仅选中此天' : undefined}
-                      className={`h-6 w-6 rounded-full text-xs transition-colors ${
-                        active
-                          ? 'bg-primary text-primary-foreground'
-                          : 'bg-secondary text-muted-foreground hover:bg-accent'
-                      }`}
+                      className={`h-6 w-6 rounded-full text-xs transition-colors ${active
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-secondary text-muted-foreground hover:bg-accent'
+                        }`}
                     >
                       {label}
                     </button>
@@ -988,7 +987,7 @@ function UpstreamEditDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="legacy">现有 Webhook 平台</SelectItem>
+                <SelectItem value="legacy">千羽架构</SelectItem>
                 <SelectItem value="kiro_app">KiroApp</SelectItem>
               </SelectContent>
             </Select>
@@ -1020,104 +1019,104 @@ function UpstreamEditDialog({
           </div>
           {edit.platform === 'legacy' && (
             <>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">本服务对外地址</label>
-            <Input
-              placeholder="https://your-host:8990（用于生成 webhook 接收地址）"
-              value={edit.receiverBaseUrl}
-              onChange={(e) => set({ receiverBaseUrl: e.target.value })}
-              disabled={saving}
-              className="font-mono text-sm"
-              autoComplete="off"
-            />
-            <p className="text-xs text-muted-foreground">
-              上游回调本服务用。留空则不生成接收地址、无法注册 Webhook。
-            </p>
-          </div>
-
-          {/* 自动提号配置 */}
-          <div className="space-y-2 rounded-xl border p-3">
-            <div className="flex items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">自动提号（低消）</div>
-                <p className="text-xs text-muted-foreground leading-snug">
-                  收到 new_keys_available 时按「最低提货量」自动提取并入库（代理池轮询分配）；
-                  收到 all_keys_dead 仅在事件日志记录，不提货
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">本服务对外地址</label>
+                <Input
+                  placeholder="https://your-host:8990（用于生成 webhook 接收地址）"
+                  value={edit.receiverBaseUrl}
+                  onChange={(e) => set({ receiverBaseUrl: e.target.value })}
+                  disabled={saving}
+                  className="font-mono text-sm"
+                  autoComplete="off"
+                />
+                <p className="text-xs text-muted-foreground">
+                  上游回调本服务用。留空则不生成接收地址、无法注册 Webhook。
                 </p>
               </div>
-              <Switch
-                checked={edit.autoPurchaseEnabled}
-                onCheckedChange={(v) => set({ autoPurchaseEnabled: v })}
-                disabled={saving}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-sm font-medium">默认提货量（低消）</label>
-              <Input
-                type="number"
-                min={0}
-                placeholder="0 = 按可提取上限提满"
-                value={edit.autoPurchaseCount}
-                onChange={(e) => set({ autoPurchaseCount: e.target.value })}
-                disabled={saving || !edit.autoPurchaseEnabled}
-                autoComplete="off"
-              />
-              <p className="text-xs text-muted-foreground">
-                未开启「分时段」时用此数量；填 0 表示按上游本轮可提取上限（stock.max）尽量提满。
-              </p>
-            </div>
 
-            {/* 分时段提货量：多条高峰规则 + 高峰/低谷两档 */}
-            <div className="space-y-2 rounded-lg border p-2.5 bg-secondary/20">
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="text-sm font-medium">按时间设置提货量（高峰 / 低谷）</div>
-                  <p className="text-xs text-muted-foreground leading-snug">
-                    自定义"哪几天 + 几点到几点"为高峰（北京时间）；命中任一高峰规则用高峰量，其余用低谷量
-                  </p>
-                </div>
-                <Switch
-                  checked={edit.scheduleEnabled}
-                  onCheckedChange={(v) => set({ scheduleEnabled: v })}
-                  disabled={saving || !edit.autoPurchaseEnabled}
-                />
-              </div>
-              {edit.scheduleEnabled && (
-                <div className="space-y-3">
-                  <PeakWindowEditor
-                    windows={edit.peakWindows}
-                    onChange={(w) => set({ peakWindows: w })}
+              {/* 自动提号配置 */}
+              <div className="space-y-2 rounded-xl border p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">自动提号（低消）</div>
+                    <p className="text-xs text-muted-foreground leading-snug">
+                      收到 new_keys_available 时按「最低提货量」自动提取并入库（代理池轮询分配）；
+                      收到 all_keys_dead 仅在事件日志记录，不提货
+                    </p>
+                  </div>
+                  <Switch
+                    checked={edit.autoPurchaseEnabled}
+                    onCheckedChange={(v) => set({ autoPurchaseEnabled: v })}
                     disabled={saving}
                   />
-                  <div className="grid grid-cols-2 gap-2">
-                    <div className="space-y-1">
-                      <label className="text-xs font-medium text-muted-foreground">高峰提货量</label>
-                      <Input
-                        type="number" min={0}
-                        placeholder="0 = 提满"
-                        value={edit.peakCount}
-                        onChange={(e) => set({ peakCount: e.target.value })}
-                        disabled={saving} autoComplete="off" className="h-9"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-xs font-medium text-muted-foreground">低谷提货量</label>
-                      <Input
-                        type="number" min={0}
-                        placeholder="0 = 提满"
-                        value={edit.offpeakCount}
-                        onChange={(e) => set({ offpeakCount: e.target.value })}
-                        disabled={saving} autoComplete="off" className="h-9"
-                      />
-                    </div>
-                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">默认提货量（低消）</label>
+                  <Input
+                    type="number"
+                    min={0}
+                    placeholder="0 = 按可提取上限提满"
+                    value={edit.autoPurchaseCount}
+                    onChange={(e) => set({ autoPurchaseCount: e.target.value })}
+                    disabled={saving || !edit.autoPurchaseEnabled}
+                    autoComplete="off"
+                  />
                   <p className="text-xs text-muted-foreground">
-                    各档填 0 表示该时段按上游可提取上限提满。时间为<b>北京时间(UTC+8)</b>整点，右开区间；起 &gt; 止表示跨天（如 22→6）。
+                    未开启「分时段」时用此数量；填 0 表示按上游本轮可提取上限（stock.max）尽量提满。
                   </p>
                 </div>
-              )}
-            </div>
-          </div>
+
+                {/* 分时段提货量：多条高峰规则 + 高峰/低谷两档 */}
+                <div className="space-y-2 rounded-lg border p-2.5 bg-secondary/20">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">按时间设置提货量（高峰 / 低谷）</div>
+                      <p className="text-xs text-muted-foreground leading-snug">
+                        自定义"哪几天 + 几点到几点"为高峰（北京时间）；命中任一高峰规则用高峰量，其余用低谷量
+                      </p>
+                    </div>
+                    <Switch
+                      checked={edit.scheduleEnabled}
+                      onCheckedChange={(v) => set({ scheduleEnabled: v })}
+                      disabled={saving || !edit.autoPurchaseEnabled}
+                    />
+                  </div>
+                  {edit.scheduleEnabled && (
+                    <div className="space-y-3">
+                      <PeakWindowEditor
+                        windows={edit.peakWindows}
+                        onChange={(w) => set({ peakWindows: w })}
+                        disabled={saving}
+                      />
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <label className="text-xs font-medium text-muted-foreground">高峰提货量</label>
+                          <Input
+                            type="number" min={0}
+                            placeholder="0 = 提满"
+                            value={edit.peakCount}
+                            onChange={(e) => set({ peakCount: e.target.value })}
+                            disabled={saving} autoComplete="off" className="h-9"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-xs font-medium text-muted-foreground">低谷提货量</label>
+                          <Input
+                            type="number" min={0}
+                            placeholder="0 = 提满"
+                            value={edit.offpeakCount}
+                            onChange={(e) => set({ offpeakCount: e.target.value })}
+                            disabled={saving} autoComplete="off" className="h-9"
+                          />
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        各档填 0 表示该时段按上游可提取上限提满。时间为<b>北京时间(UTC+8)</b>整点，右开区间；起 &gt; 止表示跨天（如 22→6）。
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
             </>
           )}
 

@@ -42,7 +42,7 @@ import type { ProxyPoolEntry } from '@/types/api'
  * 与原 ProxyPoolDialog 等价，但作为独立页面：可提前添加 / 批量导入代理、
  * 单个或全部批量验活（健康检查）、设为全局代理、轮询分配给凭据。
  */
-export function ProxyPoolPage() {
+export function ProxyPoolPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [newUrl, setNewUrl] = useState('')
   const [newLabel, setNewLabel] = useState('')
   const [batchText, setBatchText] = useState('')
@@ -211,11 +211,13 @@ export function ProxyPoolPage() {
       {/* 标题 */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px] flex items-center gap-2">
-            <Network className="h-6 w-6" />
-            代理 IP 池
-          </h1>
-          <p className="mt-1 text-sm text-muted-foreground">
+          {!embedded && (
+            <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px] flex items-center gap-2">
+              <Network className="h-6 w-6" />
+              代理 IP 池
+            </h1>
+          )}
+          <p className={`text-sm text-muted-foreground ${embedded ? '' : 'mt-1'}`}>
             提前添加、批量导入与批量验活代理；可设为全局代理或轮询分配给凭据
           </p>
         </div>
