@@ -132,7 +132,11 @@ export function OverviewPage() {
         timeText={timeLabel(filters.timeFilter)}
         groupFilterActive={groupFilterActive}
       />
-      <KeyPanel data={keyData} timeText={timeLabel(filters.timeFilter)} />
+      <KeyPanel
+        data={keyData}
+        timeText={timeLabel(filters.timeFilter)}
+        keyFilterActive={filters.keyFilter !== 'all'}
+      />
     </div>
   )
 }
@@ -626,7 +630,15 @@ function CredentialPanel({ data }: { data: CredentialDistribution[] }) {
   )
 }
 
-function KeyPanel({ data, timeText }: { data: KeyDistribution[]; timeText: string }) {
+function KeyPanel({
+  data,
+  timeText,
+  keyFilterActive,
+}: {
+  data: KeyDistribution[]
+  timeText: string
+  keyFilterActive: boolean
+}) {
   return (
     <Card className="mb-6">
       <CardContent className="p-4 sm:p-5">
@@ -639,6 +651,12 @@ function KeyPanel({ data, timeText }: { data: KeyDistribution[]; timeText: strin
             <KeyRound className="h-3 w-3" />Top {Math.min(data.length, 12)} · {timeText}
           </span>
         </div>
+        {keyFilterActive && (
+          <p className="mb-3 rounded-md bg-sky-500/10 px-2.5 py-1.5 text-[11px] text-sky-600">
+            本面板为各入口 Key 的<strong className="mx-0.5">横向对比</strong>，不受上方「入口 Key 筛选」影响，
+            始终展示全部 Key。
+          </p>
+        )}
         <KeyBarChart data={data} />
         {data.length > 0 && <KeyTable data={data} />}
       </CardContent>
