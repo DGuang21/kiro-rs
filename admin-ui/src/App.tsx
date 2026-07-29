@@ -12,7 +12,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Network, PackagePlus } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, PackagePlus, Settings2 } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
 import { tabFromHash } from "@/hooks/use-url-state";
@@ -48,19 +48,14 @@ const TraceLogPage = lazy(() =>
     default: m.TraceLogPage,
   })),
 );
-const GroupsPage = lazy(() =>
-  import("@/components/groups-page").then((m) => ({
-    default: m.GroupsPage,
-  })),
-);
-const ProxyPoolPage = lazy(() =>
-  import("@/components/proxy-pool-page").then((m) => ({
-    default: m.ProxyPoolPage,
-  })),
-);
 const UpstreamPage = lazy(() =>
   import("@/components/upstream-page").then((m) => ({
     default: m.UpstreamPage,
+  })),
+);
+const SettingsPage = lazy(() =>
+  import("@/components/settings-page").then((m) => ({
+    default: m.SettingsPage,
   })),
 );
 
@@ -68,10 +63,9 @@ type Tab =
   | "overview"
   | "credentials"
   | "keys"
-  | "groups"
-  | "proxies"
   | "restock"
-  | "traces";
+  | "traces"
+  | "settings";
 
 const TABS: {
   key: Tab;
@@ -98,18 +92,6 @@ const TABS: {
     icon: <KeyRound className="h-3.5 w-3.5" />,
   },
   {
-    key: "groups",
-    label: "分组管理",
-    mobileLabel: "分组",
-    icon: <FolderTree className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "proxies",
-    label: "代理池",
-    mobileLabel: "代理",
-    icon: <Network className="h-3.5 w-3.5" />,
-  },
-  {
     key: "restock",
     label: "补货上游",
     mobileLabel: "补货",
@@ -123,21 +105,29 @@ const TABS: {
   },
   {
     key: "settings",
-    label: "设置",
+    label: "系统设置",
     mobileLabel: "设置",
-    icon: <SlidersHorizontal className="h-3.5 w-3.5" />,
+    icon: <Settings2 className="h-3.5 w-3.5" />,
   },
 ];
 
+/**
+ * 旧入口 → 新位置的重定向表。
+ *
+ * 分组管理和代理池原先是顶级 Tab，合并进「系统设置」后旧链接（含用户书签、
+ * 文档里的 `#/proxies`）仍应可用，这里映射到对应的二级面板。
+ */
+const LEGACY_HASH_REDIRECTS: Record<string, string> = {
+  groups: "settings/groups",
+  proxies: "settings/proxies",
+};
+
 function readTabFromHash(): Tab {
-  // 走共享解析：hash 里现在可能带筛选查询串（#/traces?status=error），
-  // 直接全等比较会认不出 Tab。
-  const h = tabFromHash();
+  // 只取第一段：`#/settings/proxies` 的二级面板由 SettingsPage 自己解析
+  const h = window.location.hash.replace(/^#\/?/, "").split("/")[0];
   if (
     h === "credentials" ||
     h === "keys" ||
-    h === "groups" ||
-    h === "proxies" ||
     h === "restock" ||
     h === "overview" ||
     h === "traces" ||
@@ -145,6 +135,32 @@ function readTabFromHash(): Tab {
   )
     return h;
   return "overview";
+}
+
+/**
+ * 把旧的顶级 hash 重写成新的二级路径。返回是否发生了重写。
+ *
+ * 用 replace 而不是赋值 `location.hash`，避免在浏览器历史里留下一条指向
+ * 已不存在的 Tab 的记录（否则用户点「后退」会再次落到旧地址）。
+ */
+function redirectLegacyHash(): boolean {
+  const h = window.location.hash.replace(/^#\/?/, "").split("/")[0];
+  const target = LEGACY_HASH_REDIRECTS[h];
+  if (!target) return false;
+  window.location.replace(`#/${target}`);
+  return true;
+}
+
+/**
+ * 初始 Tab：先处理旧 hash 重定向，再读。
+ *
+ * `location.replace` 对同文档 fragment 是同步更新 `location.hash` 的
+ * （hashchange 事件才是异步派发），所以紧随其后的读取能拿到新值，
+ * 首帧就不会闪一下「概览」。
+ */
+function initialTab(): Tab {
+  redirectLegacyHash();
+  return readTabFromHash();
 }
 
 interface AppHeaderProps {
@@ -179,16 +195,24 @@ function App() {
 
 function useAppShell() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [tab, setTab] = useState<Tab>(readTabFromHash);
-  const [theme, setTheme] = useState<ThemeSelection>(() => storage.getThemeSelection());
-  const [isDarkMode, setIsDarkMode] = useState(() => resolveDarkMode(theme));
+  const [tab, setTab] = useState<Tab>(initialTab);
+  const [darkMode, setDarkMode] = useState(() => {
+    if (typeof window !== "undefined") {
+      return document.documentElement.classList.contains("dark");
+    }
+    return false;
+  });
 
   useEffect(() => {
     if (storage.getApiKey()) setIsLoggedIn(true);
   }, []);
 
   useEffect(() => {
-    const onHash = () => setTab(readTabFromHash());
+    const onHash = () => {
+      // 旧 hash 会被改写，改写本身又触发一次 hashchange，那次再更新 tab
+      if (redirectLegacyHash()) return;
+      setTab(readTabFromHash());
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -478,8 +502,6 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "overview" && <OverviewPage />}
         {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
         {tab === "keys" && <ClientKeysPage />}
-        {tab === "groups" && <GroupsPage />}
-        {tab === "proxies" && <ProxyPoolPage />}
         {tab === "restock" && <UpstreamPage />}
         {tab === "traces" && <TraceLogPage />}
         {tab === "settings" && <SettingsPage />}

@@ -1,132 +1,128 @@
-import {
-  Cpu,
-  Gauge,
-  Globe,
-  ScrollText,
-  PackageOpen,
-  ShieldCheck,
-  SlidersHorizontal,
-  Tags,
-} from 'lucide-react'
-import { PageHeader } from '@/components/console/page-header'
-import { Card, CardContent } from '@/components/ui/card'
-import { useUrlState } from '@/hooks/use-url-state'
-import { cn } from '@/lib/utils'
-import { DispatchSection } from '@/components/settings/dispatch-section'
-import { NetworkSection } from '@/components/settings/network-section'
-import { LogSection } from '@/components/settings/log-section'
-import { SystemSection } from '@/components/settings/system-section'
-import { SecuritySection } from '@/components/settings/security-section'
-import { MetadataSection } from '@/components/settings/metadata-section'
-import { ModelsSection } from '@/components/settings/models-section'
+import { useEffect, useState } from 'react'
+import { Settings2, FolderTree, Network, Activity, ShieldCheck } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { GroupsPage } from '@/components/groups-page'
+import { ProxyPoolPage } from '@/components/proxy-pool-page'
+import { SchedulingPanel } from '@/components/settings/scheduling-panel'
+import { ResiliencePanel } from '@/components/settings/resilience-panel'
 
 /**
- * 设置页 —— 把此前散在三处的 7 个配置端点收拢到一处。
+ * 系统设置页：把原先散落在顶栏下拉和独立 Tab 里的配置项收拢到一处。
  *
- * 改造前它们分别住在：顶栏按钮（负载均衡）、顶栏两个下拉（风控故障转移、自愈）、
- * 顶栏设置菜单（登录密钥）、日志页下拉（日志治理）、代理池弹窗内（全局代理）、
- * 镜像更新弹窗内（更新配置）。同一类东西分在六个地方，找一个配置得先记住它藏在哪。
+ * 四个二级面板：
+ * - 调度策略：负载均衡模式（含优先级随机）
+ * - 风控重试：账号级风控故障转移 + 冷却时长 + 失败重试次数 + 凭据自愈
+ * - 分组管理：复用 GroupsPage
+ * - 代理池：复用 ProxyPoolPage
  *
- * 顶栏**保留**三个快捷开关（负载均衡 / 故障转移 / 自愈），因为它们是运维高频动作，
- * 一次点击就该切换完；但参数（冷却时长、连续上限、保留天数这些）全部移到这里 ——
- * 下拉菜单里塞数字输入框本来就不是它该干的事。
+ * 二级 Tab 写进 hash（`#/settings/proxies`），刷新后停在原位；旧链接
+ * `#/groups`、`#/proxies` 由 App 负责重定向到这里。
  */
-type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'system' | 'security'
+export type SettingsSection = 'scheduling' | 'resilience' | 'groups' | 'proxies'
 
 const SECTIONS: {
-  key: SectionKey
+  key: SettingsSection
   label: string
+  mobileLabel: string
   icon: React.ReactNode
 }[] = [
   {
-    key: 'dispatch',
-    label: '调度',
-    icon: <Gauge className="h-4 w-4" />,
+    key: 'scheduling',
+    label: '调度策略',
+    mobileLabel: '调度',
+    icon: <Activity className="h-3.5 w-3.5" />,
   },
   {
-    key: 'metadata',
-    label: '凭据字段',
-    icon: <Tags className="h-4 w-4" />,
+    key: 'resilience',
+    label: '风控重试',
+    mobileLabel: '风控',
+    icon: <ShieldCheck className="h-3.5 w-3.5" />,
   },
   {
-    key: 'network',
-    label: '网络',
-    icon: <Globe className="h-4 w-4" />,
+    key: 'groups',
+    label: '分组管理',
+    mobileLabel: '分组',
+    icon: <FolderTree className="h-3.5 w-3.5" />,
   },
   {
-    key: 'log',
-    label: '日志',
-    icon: <ScrollText className="h-4 w-4" />,
-  },
-  {
-    key: 'models',
-    label: '模型',
-    icon: <Cpu className="h-4 w-4" />,
-  },
-  {
-    key: 'system',
-    label: '系统',
-    icon: <PackageOpen className="h-4 w-4" />,
-  },
-  {
-    key: 'security',
-    label: '安全',
-    icon: <ShieldCheck className="h-4 w-4" />,
+    key: 'proxies',
+    label: '代理池',
+    mobileLabel: '代理',
+    icon: <Network className="h-3.5 w-3.5" />,
   },
 ]
 
+const DEFAULT_SECTION: SettingsSection = 'scheduling'
+
+function isSettingsSection(value: string): value is SettingsSection {
+  return SECTIONS.some((s) => s.key === value)
+}
+
+/** 从 hash 第二段读二级 Tab，例如 `#/settings/proxies` → `proxies` */
+export function readSectionFromHash(): SettingsSection {
+  const raw = window.location.hash.replace(/^#\/?/, '')
+  const sub = raw.split('/')[1] ?? ''
+  return isSettingsSection(sub) ? sub : DEFAULT_SECTION
+}
+
 export function SettingsPage() {
-  const [urlState, patchUrl] = useUrlState('settings', { s: 'dispatch' })
-  const active = (SECTIONS.some((x) => x.key === urlState.s)
-    ? urlState.s
-    : 'dispatch') as SectionKey
+  const [section, setSection] = useState<SettingsSection>(readSectionFromHash)
+
+  useEffect(() => {
+    const onHash = () => setSection(readSectionFromHash())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  const switchSection = (next: SettingsSection) => {
+    window.location.hash = `#/settings/${next}`
+    setSection(next)
+  }
 
   return (
-    <div className="console-scope space-y-4">
-      <PageHeader
-        icon={<SlidersHorizontal className="h-4 w-4" />}
-        title="设置"
-        description="改动即时生效并写入 config.json，无需重启。"
-      />
-
-      <div className="flex flex-col gap-4 lg:flex-row">
-        {/* 分区导航：桌面端竖排侧栏，窄屏横向滚动的胶囊行 */}
-        <nav
-          className="flex shrink-0 gap-1 overflow-x-auto px-1 py-1 lg:w-48 lg:flex-col lg:overflow-visible lg:px-0 lg:py-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          aria-label="设置分区"
-        >
-          {SECTIONS.map((s) => (
-            <button
-              key={s.key}
-              type="button"
-              onClick={() => patchUrl({ s: s.key })}
-              aria-current={active === s.key ? 'page' : undefined}
-              className={cn(
-                'inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] transition-colors',
-                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
-                active === s.key
-                  ? 'bg-primary/12 font-medium text-foreground ring-1 ring-primary/25'
-                  : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
-              )}
-            >
-              {s.icon}
-              <span className="whitespace-nowrap">{s.label}</span>
-            </button>
-          ))}
-        </nav>
-
-        <Card className="min-w-0 flex-1">
-          <CardContent className="p-4 sm:p-5">
-            {active === 'dispatch' && <DispatchSection />}
-            {active === 'metadata' && <MetadataSection />}
-            {active === 'models' && <ModelsSection />}
-            {active === 'network' && <NetworkSection />}
-            {active === 'log' && <LogSection />}
-            {active === 'system' && <SystemSection />}
-            {active === 'security' && <SecuritySection />}
-          </CardContent>
-        </Card>
+    <div className="space-y-5">
+      <div>
+        <h1 className="flex items-center gap-2 text-2xl font-semibold leading-tight tracking-tight sm:text-[28px]">
+          <Settings2 className="h-6 w-6" />
+          系统设置
+        </h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          调度策略、风控重试、分组与代理池的集中配置入口
+        </p>
       </div>
+
+      <SectionTabs section={section} onSwitch={switchSection} />
+
+      {section === 'scheduling' && <SchedulingPanel />}
+      {section === 'resilience' && <ResiliencePanel />}
+      {section === 'groups' && <GroupsPage embedded />}
+      {section === 'proxies' && <ProxyPoolPage embedded />}
+    </div>
+  )
+}
+
+function SectionTabs({
+  onSwitch,
+  section,
+}: {
+  onSwitch: (next: SettingsSection) => void
+  section: SettingsSection
+}) {
+  return (
+    <div className="flex items-center gap-1 overflow-x-auto rounded-full border border-border/60 p-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      {SECTIONS.map((s) => (
+        <Button
+          key={s.key}
+          size="sm"
+          variant={section === s.key ? 'default' : 'ghost'}
+          className="h-7 shrink-0 rounded-full px-3 text-xs"
+          onClick={() => onSwitch(s.key)}
+        >
+          {s.icon}
+          <span className="hidden min-[420px]:inline">{s.label}</span>
+          <span className="min-[420px]:hidden">{s.mobileLabel}</span>
+        </Button>
+      ))}
     </div>
   )
 }

@@ -1935,7 +1935,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={() => {
-                      window.location.hash = "#/proxies";
+                      window.location.hash = "#/settings/proxies";
                     }}
                   >
                     <Globe />
