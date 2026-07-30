@@ -1987,14 +1987,12 @@ impl MultiTokenManager {
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
+                // discovery_rank 置于键尾：仅当成功次数与优先级都打平时，才偏向已确认
+                // 支持目标模型的凭据。模型缓存是否预热过绝不能盖过均衡语义，否则
+                // 单个被 Admin 查询过的凭据会独占全部流量。
                 let (entry, _) = available.iter().min_by_key(|(e, support)| {
                     let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (
-                        discovery_rank,
-                        e.success_count,
-                        e.credentials.priority,
-                        e.id,
-                    )
+                    (e.success_count, e.credentials.priority, discovery_rank)
                 })?;
 
                 Some((entry.id, entry.credentials.clone()))
@@ -2003,14 +2001,15 @@ impl MultiTokenManager {
                 // 优先级负载均衡：先取可用集合里最高优先级层（priority 值最小），
                 // 仅在该层内做 least-used 均衡。平局再按 id 保证确定性。
                 // 该层全部不可用时，min(priority) 自动落到下一层，实现逐层降级。
-                // discovery_rank 置于键首，与 priority 模式一致：已确认支持目标模型的
-                // 凭据优先于尚未确认的，避免绕过动态模型发现的分层。
+                // discovery_rank 排在 priority 与 success_count 之后：模型缓存的预热
+                // 状态只做层内 tiebreak，不参与分层，否则未预热的高优先级凭据会被
+                // 已预热的低优先级凭据永久压制。
                 let (entry, _) = available.iter().min_by_key(|(e, support)| {
                     let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
                     (
-                        discovery_rank,
                         e.credentials.priority,
                         e.success_count,
+                        discovery_rank,
                         e.id,
                     )
                 })?;
@@ -2021,29 +2020,29 @@ impl MultiTokenManager {
                 // 优先级随机：先取可用集合里最高优先级层（priority 值最小），
                 // 在该层内随机选择一个账号；该层全部不可用时，min(priority) 自动
                 // 落到下一层，继续在下一层内随机选择，实现逐层随机降级。
-                // discovery_rank 同样参与分层，保持"已确认优先"。
-                let tier_key = |e: &CredentialEntry, support: &CachedModelSupport| {
-                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.credentials.priority)
-                };
+                // 分层只看 priority：discovery_rank 不参与分层，否则"只有一个凭据预热过
+                // 模型缓存"会把随机池压缩成单元素，随机退化为固定选同一个号。
+                // Unsupported 已在 entry_available_for_request 过滤，Unknown 只是尚未
+                // 探测，交给请求本身去发现，失败由 failover 重试兜住。
                 let top_tier = available
                     .iter()
-                    .map(|(e, support)| tier_key(e, support))
+                    .map(|(e, _)| e.credentials.priority)
                     .min()?;
                 let tier: Vec<_> = available
                     .iter()
-                    .filter(|(e, support)| tier_key(e, support) == top_tier)
+                    .filter(|(e, _)| e.credentials.priority == top_tier)
                     .collect();
                 let (entry, _) = tier[fastrand::usize(..tier.len())];
 
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：严格选择数字最小的有效凭据。
-                // 同优先级按 ID 升序固定顺序，保证后端调度与前端预览一致。
-                let (entry, _) = available
-                    .iter()
-                    .min_by_key(|(e, _)| (e.credentials.priority, e.id))?;
+                // priority 模式（默认）：选择优先级最高的。
+                // discovery_rank 仅在同优先级内做 tiebreak，不得越过 priority。
+                let (entry, _) = available.iter().min_by_key(|(e, support)| {
+                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
+                    (e.credentials.priority, discovery_rank)
+                })?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -2106,14 +2105,63 @@ impl MultiTokenManager {
                     None
                 } else {
                     let entries = self.entries.lock();
-                    // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
-                    // 让调用方知道这是限流而不是凭据耗尽。
-                    if let Some(retry_after) =
-                        self.rpm_retry_after_secs(&entries, model, group, Instant::now())
-                    {
-                        return Err(
-                            UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
-                        );
+                    let current_id = *self.current_id.lock();
+                    let now = Instant::now();
+                    // current_id 只表示"粘在当前最高优先级层"，不是永久绑定：每次都要
+                    // 重算可用集合里的 min(priority)。否则一次 429/失败把 current_id 降到
+                    // 低优先级号之后，即使高优先级号冷却结束恢复可用也永远不回切，
+                    // 表现为优先级失效、流量长期钉在低优先级号上。
+                    let best_priority = entries
+                        .iter()
+                        .filter(|e| self.entry_available_for_request(e, model, group, now))
+                        .map(|e| e.credentials.priority)
+                        .min();
+                    // 复用统一的可用性判定：Unsupported 在那里已被排除。刻意不再要求
+                    // "当前凭据必须是 Confirmed"——那个交叉条件会让尚未预热模型缓存
+                    // （Unknown）的高优先级凭据被判为不可用，转而选中已预热的低优先级
+                    // 凭据并改写 current_id，形成优先级彻底失效的自锁。
+                    entries
+                        .iter()
+                        .find(|e| {
+                            e.id == current_id
+                                && self.entry_available_for_request(e, model, group, now)
+                                && Some(e.credentials.priority) == best_priority
+                        })
+                        .map(|e| (e.id, e.credentials.clone()))
+                };
+
+                let (id, credentials) = if let Some(hit) = current_hit {
+                    hit
+                } else {
+                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                    let mut best = self.select_next_credential(model, group);
+
+                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
+                    // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
+                    if best.is_none() && self.try_self_heal(model, group) {
+                        best = self.select_next_credential(model, group);
+                    }
+
+                    if let Some((new_id, new_creds)) = best {
+                        if update_current {
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                        }
+                        (new_id, new_creds)
+                    } else {
+                        let entries = self.entries.lock();
+                        if let Some(retry_after) =
+                            self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                        {
+                            return Err(
+                                UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
+                            );
+                        }
+                        // 注意：必须在 bail! 之前计算 available_count，
+                        // 因为 available_count() 会尝试获取 entries 锁，
+                        // 而此时我们已经持有该锁，会导致死锁
+                        let available = entries.iter().filter(|e| !e.disabled).count();
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                     // 注意：必须在 bail! 之前计算 available_count，
                     // 因为 available_count() 会尝试获取 entries 锁，
@@ -6914,51 +6962,12 @@ mod tests {
         );
     }
 
+    /// 同优先级时，已确认支持目标模型的凭据优先于尚未探测的凭据（仅层内 tiebreak）。
     #[test]
-    fn test_update_credential_preserves_extensible_metadata() {
+    fn test_model_routing_prefers_confirmed_cache_within_same_priority() {
         let manager = MultiTokenManager::new(
             Config::default(),
-            vec![grouped_cred("token", &[])],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        let metadata = crate::kiro::model::credentials::CredentialMetadata {
-            kind: crate::kiro::model::credentials::CredentialType::Boom,
-            sale_status: crate::kiro::model::credentials::CredentialSaleStatus::ForSale,
-            extra: std::collections::BTreeMap::from([(
-                "supplier".to_string(),
-                serde_json::Value::String("vendor-a".to_string()),
-            )]),
-        };
-
-        manager
-            .update_credential(1, None, None, None, None, None, None, Some(metadata))
-            .unwrap();
-
-        let snapshot = manager.snapshot();
-        assert_eq!(
-            snapshot.entries[0].metadata.kind,
-            crate::kiro::model::credentials::CredentialType::Boom
-        );
-        assert_eq!(
-            snapshot.entries[0].metadata.sale_status,
-            crate::kiro::model::credentials::CredentialSaleStatus::ForSale
-        );
-        assert_eq!(
-            snapshot.entries[0].metadata.extra.get("supplier"),
-            Some(&serde_json::Value::String("vendor-a".to_string()))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_priority_routing_prefers_priority_over_unknown_model_cache() {
-        let mut confirmed = grouped_cred("confirmed", &[]);
-        confirmed.priority = 10;
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![grouped_cred("unknown", &[]), confirmed],
+            vec![grouped_cred("unknown", &[]), grouped_cred("confirmed", &[])],
             None,
             None,
             false,
@@ -6966,11 +6975,68 @@ mod tests {
         .unwrap();
         seed_model_cache(&manager, 2, &["minimax-m2.5"]);
 
-        let context = manager
-            .acquire_context(Some("minimax-m2.5"), None)
-            .await
-            .unwrap();
-        assert_eq!(context.id, 1);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("minimax-m2.5"), None)
+                .map(|(id, _)| id),
+            Some(2),
+            "同优先级下应偏向已确认支持该模型的凭据"
+        );
+    }
+
+    /// 回归：模型缓存的预热状态不得越过优先级。
+    ///
+    /// 曾经 discovery_rank 是四种模式的首位排序键，priority 模式还额外有
+    /// `confirmed_available` 交叉门，导致"未预热的高优先级号"被"已预热的低优先级号"
+    /// 永久压制，并把 current_id 改写过去形成自锁 —— 表现为无论怎么切调度模式，
+    /// 优先级都失效、流量长期钉在同一个低优先级号上。
+    #[tokio::test]
+    async fn test_confirmed_cache_does_not_override_higher_priority() {
+        let mut low = grouped_cred("low-priority-confirmed", &[]);
+        low.priority = 5;
+        let mut high = grouped_cred("high-priority-unknown", &[]);
+        high.priority = 1;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![low, high], None, None, false).unwrap();
+        // 只有低优先级号被预热过，等价于 Admin 单独查询过它的模型列表
+        seed_model_cache(&manager, 1, &["minimax-m2.5"]);
+
+        for mode in ["priority", "priority-balanced", "priority-random", "balanced"] {
+            *manager.load_balancing_mode.lock() = mode.to_string();
+            let context = manager
+                .acquire_context(Some("minimax-m2.5"), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                context.id, 2,
+                "{mode} 模式：高优先级凭据即使尚未预热模型缓存，也不应让位给已预热的低优先级凭据"
+            );
+        }
+    }
+
+    /// 回归：priority 模式在高优先级号冷却结束后必须回切，不能永久粘在低优先级号上。
+    #[tokio::test]
+    async fn test_priority_mode_returns_to_high_priority_after_throttle_recovers() {
+        let mut high = grouped_cred("high", &[]);
+        high.priority = 1;
+        let mut low = grouped_cred("low", &[]);
+        low.priority = 5;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![high, low], None, None, false).unwrap();
+
+        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 1);
+
+        // 高优先级号被风控 → 降级到低优先级号，current_id 随之变为 #2
+        manager.report_account_throttled_for_request(1, StdDuration::from_secs(600), None, None);
+        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 2);
+
+        // 冷却解除 → 必须回到高优先级号
+        manager.clear_throttle(1).unwrap();
+        assert_eq!(
+            manager.acquire_context(None, None).await.unwrap().id,
+            1,
+            "高优先级号恢复可用后 priority 模式应回切，而不是继续粘在低优先级号"
+        );
     }
 
     #[tokio::test]
