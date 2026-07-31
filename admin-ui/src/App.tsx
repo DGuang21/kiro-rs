@@ -12,7 +12,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, PackagePlus, Settings2 } from "lucide-react";
+import { Activity, Server, LogOut, Moon, Sun, ScrollText, PackagePlus, Settings2 } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
 import { tabFromHash } from "@/hooks/use-url-state";
@@ -38,11 +38,6 @@ const OverviewPage = lazy(() =>
     default: m.OverviewPage,
   })),
 );
-const ClientKeysPage = lazy(() =>
-  import("@/components/client-keys-page").then((m) => ({
-    default: m.ClientKeysPage,
-  })),
-);
 const TraceLogPage = lazy(() =>
   import("@/components/trace-log-page").then((m) => ({
     default: m.TraceLogPage,
@@ -59,13 +54,7 @@ const SettingsPage = lazy(() =>
   })),
 );
 
-type Tab =
-  | "overview"
-  | "credentials"
-  | "keys"
-  | "restock"
-  | "traces"
-  | "settings";
+type Tab = "overview" | "credentials" | "restock" | "traces" | "settings";
 
 const TABS: {
   key: Tab;
@@ -84,12 +73,6 @@ const TABS: {
     label: "凭据管理",
     mobileLabel: "凭据",
     icon: <Server className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "keys",
-    label: "客户端 Key",
-    mobileLabel: "Key",
-    icon: <KeyRound className="h-3.5 w-3.5" />,
   },
   {
     key: "restock",
@@ -114,12 +97,13 @@ const TABS: {
 /**
  * 旧入口 → 新位置的重定向表。
  *
- * 分组管理和代理池原先是顶级 Tab，合并进「系统设置」后旧链接（含用户书签、
- * 文档里的 `#/proxies`）仍应可用，这里映射到对应的二级面板。
+ * 分组管理、代理池和客户端 Key 原先是顶级 Tab，合并进「系统设置」后旧链接（含
+ * 用户书签、文档里的 `#/proxies`）仍应可用，这里映射到对应的二级面板。
  */
 const LEGACY_HASH_REDIRECTS: Record<string, string> = {
   groups: "settings/groups",
   proxies: "settings/proxies",
+  keys: "settings/keys",
 };
 
 function readTabFromHash(): Tab {
@@ -127,7 +111,6 @@ function readTabFromHash(): Tab {
   const h = window.location.hash.replace(/^#\/?/, "").split("/")[0];
   if (
     h === "credentials" ||
-    h === "keys" ||
     h === "restock" ||
     h === "overview" ||
     h === "traces" ||
@@ -501,7 +484,6 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
       <Suspense fallback={<div className="text-sm text-muted-foreground">加载中…</div>}>
         {tab === "overview" && <OverviewPage />}
         {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
-        {tab === "keys" && <ClientKeysPage />}
         {tab === "restock" && <UpstreamPage />}
         {tab === "traces" && <TraceLogPage />}
         {tab === "settings" && <SettingsPage />}

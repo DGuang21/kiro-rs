@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
-import { Settings2, FolderTree, Network, Activity, ShieldCheck } from 'lucide-react'
+import { Settings2, FolderTree, Network, Activity, ShieldCheck, KeyRound } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { ClientKeysPage } from '@/components/client-keys-page'
 import { GroupsPage } from '@/components/groups-page'
 import { ProxyPoolPage } from '@/components/proxy-pool-page'
 import { SchedulingPanel } from '@/components/settings/scheduling-panel'
@@ -9,16 +10,22 @@ import { ResiliencePanel } from '@/components/settings/resilience-panel'
 /**
  * 系统设置页：把原先散落在顶栏下拉和独立 Tab 里的配置项收拢到一处。
  *
- * 四个二级面板：
+ * 五个二级面板：
  * - 调度策略：负载均衡模式（含优先级随机）
  * - 风控重试：账号级风控故障转移 + 冷却时长 + 失败重试次数 + 凭据自愈
+ * - 客户端 Key：复用 ClientKeysPage
  * - 分组管理：复用 GroupsPage
  * - 代理池：复用 ProxyPoolPage
  *
  * 二级 Tab 写进 hash（`#/settings/proxies`），刷新后停在原位；旧链接
- * `#/groups`、`#/proxies` 由 App 负责重定向到这里。
+ * `#/groups`、`#/proxies`、`#/keys` 由 App 负责重定向到这里。
  */
-export type SettingsSection = 'scheduling' | 'resilience' | 'groups' | 'proxies'
+export type SettingsSection =
+  | 'scheduling'
+  | 'resilience'
+  | 'keys'
+  | 'groups'
+  | 'proxies'
 
 const SECTIONS: {
   key: SettingsSection
@@ -37,6 +44,12 @@ const SECTIONS: {
     label: '风控重试',
     mobileLabel: '风控',
     icon: <ShieldCheck className="h-3.5 w-3.5" />,
+  },
+  {
+    key: 'keys',
+    label: '客户端 Key',
+    mobileLabel: 'Key',
+    icon: <KeyRound className="h-3.5 w-3.5" />,
   },
   {
     key: 'groups',
@@ -87,7 +100,7 @@ export function SettingsPage() {
           系统设置
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          调度策略、风控重试、分组与代理池的集中配置入口
+          调度策略、风控重试、客户端 Key、分组与代理池的集中配置入口
         </p>
       </div>
 
@@ -95,6 +108,7 @@ export function SettingsPage() {
 
       {section === 'scheduling' && <SchedulingPanel />}
       {section === 'resilience' && <ResiliencePanel />}
+      {section === 'keys' && <ClientKeysPage embedded />}
       {section === 'groups' && <GroupsPage embedded />}
       {section === 'proxies' && <ProxyPoolPage embedded />}
     </div>

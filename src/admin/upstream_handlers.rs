@@ -103,6 +103,12 @@ pub struct StockView {
     pub max: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_price: Option<f64>,
+    /// 仅 Kiro Market：该接口一次就返回余额，前端无需再打 /profile
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<f64>,
+    /// 仅 Kiro Market：阶梯定价的最高价（key_price 是最低价）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_max: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +210,8 @@ pub async fn upstream_stock(
         Ok(s) => Json(StockView {
             max: s.max,
             key_price: s.key_price,
+            balance: s.balance,
+            price_max: s.price_max,
         })
         .into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
@@ -235,7 +243,15 @@ pub async fn upstream_keys(
         return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
     };
     let history = q.get("history").map(|v| v == "1").unwrap_or(false);
+    let page = q.get("page").and_then(|v| v.parse::<u32>().ok());
+    let page_size = q.get("page_size").and_then(|v| v.parse::<u32>().ok());
     let client = state.service.build_upstream_client(&cfg);
+    if cfg.platform == UpstreamPlatform::KiroMarket {
+        return match client.market_keys(history, page, page_size).await {
+            Ok(r) => Json(r).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
+        };
+    }
     match client.get_keys(history).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
@@ -251,6 +267,17 @@ pub async fn upstream_created_at(
         return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
     };
     let client = state.service.build_upstream_client(&cfg);
+    if cfg.platform == UpstreamPlatform::KiroMarket {
+        // Kiro Market 用 count 表示总数，映射到既有的 keyCount 字段供前端复用
+        return match client.market_keys_created_at().await {
+            Ok(r) => Json(serde_json::json!({
+                "createdAt": r.created_at,
+                "keyCount": r.count,
+            }))
+            .into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
+        };
+    }
     match client.get_keys_created_at().await {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
@@ -261,11 +288,20 @@ pub async fn upstream_created_at(
 pub async fn upstream_orders(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let Some(cfg) = state.upstreams.get(&id) else {
         return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
     };
     let client = state.service.build_upstream_client(&cfg);
+    if cfg.platform == UpstreamPlatform::KiroMarket {
+        let page = q.get("page").and_then(|v| v.parse::<u32>().ok());
+        let page_size = q.get("page_size").and_then(|v| v.parse::<u32>().ok());
+        return match client.market_orders(page, page_size).await {
+            Ok(r) => Json(r).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
+        };
+    }
     match client.get_purchase_orders().await {
         Ok(list) => Json(serde_json::json!({ "orders": list })).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
@@ -305,9 +341,17 @@ pub async fn upstream_purchase(
     let order_id = new_client_order_id();
     let count = Some(req.count);
     let source_channel = Some(cfg.name.clone());
+    // 手动提号不限定开号批次，从全量库存里取。
     let result = state
         .service
-        .upstream_purchase_and_import(&cfg, count, &order_id, cfg.groups.clone(), source_channel)
+        .upstream_purchase_and_import(
+            &cfg,
+            count,
+            &order_id,
+            None,
+            cfg.groups.clone(),
+            source_channel,
+        )
         .await;
 
     match result {
@@ -357,8 +401,8 @@ pub async fn upstream_register_webhook(
     let Some(cfg) = state.upstreams.get(&id) else {
         return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
     };
-    if !cfg.platform.supports_webhook() {
-        return bad_request("KiroApp 平台不支持 Webhook");
+    if !cfg.platform.can_register_webhook() {
+        return bad_request(webhook_register_unsupported_hint(cfg.platform));
     }
     let Some(base) = cfg.receiver_base_url.as_ref() else {
         return bad_request("请先配置本服务对外可达地址（receiverBaseUrl）再注册");
@@ -389,8 +433,8 @@ pub async fn upstream_test_webhook(
     let Some(cfg) = state.upstreams.get(&id) else {
         return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
     };
-    if !cfg.platform.supports_webhook() {
-        return bad_request("KiroApp 平台不支持 Webhook");
+    if !cfg.platform.can_register_webhook() {
+        return bad_request(webhook_register_unsupported_hint(cfg.platform));
     }
     let client = state.service.build_upstream_client(&cfg);
     match client.test_webhook().await {
@@ -411,6 +455,115 @@ pub async fn upstream_events(State(state): State<AdminState>) -> impl IntoRespon
     }))
 }
 
+// ── Kiro Market 专属端点 ─────────────────────────────────────────────────────
+
+/// 兑换码充值请求体
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedeemRequest {
+    pub code: String,
+}
+
+/// 签发 API 令牌请求体
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueTokenRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 有效期天数；0 = 永不过期，最长 365
+    #[serde(default)]
+    pub expires_in_days: Option<u32>,
+}
+
+/// GET /api/admin/upstream/{id}/ledger —— 积分流水
+pub async fn upstream_ledger(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(cfg) = state.upstreams.get(&id) else {
+        return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
+    };
+    let page = q.get("page").and_then(|v| v.parse::<u32>().ok());
+    let page_size = q.get("page_size").and_then(|v| v.parse::<u32>().ok());
+    let entry_type = q.get("type").map(String::as_str);
+    let client = state.service.build_upstream_client(&cfg);
+    match client.market_ledger(page, page_size, entry_type).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
+    }
+}
+
+/// POST /api/admin/upstream/{id}/redeem —— 兑换码充值
+pub async fn upstream_redeem(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<RedeemRequest>,
+) -> impl IntoResponse {
+    let Some(cfg) = state.upstreams.get(&id) else {
+        return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
+    };
+    if req.code.trim().is_empty() {
+        return bad_request("兑换码不能为空");
+    }
+    let client = state.service.build_upstream_client(&cfg);
+    match client.market_redeem(req.code.trim()).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
+    }
+}
+
+/// GET /api/admin/upstream/{id}/tokens —— API 令牌列表（不含明文）
+pub async fn upstream_tokens(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(cfg) = state.upstreams.get(&id) else {
+        return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
+    };
+    let client = state.service.build_upstream_client(&cfg);
+    match client.market_tokens().await {
+        Ok(list) => Json(serde_json::json!({ "tokens": list })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
+    }
+}
+
+/// POST /api/admin/upstream/{id}/tokens —— 签发令牌
+///
+/// 上游只在此处返回一次明文，因此原样透传给调用方，本服务不落盘。
+pub async fn upstream_issue_token(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<IssueTokenRequest>,
+) -> impl IntoResponse {
+    let Some(cfg) = state.upstreams.get(&id) else {
+        return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
+    };
+    let client = state.service.build_upstream_client(&cfg);
+    match client
+        .market_issue_token(req.name.as_deref(), req.expires_in_days)
+        .await
+    {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
+    }
+}
+
+/// DELETE /api/admin/upstream/{id}/tokens/{tokenId} —— 吊销令牌
+pub async fn upstream_revoke_token(
+    State(state): State<AdminState>,
+    Path((id, token_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(cfg) = state.upstreams.get(&id) else {
+        return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
+    };
+    let client = state.service.build_upstream_client(&cfg);
+    match client.market_revoke_token(&token_id).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
+    }
+}
+
 // ── 公共 webhook 接收端点（免 admin 鉴权，靠 path 中的 token 鉴别来源）──────────
 
 /// 上游 webhook 回调体（宽松解析，未知字段忽略）
@@ -421,9 +574,18 @@ pub struct WebhookPayload {
     pub event: String,
     #[serde(default)]
     pub event_id: Option<String>,
-    /// new_keys_available 携带：自动提号时必须原样作为 client_order_id
-    #[serde(default)]
+    /// new_keys_available 携带：自动提号时必须原样作为 client_order_id。
+    ///
+    /// 老平台叫 `purchase_order_id`，Kiro Market 叫 `client_order_id`（由「批次+收件人」
+    /// 确定性派生，推送重试/服务重启后都是同一个值），故用 alias 同时接受两者。
+    #[serde(default, alias = "client_order_id")]
     pub purchase_order_id: Option<String>,
+    /// Kiro Market 的开号批次 id。原样回传给 `POST /api/me/purchase` 即可只拉该批次的 Key。
+    #[serde(default)]
+    pub order_id: Option<String>,
+    /// Kiro Market：母号 id，仅记录
+    #[serde(default)]
+    pub mother_id: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
@@ -447,6 +609,20 @@ pub async fn receive_webhook(
     };
     if !cfg.enabled {
         return (StatusCode::NOT_FOUND, Json(err_body("上游已禁用"))).into_response();
+    }
+
+    // 推送失败会重试，同一事件可能送达多次：按 event_id 去重后再处理。
+    // 已见过的直接 ack，避免重复记事件、重复触发提号。
+    if !state
+        .upstream_events
+        .mark_event_seen(payload.event_id.as_deref())
+    {
+        tracing::info!(
+            "上游 {} 的 webhook 事件 {:?} 重复送达，已忽略",
+            cfg.name,
+            payload.event_id
+        );
+        return Json(serde_json::json!({ "ok": true, "deduplicated": true })).into_response();
     }
 
     match payload.event.as_str() {
@@ -490,12 +666,46 @@ pub async fn receive_webhook(
                     .purchase_order_id
                     .clone()
                     .unwrap_or_else(new_client_order_id);
+                // Kiro Market：把批次 order_id 一并带上，只拉取该批次产出的 Key
+                let upstream_order_id = payload.order_id.clone();
                 tokio::spawn(async move {
-                    run_auto_purchase(state2, cfg, order_id).await;
+                    run_auto_purchase(state2, cfg, order_id, upstream_order_id).await;
                 });
             } else {
                 tracing::info!("上游 {} 未开启自动提号，仅记录通知", cfg.name);
             }
+        }
+        // Kiro Market：Key 因滥用被回收，仅记录，不触发提号
+        "key_revoked_abuse" => {
+            state.upstream_events.push(make_event(
+                &cfg.id,
+                &cfg.name,
+                UpstreamEventKind::KeyRevokedAbuse,
+                payload
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "上游 Key 因滥用被回收".to_string()),
+                payload.order_id.clone(),
+                None,
+                None,
+                true,
+            ));
+        }
+        // Kiro Market：网页上「发一条 test 事件」验证连通性
+        "test" => {
+            state.upstream_events.push(make_event(
+                &cfg.id,
+                &cfg.name,
+                UpstreamEventKind::WebhookTest,
+                payload
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "收到上游 Webhook 连通性测试".to_string()),
+                None,
+                None,
+                None,
+                true,
+            ));
         }
         other => {
             tracing::info!("上游 {} 收到未知 webhook 事件: {}", cfg.name, other);
@@ -511,6 +721,7 @@ async fn run_auto_purchase(
     state: AdminState,
     cfg: super::upstream::UpstreamConfig,
     order_id: String,
+    upstream_order_id: Option<String>,
 ) {
     // 按**北京时间 UTC+8** 当前 (星期几, 小时) 决定提货量（分时段：命中任一高峰规则用高峰量，
     // 否则用低谷量；未启用分时段则用固定量）。不依赖服务器/容器时区。None 表示按 stock.max 提满。
@@ -521,7 +732,14 @@ async fn run_auto_purchase(
     let source_channel = Some(cfg.name.clone());
     match state
         .service
-        .upstream_purchase_and_import(&cfg, count, &order_id, cfg.groups.clone(), source_channel)
+        .upstream_purchase_and_import(
+            &cfg,
+            count,
+            &order_id,
+            upstream_order_id.as_deref(),
+            cfg.groups.clone(),
+            source_channel,
+        )
         .await
     {
         Ok((purchased, imported)) => {
@@ -566,4 +784,17 @@ fn err_body(msg: impl Into<String>) -> serde_json::Value {
 
 fn bad_request(msg: impl Into<String>) -> axum::response::Response {
     (StatusCode::BAD_REQUEST, Json(err_body(msg))).into_response()
+}
+
+/// 「不支持注册/测试回调」的提示文案。
+///
+/// Kiro Market 会推送 webhook，但回调地址只能在平台网页里填，没有注册 API，
+/// 因此要和「完全不支持 webhook」的 KiroApp 区分开，否则用户会以为收不到推送。
+fn webhook_register_unsupported_hint(platform: UpstreamPlatform) -> &'static str {
+    match platform {
+        UpstreamPlatform::KiroMarket => {
+            "Kiro Market 不提供注册接口，请到平台网页「设置 → Webhook 配置」填写回调地址，可在那里发送 test 事件验证连通"
+        }
+        _ => "当前平台不支持 Webhook",
+    }
 }

@@ -2984,6 +2984,8 @@ impl AdminService {
     ///
     /// - `count`：期望提取数量；传 `None` 或 0 时按上游 `GET /api/my/stock` 的 max 尽量提满。
     /// - `client_order_id`：幂等键（自动提号必须传 webhook 的 purchase_order_id）。
+    /// - `upstream_order_id`：仅 Kiro Market 有效，来自 webhook 的开号批次 `order_id`，
+    ///   只拉取该批次产出的 Key；其他平台忽略。
     /// - `groups` / `source_channel`：入库凭据的分组与来源渠道备注。
     ///
     /// 返回 `(purchased, imported)`：实际出 Key 数与成功入库数。
@@ -2995,17 +2997,39 @@ impl AdminService {
         cfg: &crate::admin::upstream::UpstreamConfig,
         count: Option<u32>,
         client_order_id: &str,
+        upstream_order_id: Option<&str>,
         groups: Vec<String>,
         source_channel: Option<String>,
     ) -> anyhow::Result<(u32, u32)> {
         let client = self.build_upstream_client(cfg);
 
-        // 计算数量：显式指定则用之；否则（仅 webhook 自动提号会传 None）按 stock.max 提满
+        // 计算数量：显式指定则用之；否则（仅 webhook 自动提号会传 None）按库存提满。
+        //
+        // Kiro Market 的 stock 是**全站在售库存**（可能上百），而每个账号有 max_purchase
+        // 限购；直接拿库存数下单会被上游拒。老平台的 stock.max 本身就是"本轮可提取上限"，
+        // 无此问题。故这里对 Kiro Market 额外按 max_purchase 收敛。
         let want = match count {
             Some(n) if n > 0 => n,
             _ => {
                 let stock = client.get_stock().await?;
-                stock.max
+                let mut want = stock.max;
+                if cfg.platform == crate::admin::upstream::UpstreamPlatform::KiroMarket {
+                    // 限购取自用户档案；查不到就保守放行，让上游自己裁决
+                    match client.market_profile().await {
+                        Ok(user) => {
+                            if let Some(limit) = user.max_purchase.filter(|v| *v > 0) {
+                                want = want.min(limit);
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            "上游 {} 查询限购失败，按库存 {} 下单: {}",
+                            cfg.name,
+                            want,
+                            e
+                        ),
+                    }
+                }
+                want
             }
         };
         if want == 0 {
@@ -3013,7 +3037,9 @@ impl AdminService {
         }
 
         // 提号（真实错误原样透出）
-        let resp = client.purchase(want, client_order_id).await?;
+        let resp = client
+            .purchase(want, client_order_id, upstream_order_id)
+            .await?;
 
         let keys: Vec<String> = resp.keys.into_iter().map(|k| k.key).collect();
         let purchased = resp.purchased;
