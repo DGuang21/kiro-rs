@@ -24,10 +24,20 @@ import {
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getGlobalProxy,
+  setGlobalProxy,
+  getUpdateConfig,
+  setUpdateConfig,
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
-import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  SetGlobalProxyRequest,
+  SetUpdateConfigRequest,
+  UpdateCredentialRequest,
+  UpdateRefreshTokenRequest,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -294,6 +304,43 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 全局出站代理。此前只在代理池弹窗里内联查询，设置页需要独立入口，
+// 抽成 hook 后两处共用同一份缓存（queryKey 与弹窗保持一致：'global-proxy'）。
+export function useGlobalProxy() {
+  return useQuery({
+    queryKey: ['global-proxy'],
+    queryFn: getGlobalProxy,
+  })
+}
+
+export function useSetGlobalProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetGlobalProxyRequest) => setGlobalProxy(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
+    },
+  })
+}
+
+// 镜像在线更新配置（GitHub Token / 无人值守自动更新）
+export function useUpdateConfig() {
+  return useQuery({
+    queryKey: ['update-config'],
+    queryFn: getUpdateConfig,
+  })
+}
+
+export function useSetUpdateConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetUpdateConfigRequest) => setUpdateConfig(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['update-config'] })
     },
   })
 }

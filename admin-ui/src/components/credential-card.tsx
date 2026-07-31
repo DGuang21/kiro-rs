@@ -59,6 +59,11 @@ import { UpdateTokenDialog } from "@/components/update-token-dialog";
 import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
 import { AvailableModelsDialog } from "@/components/available-models-dialog";
+import { BalanceDialog } from "@/components/balance-dialog";
+import { getDisposition } from "@/components/console/credential-state";
+import { railBorderClass } from "@/components/console/rail";
+import { PriorityPreview } from "@/components/console/priority-preview";
+import { CredentialLabel } from "@/components/console/credential-label";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -232,6 +237,7 @@ export function CredentialCard({
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
+  const [showBalanceDialog, setShowBalanceDialog] = useState(false);
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
@@ -319,7 +325,7 @@ export function CredentialCard({
   const handlePriorityChange = () => {
     const np = parseInt(priorityValue, 10);
     if (isNaN(np) || np < 0) {
-      toast.error("优先级必须是非负整数");
+      toast.error("优先级要填 0 或更大的整数，0 最先被使用");
       return;
     }
     setPriority.mutate(
@@ -392,6 +398,58 @@ export function CredentialCard({
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
 
+  // 状态判定与处置意图 —— 与日志页共用同一套四档色轨语义，
+  // 判定逻辑集中在 console/credential-state.ts，卡片与列表行只负责渲染。
+  const disposition = getDisposition(credential, balance, throttleRemaining);
+
+  /** 处置意图 → 具体 handler。语义类型在 credential-state 里定义，落地在这里。 */
+  const runDisposition = () => {
+    switch (disposition.action) {
+      case "clearThrottle":
+        handleClearThrottle();
+        break;
+      case "viewBalance":
+        setShowBalanceDialog(true);
+        break;
+      case "relogin":
+        setShowReloginDialog(true);
+        break;
+      case "enable":
+        handleToggleDisabled();
+        break;
+      case "refreshToken":
+        handleForceRefresh();
+        break;
+      case "viewFailures":
+        setShowFailuresDialog(true);
+        break;
+      case "none":
+        break;
+    }
+  };
+
+  /**
+   * 处置按钮：这一行当前唯一该做的事。
+   *
+   * 只在需要处置时出现，健康行不显示 —— 空着本身就是信息："这行不用管"。
+   */
+  const dispositionButton = disposition.actionLabel ? (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={runDisposition}
+      disabled={
+        (disposition.action === "clearThrottle" && clearThrottle.isPending) ||
+        (disposition.action === "enable" && setDisabled.isPending) ||
+        (disposition.action === "refreshToken" && forceRefresh.isPending)
+      }
+      title={`${disposition.stateLabel} → ${disposition.actionLabel}`}
+      className="h-7 whitespace-nowrap px-2.5 text-xs"
+    >
+      {disposition.actionLabel}
+    </Button>
+  ) : null;
+
   // 卡片与列表行共用的状态描边 / 灰化（当前优先 · 超额 · 冷却 · 禁用）
   const stateClasses = [
     credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : "",
@@ -453,20 +511,48 @@ export function CredentialCard({
             .join(" · ")}
         </Badge>
       )}
-      {/* 账号所属分组 */}
-      {(credential.groups ?? []).map((g) => (
-        <Badge key={g} variant="outline" title="账号分组">
-          {g}
-        </Badge>
-      ))}
-      {/* 账号来源渠道 */}
-      {credential.sourceChannel && (
-        <Badge variant="outline" title="账号来源渠道">
-          来源: {credential.sourceChannel}
-        </Badge>
-      )}
+      {/* 分组与来源不在这里：它们不是状态，见下方 groupingBlock */}
     </>
   );
+
+  const groups = credential.groups ?? [];
+
+  /**
+   * 归属模块：分组 + 来源渠道。
+   *
+   * 原先这两样和「已禁用」「冷却」「Builder ID」挤在同一串徽章里，但它们回答的是
+   * 完全不同的问题 —— 那些说的是"这个号现在怎么了"（会变，要处置），分组说的是
+   * "这个号归谁用"（人为归档，稳定）。混在一起的后果是：想按分组扫一眼时，眼睛
+   * 得在一排形状相同的胶囊里挑出哪几个是分组，因为它们长得一模一样。
+   *
+   * 拆成独立一块并加上字段名，分组就有了固定位置：不用读内容也知道去哪儿看。
+   */
+  const groupingBlock =
+    groups.length > 0 || credential.sourceChannel ? (
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1.5 text-[12px]">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <span className="shrink-0 text-muted-foreground">分组</span>
+          {groups.length > 0 ? (
+            groups.map((g) => (
+              <span
+                key={g}
+                className="inline-flex max-w-full items-center truncate rounded-md bg-secondary px-1.5 py-0.5 font-medium text-secondary-foreground"
+              >
+                {g}
+              </span>
+            ))
+          ) : (
+            <span className="text-muted-foreground/60">未分组</span>
+          )}
+        </div>
+        {credential.sourceChannel && (
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="shrink-0 text-muted-foreground">来源</span>
+            <span className="min-w-0 truncate">{credential.sourceChannel}</span>
+          </div>
+        )}
+      </div>
+    ) : null;
 
   // “更多操作”下拉 —— 卡片与列表行共用
   const moreMenu = (
@@ -572,7 +658,11 @@ export function CredentialCard({
       ref={setNodeRef}
       style={dragStyle}
       data-credential-id={credential.id}
-      className={`group flex min-w-0 items-center gap-2 rounded-2xl border bg-card px-2 py-2 transition-all sm:gap-3 sm:px-3 ${
+      // 这里刻意不加 overflow-hidden：优先级编辑框与它下方的队列位置预览是绝对定位
+      // 浮起的，会有意超出 56px 的优先级列，裁剪会把它们切掉。
+      className={`group flex min-w-0 items-center gap-2 rounded-2xl border bg-card px-2 py-2 transition-all sm:gap-3 sm:px-3 ${railBorderClass(
+        disposition.tone,
+      )} ${
         isDragging
           ? "shadow-apple-lg opacity-80"
           : "hover:bg-accent/40 hover:shadow-apple-sm"
@@ -586,7 +676,7 @@ export function CredentialCard({
           variant="ghost"
           data-no-rect-select
           className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
-          title="拖拽调整优先级"
+          title="拖拽排序 · 越靠上越先被使用"
           {...attributes}
           {...listeners}
         >
@@ -609,26 +699,52 @@ export function CredentialCard({
 
       {/* 身份 + 徽章 */}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-medium leading-5">
-          {credential.email || `凭据 #${credential.id}`}
+        <div className="text-sm font-medium leading-5">
+          <CredentialLabel id={credential.id} email={credential.email} />
         </div>
         <div className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden [&>*]:shrink-0">
           {badges}
+          {/* 列表行放不下字段名，用一个前导斜杠把归属信息与状态徽章隔开，
+              形状（方角、实底）也与状态胶囊（圆角、描边）不同，扫读时可分辨 */}
+          {groups.map((g) => (
+            <span
+              key={g}
+              title="账号分组"
+              className="inline-flex items-center rounded-md bg-secondary px-1.5 py-0.5 text-[11px] font-medium text-secondary-foreground"
+            >
+              {g}
+            </span>
+          ))}
+          {credential.sourceChannel && (
+            <span
+              title="账号来源渠道"
+              className="text-[11px] text-muted-foreground"
+            >
+              {credential.sourceChannel}
+            </span>
+          )}
         </div>
       </div>
 
       {/* 关键指标（中大屏） */}
       <div className="hidden shrink-0 items-center gap-5 lg:flex">
         <div className="relative w-14 shrink-0 text-center">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          {/* 列宽只有 56px，塞不下「小=先用」。用一个升序楔形符号带住方向，
+              完整说明挂 title；点开编辑后由队列位置预览把话说全。 */}
+          <div
+            className="text-[10px] uppercase tracking-wider text-muted-foreground"
+            title="优先级：数字越小越先被使用，0 最先"
+          >
             优先级
+            <span className="ml-0.5 text-muted-foreground/60">↑</span>
           </div>
           {/* 固定高度占位，避免编辑态切换时整行高度抖动 */}
           <div className="mt-0.5 flex h-[26px] items-center justify-center">
             {editingPriority ? (
               // 编辑栏（≈112px）比列宽（56px）更宽：绝对定位脱离流式布局浮起，
               // 配合背景与 z-index，避免被相邻"失败"列在绘制顺序上覆盖
-              <div className="absolute left-1/2 top-1/2 z-30 inline-flex -translate-x-1/2 -translate-y-1/2 items-center gap-0.5 rounded-md border border-border/60 bg-card p-1 shadow-apple-sm">
+              <div className="absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-md border border-border/60 bg-card p-1 shadow-apple-sm">
+                <div className="inline-flex items-center gap-0.5">
                 <Input
                   type="number"
                   value={priorityValue}
@@ -666,13 +782,22 @@ export function CredentialCard({
                 >
                   ✕
                 </Button>
+                </div>
+                {/* 改这个数字会发生什么，当场说清楚 */}
+                <div className="mt-1 whitespace-nowrap px-1 text-center">
+                  <PriorityPreview
+                    credentialId={credential.id}
+                    draft={priorityValue}
+                    disabled={credential.disabled}
+                  />
+                </div>
               </div>
             ) : (
               <button
                 type="button"
                 className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
                 onClick={() => setEditingPriority(true)}
-                title="点击编辑优先级"
+                title="点击编辑 · 数字越小越先被使用"
               >
                 {credential.priority}
                 <Pencil className="h-3 w-3 opacity-70" />
@@ -783,12 +908,19 @@ export function CredentialCard({
         </div>
       </div>
 
-      {/* 操作区 */}
+      {/*
+        操作区：处置意图按钮在最前 —— 这一行现在唯一该做的事。
+        禁用态下会多出一个「启用」按钮，加上右侧几个固定宽度的指标列，总宽会超出
+        行容器把「更多操作」顶出右边界。所以有处置按钮时就收掉那两个图标按钮
+        （刷新 Token / 刷新余额）—— 它们在「更多操作」里本来就有一份，而处置按钮
+        才是这一行真正该点的东西。
+      */}
       <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
+        {dispositionButton}
         <Button
           size="icon"
           variant="ghost"
-          className="hidden h-9 w-9 sm:inline-flex"
+          className={`h-9 w-9 ${dispositionButton ? "hidden" : "hidden sm:inline-flex"}`}
           onClick={handleForceRefresh}
           disabled={
             forceRefresh.isPending ||
@@ -810,7 +942,7 @@ export function CredentialCard({
         <Button
           size="icon"
           variant="ghost"
-          className="hidden h-9 w-9 sm:inline-flex"
+          className={`h-9 w-9 ${dispositionButton ? "hidden" : "hidden sm:inline-flex"}`}
           onClick={onRefreshBalance}
           disabled={loadingBalance || credential.disabled}
           title={credential.disabled ? "已禁用" : "刷新余额"}
@@ -850,7 +982,7 @@ export function CredentialCard({
         ref={setNodeRef}
         style={dragStyle}
         data-credential-id={credential.id}
-        className={`group flex h-full min-w-0 flex-col ${
+        className={`group flex h-full min-w-0 flex-col overflow-hidden ${
           isDragging
             ? "shadow-apple-lg opacity-80"
             : "hover:-translate-y-0.5 hover:shadow-apple-lg"
@@ -873,8 +1005,8 @@ export function CredentialCard({
               />
             </label>
             <div className="min-w-0 flex-1">
-              <CardTitle className="truncate text-[15px] leading-5">
-                {credential.email || `凭据 #${credential.id}`}
+              <CardTitle className="text-[15px] leading-5">
+                <CredentialLabel id={credential.id} email={credential.email} />
               </CardTitle>
               <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 overflow-hidden">
                 {badges}
@@ -891,40 +1023,68 @@ export function CredentialCard({
         </CardHeader>
 
         <CardContent className="flex flex-1 flex-col space-y-3 px-4 pb-4 sm:space-y-4 sm:px-5 sm:pb-5">
+          {/* 归属：分组 / 来源 —— 独立成块，与状态徽章分开 */}
+          {groupingBlock}
+
           {/* 信息行 */}
           <dl className="grid grid-cols-1 gap-2 text-[13px] min-[420px]:grid-cols-2 min-[420px]:gap-x-4">
             <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">优先级</dt>
+              {/* 方向写在字段名里：标签本来就该说清这个数字是什么意思 */}
+              <dt className="shrink-0 text-muted-foreground">
+                优先级
+                <span className="ml-1 text-[11px] text-muted-foreground/70">
+                  小=先用
+                </span>
+              </dt>
               <dd className="min-w-0">
                 {editingPriority ? (
-                  <div className="inline-flex max-w-full items-center gap-1">
-                    <Input
-                      type="number"
-                      value={priorityValue}
-                      onChange={(e) => setPriorityValue(e.target.value)}
-                      className="w-16 h-7 rounded-md text-base sm:text-sm"
-                      min="0"
-                    />
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7"
-                      onClick={handlePriorityChange}
-                      disabled={setPriority.isPending}
-                    >
-                      ✓
-                    </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7"
-                      onClick={() => {
-                        setEditingPriority(false);
-                        setPriorityValue(String(credential.priority));
-                      }}
-                    >
-                      ✕
-                    </Button>
+                  <div className="max-w-full text-right">
+                    <div className="inline-flex max-w-full items-center gap-1">
+                      <Input
+                        type="number"
+                        value={priorityValue}
+                        onChange={(e) => setPriorityValue(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handlePriorityChange();
+                          if (e.key === "Escape") {
+                            setEditingPriority(false);
+                            setPriorityValue(String(credential.priority));
+                          }
+                        }}
+                        className="w-16 h-7 rounded-md text-base sm:text-sm"
+                        min="0"
+                        autoFocus
+                      />
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7"
+                        onClick={handlePriorityChange}
+                        disabled={setPriority.isPending}
+                        title="保存"
+                      >
+                        ✓
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7"
+                        onClick={() => {
+                          setEditingPriority(false);
+                          setPriorityValue(String(credential.priority));
+                        }}
+                        title="取消"
+                      >
+                        ✕
+                      </Button>
+                    </div>
+                    <div className="mt-0.5">
+                      <PriorityPreview
+                        credentialId={credential.id}
+                        draft={priorityValue}
+                        disabled={credential.disabled}
+                      />
+                    </div>
                   </div>
                 ) : (
                   <button
@@ -1100,8 +1260,9 @@ export function CredentialCard({
           </div>
 
           {/* 操作区 */}
-          <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:justify-between">
-            <div className="grid grid-cols-3 gap-1 min-[420px]:flex min-[420px]:items-center">
+          {/* min-w-0 + flex-wrap：两组按钮宽度不够时折行，不把内容顶出卡片 */}
+          <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:flex-wrap min-[420px]:items-center min-[420px]:justify-between">
+            <div className="grid min-w-0 grid-cols-3 gap-1 min-[420px]:flex min-[420px]:items-center">
               {!dragDisabled && (
                 <>
                   <Button
@@ -1110,7 +1271,7 @@ export function CredentialCard({
                     variant="ghost"
                     data-no-rect-select
                     className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
-                    title="拖拽调整优先级"
+                    title="拖拽排序 · 越靠上越先被使用"
                     {...attributes}
                     {...listeners}
                   >
@@ -1157,11 +1318,18 @@ export function CredentialCard({
               </Button>
             </div>
 
-            <div className="grid grid-cols-[1fr_auto] gap-1 min-[420px]:flex min-[420px]:items-center">
+            {/*
+              原先是 grid-cols-[1fr_auto]（两列）。禁用态会多出「启用」处置按钮，
+              三个孩子塞两列，加上这条链路上没有任何 min-w-0 / flex-wrap 约束、
+              Card 也没裁剪，于是「更多操作」被按固有宽度推出卡片右边界。
+              改成可换行的 flex：宽度不够就折行，而不是往外顶。
+            */}
+            <div className="flex min-w-0 flex-wrap items-center justify-end gap-1">
+              {dispositionButton}
               <Button
                 size="sm"
                 variant="outline"
-                className="w-full min-[420px]:w-auto"
+                className="flex-1 min-[420px]:flex-none"
                 onClick={() => setShowEditDialog(true)}
               >
                 <Pencil className="h-3.5 w-3.5" />
@@ -1226,6 +1394,12 @@ export function CredentialCard({
         open={showModelsDialog}
         onOpenChange={setShowModelsDialog}
         credentialId={credential.id}
+      />
+      {/* 「查看余额」处置动作：拉一次最新余额，看清用量与下次重置时间 */}
+      <BalanceDialog
+        open={showBalanceDialog}
+        onOpenChange={setShowBalanceDialog}
+        credentialId={showBalanceDialog ? credential.id : null}
       />
     </>
   );

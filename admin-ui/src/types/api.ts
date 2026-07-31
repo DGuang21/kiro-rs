@@ -544,6 +544,12 @@ export interface TraceQuery {
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
   onlyFailed?: boolean
+  /** 时间窗口起点（Unix 秒，含）。与后端 traces.ts_epoch 同单位 */
+  startTime?: number
+  /** 时间窗口终点（Unix 秒，含） */
+  endTime?: number
+  /** 关键字模糊匹配：模型名 / traceId / 错误信息 */
+  q?: string
   limit?: number
   offset?: number
 }

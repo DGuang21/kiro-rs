@@ -1298,7 +1298,8 @@ pub async fn stats_by_credential(
 
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
-/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
+/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed /
+///            startTime / endTime（Unix 秒）/ q（关键字）/ limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
@@ -1336,6 +1337,13 @@ pub async fn list_traces(
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false),
         credential_ids,
+        // startTime / endTime 为 Unix 秒，与 traces.ts_epoch 同单位
+        start_ts: params.get("startTime").and_then(|s| s.parse::<i64>().ok()),
+        end_ts: params.get("endTime").and_then(|s| s.parse::<i64>().ok()),
+        keyword: params
+            .get("q")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         limit: params
             .get("limit")
             .and_then(|s| s.parse::<usize>().ok())
