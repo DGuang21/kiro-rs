@@ -12,7 +12,40 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-export type UpstreamPlatform = 'legacy' | 'kiro_app'
+export type UpstreamPlatform = 'legacy' | 'kiro_app' | 'kiro_market'
+
+/** 各平台的默认 baseUrl；legacy 必须用户自填。与后端 `default_base_url()` 保持一致。 */
+export const PLATFORM_DEFAULT_BASE_URL: Record<UpstreamPlatform, string> = {
+  legacy: '',
+  kiro_app: 'https://kiroapp.cc',
+  kiro_market: 'https://kiroapp.io',
+}
+
+export const PLATFORM_LABEL: Record<UpstreamPlatform, string> = {
+  legacy: 'Webhook API',
+  kiro_app: 'KiroApp',
+  kiro_market: 'Kiro Market',
+}
+
+/**
+ * 平台能力位，镜像后端 `UpstreamPlatform` 的同名方法。
+ *
+ * 注意 `supportsWebhook` 与 `canRegisterWebhook` 是两件事：Kiro Market 会推送
+ * webhook（所以要展示回调地址、允许自动提号），但没有注册接口，回调地址得用户
+ * 自己贴到平台网页的「设置 → Webhook 配置」里。
+ */
+export function supportsWebhook(platform: UpstreamPlatform): boolean {
+  return platform === 'legacy' || platform === 'kiro_market'
+}
+
+export function canRegisterWebhook(platform: UpstreamPlatform): boolean {
+  return platform === 'legacy'
+}
+
+/** 平台把配额叫「积分」还是「余额」 */
+export function balanceLabel(platform: UpstreamPlatform): string {
+  return platform === 'legacy' ? '余额' : '积分'
+}
 
 api.interceptors.request.use((config) => {
   const apiKey = storage.getApiKey()
@@ -93,6 +126,10 @@ export interface UpsertUpstreamRequest {
 export interface StockResponse {
   max: number
   keyPrice?: number
+  /** 仅 Kiro Market：该接口一次就返回余额 */
+  balance?: number
+  /** 仅 Kiro Market：阶梯定价最高价（keyPrice 为最低价） */
+  priceMax?: number
 }
 
 export interface UpstreamProfile {

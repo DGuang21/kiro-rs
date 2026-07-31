@@ -65,6 +65,11 @@ import {
   type PeakWindow,
   type PickupStats,
   type UpstreamPlatform,
+  PLATFORM_DEFAULT_BASE_URL,
+  PLATFORM_LABEL,
+  supportsWebhook,
+  canRegisterWebhook,
+  balanceLabel,
 } from '@/api/upstream'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -133,7 +138,10 @@ export function UpstreamPage() {
 
   // 余额 / 库存缓存：id → 结果
   const [profiles, setProfiles] = useState<
-    Record<string, UpstreamProfile & { max?: number; keyPrice?: number }>
+    Record<
+      string,
+      UpstreamProfile & { max?: number; keyPrice?: number; priceMax?: number }
+    >
   >({})
   const [loadingId, setLoadingId] = useState<string | null>(null)
   const [purchasingId, setPurchasingId] = useState<string | null>(null)
@@ -178,7 +186,7 @@ export function UpstreamPage() {
       return Number.isNaN(n) || n < 0 ? 0 : n
     }
     // 校验：开启分时段但没配任何高峰规则
-    if (edit.platform === 'legacy' && edit.scheduleEnabled && edit.peakWindows.length === 0) {
+    if (supportsWebhook(edit.platform) && edit.scheduleEnabled && edit.peakWindows.length === 0) {
       toast.error('已开启分时段，请至少添加一条高峰时段规则')
       return
     }
@@ -191,11 +199,13 @@ export function UpstreamPage() {
     const req = {
       name: edit.name.trim(),
       platform: edit.platform,
-      baseUrl:
-        edit.baseUrl.trim() || (edit.platform === 'kiro_app' ? 'https://kiroapp.cc' : ''),
-      receiverBaseUrl:
-        edit.platform === 'legacy' ? edit.receiverBaseUrl.trim() || null : null,
-      autoPurchaseEnabled: edit.platform === 'legacy' && edit.autoPurchaseEnabled,
+      baseUrl: edit.baseUrl.trim() || PLATFORM_DEFAULT_BASE_URL[edit.platform],
+      // Kiro Market 也收 webhook，回调地址与自动提号对它同样有效
+      receiverBaseUrl: supportsWebhook(edit.platform)
+        ? edit.receiverBaseUrl.trim() || null
+        : null,
+      autoPurchaseEnabled:
+        supportsWebhook(edit.platform) && edit.autoPurchaseEnabled,
       autoPurchaseCount: Number.isNaN(count) || count < 0 ? 0 : count,
       schedule,
       endpoint: edit.endpoint.trim() || null,
@@ -249,18 +259,27 @@ export function UpstreamPage() {
         queryUpstreamProfile(u.id),
         queryUpstreamStock(u.id),
       ])
-      const merged: UpstreamProfile & { max?: number; keyPrice?: number } = {}
+      const merged: UpstreamProfile & {
+        max?: number
+        keyPrice?: number
+        priceMax?: number
+      } = {}
       if (profile.status === 'fulfilled') Object.assign(merged, profile.value)
       if (stock.status === 'fulfilled') {
         merged.max = stock.value.max
         merged.keyPrice = stock.value.keyPrice
+        merged.priceMax = stock.value.priceMax
+        // Kiro Market 的 stock 自带余额：profile 失败时也能显示余额
+        if (merged.remaining == null && stock.value.balance != null) {
+          merged.remaining = stock.value.balance
+        }
       }
       setProfiles((prev) => ({ ...prev, [u.id]: merged }))
       if (profile.status === 'rejected' && stock.status === 'rejected') {
         toast.error('查询失败: ' + extractErrorMessage(stock.reason))
       } else {
         toast.success(
-          `${u.name}：${u.platform === 'kiro_app' ? '积分' : '余额'} ${merged.remaining ?? '-'}，可提取 ${merged.max ?? '-'} 个`,
+          `${u.name}：${balanceLabel(u.platform)} ${merged.remaining ?? '-'}，可提取 ${merged.max ?? '-'} 个`,
         )
       }
     } finally {
@@ -441,7 +460,11 @@ function UpstreamCard({
   onDelete,
 }: {
   upstream: UpstreamConfig
-  profile?: UpstreamProfile & { max?: number; keyPrice?: number }
+  profile?: UpstreamProfile & {
+    max?: number
+    keyPrice?: number
+    priceMax?: number
+  }
   loading: boolean
   purchasing: boolean
   onQuery: () => void
@@ -495,7 +518,7 @@ function UpstreamCard({
             <div className="flex items-center gap-2 min-w-0">
               <span className="font-medium truncate">{upstream.name}</span>
               <Badge variant="outline" className="text-xs shrink-0">
-                {upstream.platform === 'kiro_app' ? 'KiroApp' : 'Webhook API'}
+                {PLATFORM_LABEL[upstream.platform] ?? upstream.platform}
               </Badge>
               {!upstream.enabled && <Badge variant="outline" className="text-xs text-muted-foreground">已禁用</Badge>}
               {upstream.autoPurchaseEnabled && (
@@ -530,22 +553,31 @@ function UpstreamCard({
         {profile && (
           <div className="flex flex-wrap items-center gap-2 text-xs">
             {profile.remaining != null && (
-              <Badge variant="secondary" className="gap-1"><Wallet className="h-3 w-3" />{upstream.platform === 'kiro_app' ? '积分' : '余额'} {profile.remaining}</Badge>
+              <Badge variant="secondary" className="gap-1"><Wallet className="h-3 w-3" />{balanceLabel(upstream.platform)} {profile.remaining}</Badge>
             )}
             {profile.max != null && (
               <Badge variant="secondary" className="gap-1"><KeyRound className="h-3 w-3" />可提取 {profile.max} 个</Badge>
             )}
             {profile.keyPrice != null && (
-              <Badge variant="secondary" className="gap-1">单价 {profile.keyPrice}</Badge>
+              <Badge variant="secondary" className="gap-1">
+                单价{' '}
+                {profile.priceMax != null && profile.priceMax !== profile.keyPrice
+                  ? `${profile.keyPrice}~${profile.priceMax}`
+                  : profile.keyPrice}
+              </Badge>
             )}
           </div>
         )}
 
         {/* Webhook 接收地址：全打码短展示，完整地址仅通过复制获取 */}
-        {upstream.platform !== 'legacy' ? null : upstream.webhookReceiverUrl ? (
+        {!supportsWebhook(upstream.platform) ? null : upstream.webhookReceiverUrl ? (
           <div className="flex items-center gap-1.5 rounded-md bg-secondary/40 px-2 py-1.5">
             <Webhook className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <span className="flex-1 min-w-0 truncate text-[11px] text-muted-foreground">回调地址已配置 ·····</span>
+            <span className="flex-1 min-w-0 truncate text-[11px] text-muted-foreground">
+              {canRegisterWebhook(upstream.platform)
+                ? '回调地址已配置 ·····'
+                : '回调地址已生成 ····· 需手动填到平台网页'}
+            </span>
             <Button size="icon" variant="ghost" className="h-6 w-6" onClick={copyWebhook} title="复制完整接收地址">
               <Copy className="h-3 w-3" />
             </Button>
@@ -558,13 +590,13 @@ function UpstreamCard({
         <div className="flex flex-wrap items-center gap-1.5">
           <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onQuery} disabled={loading}>
             {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />}
-            {upstream.platform === 'kiro_app' ? '查询库存' : '查询余额'}
+            {upstream.platform === 'legacy' ? '查询余额' : '查询库存'}
           </Button>
           <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onPurchase} disabled={purchasing}>
             {purchasing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
             提号入库
           </Button>
-          {upstream.platform === 'legacy' && (
+          {canRegisterWebhook(upstream.platform) && (
             <>
               <Button
                 size="sm"
@@ -941,19 +973,22 @@ function UpstreamEditDialog({
 }) {
   const set = (patch: Partial<EditState>) => onChange({ ...edit, ...patch })
   const setPlatform = (platform: UpstreamPlatform) => {
-    if (platform === 'kiro_app') {
+    // baseUrl：只在当前值是「某个平台的默认地址」时才替换，避免覆盖用户手填的地址。
+    const defaults = Object.values(PLATFORM_DEFAULT_BASE_URL).filter(Boolean)
+    const baseUrl = defaults.includes(edit.baseUrl)
+      ? PLATFORM_DEFAULT_BASE_URL[platform]
+      : edit.baseUrl || PLATFORM_DEFAULT_BASE_URL[platform]
+    // 不收 webhook 的平台清掉回调与自动提号，避免留下无效配置
+    if (!supportsWebhook(platform)) {
       set({
         platform,
-        baseUrl: 'https://kiroapp.cc',
+        baseUrl,
         receiverBaseUrl: '',
         autoPurchaseEnabled: false,
         scheduleEnabled: false,
       })
     } else {
-      set({
-        platform,
-        baseUrl: edit.baseUrl === 'https://kiroapp.cc' ? '' : edit.baseUrl,
-      })
+      set({ platform, baseUrl })
     }
   }
 
@@ -989,13 +1024,14 @@ function UpstreamEditDialog({
               <SelectContent>
                 <SelectItem value="legacy">千羽架构</SelectItem>
                 <SelectItem value="kiro_app">KiroApp</SelectItem>
+                <SelectItem value="kiro_market">Kiro Market</SelectItem>
               </SelectContent>
             </Select>
           </div>
           <div className="space-y-1.5">
             <label className="text-sm font-medium">API 基础地址</label>
             <Input
-              placeholder={edit.platform === 'kiro_app' ? 'https://kiroapp.cc' : 'https://api.example.com'}
+              placeholder={PLATFORM_DEFAULT_BASE_URL[edit.platform] || 'https://api.example.com'}
               value={edit.baseUrl}
               onChange={(e) => set({ baseUrl: e.target.value })}
               disabled={saving}
@@ -1009,7 +1045,13 @@ function UpstreamEditDialog({
             </label>
             <Input
               type="password"
-              placeholder={edit.platform === 'kiro_app' ? 'KiroApp Open API Key' : 'usr-xxxxxxxx'}
+              placeholder={
+                edit.platform === 'kiro_market'
+                  ? 'km_xxxxxxxx（设置 → API 令牌 生成）'
+                  : edit.platform === 'kiro_app'
+                    ? 'KiroApp Open API Key'
+                    : 'usr-xxxxxxxx'
+              }
               value={edit.apiKey}
               onChange={(e) => set({ apiKey: e.target.value })}
               disabled={saving}
@@ -1017,7 +1059,7 @@ function UpstreamEditDialog({
               autoComplete="new-password"
             />
           </div>
-          {edit.platform === 'legacy' && (
+          {supportsWebhook(edit.platform) && (
             <>
               <div className="space-y-1.5">
                 <label className="text-sm font-medium">本服务对外地址</label>
@@ -1030,7 +1072,9 @@ function UpstreamEditDialog({
                   autoComplete="off"
                 />
                 <p className="text-xs text-muted-foreground">
-                  上游回调本服务用。留空则不生成接收地址、无法注册 Webhook。
+                  {canRegisterWebhook(edit.platform)
+                    ? '上游回调本服务用。留空则不生成接收地址、无法注册 Webhook。'
+                    : 'Kiro Market 没有注册接口：填好后把下方生成的接收地址复制到平台网页「设置 → Webhook 配置」里，可在那里发 test 事件验证连通。'}
                 </p>
               </div>
 

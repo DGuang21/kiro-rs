@@ -26,19 +26,54 @@ const MAX_EVENTS: usize = 500;
 /// KiroApp 开放 API 默认地址。
 pub const KIRO_APP_DEFAULT_BASE_URL: &str = "https://kiroapp.cc";
 const KIRO_APP_DEFAULT_COOLDOWN_SECS: u64 = 180;
+/// Kiro Market（kiroapp.io）开放 API 默认地址。
+pub const KIRO_MARKET_DEFAULT_BASE_URL: &str = "https://kiroapp.io";
+/// Kiro Market 分页接口的 page_size 上限。
+const KIRO_MARKET_MAX_PAGE_SIZE: u32 = 500;
 
-/// 补货平台协议。`legacy` 是已有的 `/api/my/* + webhook` 协议。
+/// 补货平台协议。
+///
+/// - `legacy`：已有的 `/api/my/* + X-API-Key + webhook 注册 API` 协议
+/// - `kiro_app`：KiroApp（kiroapp.cc）`/openapi/*`，纯拉取，无 webhook
+/// - `kiro_market`：Kiro Market（kiroapp.io）`/api/me/* + Bearer km_…`，
+///   支持接收 webhook，但回调地址只能在平台网页「设置 → Webhook 配置」里填，
+///   没有注册 API
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamPlatform {
     #[default]
     Legacy,
     KiroApp,
+    KiroMarket,
 }
 
 impl UpstreamPlatform {
+    /// 是否接收上游 webhook 推送（决定 receiver_base_url / 自动提号是否可用）。
     pub fn supports_webhook(self) -> bool {
+        matches!(self, Self::Legacy | Self::KiroMarket)
+    }
+
+    /// 是否提供「注册/测试回调地址」的 API。Kiro Market 只能在网页里配。
+    pub fn can_register_webhook(self) -> bool {
         matches!(self, Self::Legacy)
+    }
+
+    pub fn is_legacy(self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+
+    /// 是否支持按开号批次 `order_id` 只拉取该批次产出的 Key。
+    pub fn supports_order_scoped_purchase(self) -> bool {
+        matches!(self, Self::KiroMarket)
+    }
+
+    /// 平台默认 baseUrl；`None` 表示必须由用户显式填写。
+    pub fn default_base_url(self) -> Option<&'static str> {
+        match self {
+            Self::Legacy => None,
+            Self::KiroApp => Some(KIRO_APP_DEFAULT_BASE_URL),
+            Self::KiroMarket => Some(KIRO_MARKET_DEFAULT_BASE_URL),
+        }
     }
 }
 
@@ -263,6 +298,10 @@ pub enum UpstreamEventKind {
     AutoPurchase,
     /// 手动提号结果
     ManualPurchase,
+    /// Kiro Market：Key 因滥用被回收（仅记录）
+    KeyRevokedAbuse,
+    /// Kiro Market：连通性测试推送（仅记录）
+    WebhookTest,
     /// 其他/错误
     Error,
 }
@@ -494,10 +533,9 @@ impl UpstreamManager {
 
 fn normalized_base_url(platform: UpstreamPlatform, value: &str) -> String {
     let value = value.trim().trim_end_matches('/');
-    if value.is_empty() && platform == UpstreamPlatform::KiroApp {
-        KIRO_APP_DEFAULT_BASE_URL.to_string()
-    } else {
-        value.to_string()
+    match (value.is_empty(), platform.default_base_url()) {
+        (true, Some(default)) => default.to_string(),
+        _ => value.to_string(),
     }
 }
 
@@ -522,6 +560,11 @@ impl Default for UpstreamManager {
 pub struct UpstreamEventLog {
     inner: RwLock<Vec<UpstreamEvent>>,
     path: Option<PathBuf>,
+    /// 已处理过的 webhook `event_id`（进程内，不持久化）。
+    ///
+    /// 上游推送失败会重试，同一事件可能送达多次；按文档要求用 event_id 去重。
+    /// 重试都发生在分钟级窗口内，故无需跨重启保留；上限与事件环形缓冲一致。
+    seen_event_ids: RwLock<std::collections::VecDeque<String>>,
 }
 
 impl UpstreamEventLog {
@@ -539,7 +582,26 @@ impl UpstreamEventLog {
         Self {
             inner: RwLock::new(list),
             path: Some(path),
+            seen_event_ids: RwLock::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// 登记一个 webhook `event_id`；返回 `true` 表示首次见到、应当处理。
+    ///
+    /// `event_id` 缺失时一律返回 `true`（老平台不带该字段，不能因此丢事件）。
+    pub fn mark_event_seen(&self, event_id: Option<&str>) -> bool {
+        let Some(event_id) = event_id.map(str::trim).filter(|v| !v.is_empty()) else {
+            return true;
+        };
+        let mut seen = self.seen_event_ids.write();
+        if seen.iter().any(|id| id == event_id) {
+            return false;
+        }
+        seen.push_back(event_id.to_string());
+        while seen.len() > MAX_EVENTS {
+            seen.pop_front();
+        }
+        true
     }
 
     fn save_locked(&self, list: &[UpstreamEvent]) {
@@ -702,6 +764,15 @@ pub struct StockResponse {
     pub max: u32,
     #[serde(default)]
     pub key_price: Option<f64>,
+    /// 余额。老平台的 stock 不带，仅 Kiro Market 会填（它一个请求就返回库存+报价+余额）。
+    #[serde(default)]
+    pub balance: Option<f64>,
+    /// 最高价。仅 Kiro Market：阶梯定价下 key_price 是最低价，这里是最高价。
+    #[serde(default)]
+    pub price_max: Option<f64>,
+    /// 单次购买上限（`max_purchase`）。仅 Kiro Market，来自用户档案。
+    #[serde(default)]
+    pub max_purchase: Option<u32>,
 }
 
 /// GET /api/my/profile 响应。
@@ -752,12 +823,224 @@ struct KiroAppBalanceResponse {
     balance: f64,
 }
 
+// ── Kiro Market（kiroapp.io）实体 ────────────────────────────────────────────
+
+/// Kiro Market 列表接口统一的分页信封。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KiroMarketPage<T> {
+    #[serde(default = "Vec::new")]
+    pub items: Vec<T>,
+    #[serde(default)]
+    pub total: u32,
+    #[serde(default)]
+    pub page: u32,
+    #[serde(default, alias = "page_size")]
+    pub page_size: u32,
+    #[serde(default)]
+    pub pages: u32,
+}
+
+/// `GET /api/me/profile` 的 `user` 对象。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketUser {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub balance: f64,
+    #[serde(default, alias = "min_purchase")]
+    pub min_purchase: Option<u32>,
+    #[serde(default, alias = "max_purchase")]
+    pub max_purchase: Option<u32>,
+    #[serde(default, alias = "notify_new_batch")]
+    pub notify_new_batch: Option<bool>,
+    #[serde(default, alias = "created_at")]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KiroMarketProfileResponse {
+    user: KiroMarketUser,
+}
+
+/// `GET /api/me/ledger` 单条积分流水。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketLedgerEntry {
+    #[serde(default)]
+    pub seq: Option<u64>,
+    #[serde(default, rename = "type")]
+    pub entry_type: Option<String>,
+    /// 带符号的变动额
+    #[serde(default)]
+    pub amount: f64,
+    #[serde(default, alias = "balance_after")]
+    pub balance_after: Option<f64>,
+    #[serde(default, alias = "ref_type")]
+    pub ref_type: Option<String>,
+    #[serde(default, alias = "ref_id")]
+    pub ref_id: Option<String>,
+    #[serde(default)]
+    pub memo: Option<String>,
+    #[serde(default, alias = "created_at")]
+    pub created_at: Option<String>,
+}
+
+/// `GET /api/me/ledger` 附带的累计收支汇总。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketLedgerSummary {
+    #[serde(default, alias = "total_in")]
+    pub total_in: f64,
+    #[serde(default, alias = "total_out")]
+    pub total_out: f64,
+}
+
+/// `GET /api/me/ledger` 完整响应（分页信封 + summary）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KiroMarketLedgerResponse {
+    #[serde(flatten)]
+    pub page: KiroMarketPage<KiroMarketLedgerEntry>,
+    #[serde(default)]
+    pub summary: KiroMarketLedgerSummary,
+}
+
+/// `POST /api/me/redeem` 响应。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketRedeemResponse {
+    #[serde(default)]
+    pub quota: f64,
+    /// true = 同码重复兑换，未重复到账
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+/// `GET /api/me/stock` 响应。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketStockResponse {
+    #[serde(default)]
+    pub stock: u32,
+    /// 向后兼容字段，等于 `price_min`
+    #[serde(default)]
+    pub price: Option<f64>,
+    #[serde(default, alias = "price_min")]
+    pub price_min: Option<f64>,
+    #[serde(default, alias = "price_max")]
+    pub price_max: Option<f64>,
+    #[serde(default)]
+    pub balance: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct KiroAppClaimResponse {
     #[serde(default)]
     key: Option<String>,
     #[serde(default)]
     keys: Vec<String>,
+}
+
+/// `POST /api/me/purchase` 返回的单个 key。除 key 明文外还带开号账户信息。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketPurchasedKey {
+    pub key: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default, alias = "issuer_url")]
+    pub issuer_url: Option<String>,
+    /// 这一个 key 实际扣了多少积分（阶梯定价）
+    #[serde(default)]
+    pub price: Option<f64>,
+}
+
+/// `POST /api/me/purchase` 响应。
+///
+/// 阶梯定价下总价无法预估，`total_debit` 是权威扣费数字，`unit_price` 只是本单均价。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketPurchaseResponse {
+    #[serde(default)]
+    pub purchased: u32,
+    #[serde(default)]
+    pub requested: u32,
+    #[serde(default)]
+    pub remaining: Option<u32>,
+    #[serde(default, alias = "unit_price")]
+    pub unit_price: Option<f64>,
+    #[serde(default, alias = "total_debit")]
+    pub total_debit: Option<f64>,
+    #[serde(default, alias = "order_id")]
+    pub order_id: Option<String>,
+    #[serde(default)]
+    pub keys: Vec<KiroMarketPurchasedKey>,
+    /// true = 同 client_order_id 幂等重放，未二次扣费
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+/// `GET /api/me/keys` 单条。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketKeyItem {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, alias = "key_value")]
+    pub key_value: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default, alias = "issuer_url")]
+    pub issuer_url: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default, alias = "purchased_at")]
+    pub purchased_at: Option<String>,
+    #[serde(default, alias = "created_at")]
+    pub created_at: Option<String>,
+}
+
+/// `GET /api/me/keys/created-at` 响应。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketKeysCreatedAt {
+    #[serde(default, alias = "created_at")]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub count: u32,
+}
+
+/// `GET /api/me/tokens` 单条（不含明文，只有展示用前缀）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketToken {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default, alias = "expires_at")]
+    pub expires_at: Option<String>,
+    #[serde(default, alias = "created_at")]
+    pub created_at: Option<String>,
+}
+
+/// `POST /api/me/tokens` 响应。`token` 明文只在签发时返回一次。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroMarketIssuedToken {
+    pub token: String,
+    #[serde(default)]
+    pub item: Option<KiroMarketToken>,
 }
 
 /// GET /api/my/keys 单条
@@ -903,6 +1186,104 @@ impl UpstreamClient {
         unreachable!("KiroApp 请求最多执行两次")
     }
 
+    /// Kiro Market 请求：`Authorization: Bearer km_…`，无需 Cookie / CSRF。
+    /// 429 时按 Retry-After 退避重试一次（平台有限速）。
+    async fn kiro_market_json<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<T> {
+        let client = self.client()?;
+        for attempt in 0..=1 {
+            let mut request = client
+                .request(method.clone(), self.url(path))
+                .bearer_auth(&self.api_key);
+            if !query.is_empty() {
+                request = request.query(query);
+            }
+            if let Some(value) = body.as_ref() {
+                request = request.json(value);
+            }
+            let response = request.send().await?;
+            let status = response.status();
+            let retry_after_header = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let text = response.text().await.unwrap_or_default();
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
+                let retry_after = retry_after_seconds(retry_after_header.as_deref(), &text)
+                    .unwrap_or(KIRO_APP_DEFAULT_COOLDOWN_SECS);
+                tracing::warn!("Kiro Market 开放 API 限流，{} 秒后重试", retry_after);
+                tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+                continue;
+            }
+            return Self::parse_json_text(status, &text);
+        }
+        unreachable!("Kiro Market 请求最多执行两次")
+    }
+
+    fn require_kiro_market(&self, capability: &str) -> anyhow::Result<()> {
+        if self.platform == UpstreamPlatform::KiroMarket {
+            Ok(())
+        } else {
+            anyhow::bail!("仅 Kiro Market 平台提供{}接口", capability)
+        }
+    }
+
+    /// 分页参数收敛：page 至少 1，page_size 夹在 1..=500。
+    fn market_page_query(page: Option<u32>, page_size: Option<u32>) -> Vec<(&'static str, String)> {
+        let mut query = vec![("page", page.unwrap_or(1).max(1).to_string())];
+        if let Some(size) = page_size {
+            query.push((
+                "page_size",
+                size.clamp(1, KIRO_MARKET_MAX_PAGE_SIZE).to_string(),
+            ));
+        }
+        query
+    }
+
+    /// GET /api/me/profile —— 当前用户档案（余额、限购、通知配置）
+    pub async fn market_profile(&self) -> anyhow::Result<KiroMarketUser> {
+        self.require_kiro_market("用户档案")?;
+        let response: KiroMarketProfileResponse = self
+            .kiro_market_json(reqwest::Method::GET, "/api/me/profile", &[], None)
+            .await?;
+        Ok(response.user)
+    }
+
+    /// GET /api/me/ledger —— 积分流水（可按 type 过滤）
+    pub async fn market_ledger(
+        &self,
+        page: Option<u32>,
+        page_size: Option<u32>,
+        entry_type: Option<&str>,
+    ) -> anyhow::Result<KiroMarketLedgerResponse> {
+        self.require_kiro_market("积分流水")?;
+        let mut query = Self::market_page_query(page, page_size);
+        if let Some(value) = entry_type.map(str::trim).filter(|v| !v.is_empty()) {
+            query.push(("type", value.to_string()));
+        }
+        self.kiro_market_json(reqwest::Method::GET, "/api/me/ledger", &query, None)
+            .await
+    }
+
+    /// POST /api/me/redeem —— 兑换码充值。`replayed=true` 表示同码重复兑换、未重复到账。
+    pub async fn market_redeem(&self, code: &str) -> anyhow::Result<KiroMarketRedeemResponse> {
+        self.require_kiro_market("兑换码充值")?;
+        self.kiro_market_json(
+            reqwest::Method::POST,
+            "/api/me/redeem",
+            &[],
+            Some(serde_json::json!({ "code": code })),
+        )
+        .await
+    }
+
     /// GET /api/my/stock —— 本轮最大可提取数量
     pub async fn get_stock(&self) -> anyhow::Result<StockResponse> {
         if self.platform == UpstreamPlatform::KiroApp {
@@ -912,6 +1293,24 @@ impl UpstreamClient {
             return Ok(StockResponse {
                 max: stock.available_keys,
                 key_price: stock.key_price,
+                balance: None,
+                price_max: None,
+                max_purchase: None,
+            });
+        }
+        if self.platform == UpstreamPlatform::KiroMarket {
+            let stock: KiroMarketStockResponse = self
+                .kiro_market_json(reqwest::Method::GET, "/api/me/stock", &[], None)
+                .await?;
+            // 这个接口一次就返回库存 + 报价 + 余额，余额不能丢：否则前端只能靠
+            // 另一个 /api/me/profile 请求才看得到余额。
+            // 阶梯定价：key_price 取最低价（price 字段本身就是 price_min）。
+            return Ok(StockResponse {
+                max: stock.stock,
+                key_price: stock.price_min.or(stock.price),
+                balance: stock.balance,
+                price_max: stock.price_max,
+                max_purchase: None,
             });
         }
         let resp = self
@@ -933,6 +1332,17 @@ impl UpstreamClient {
                 name: None,
                 quota: None,
                 remaining: Some(response.balance),
+                used_quota: None,
+                webhook_url: None,
+            });
+        }
+        if self.platform == UpstreamPlatform::KiroMarket {
+            let user = self.market_profile().await?;
+            // 平台只有「余额」概念，没有配额/已用量；webhook 地址在网页里配，API 不返回。
+            return Ok(ProfileResponse {
+                name: user.name,
+                quota: None,
+                remaining: Some(user.balance),
                 used_quota: None,
                 webhook_url: None,
             });
@@ -995,12 +1405,155 @@ impl UpstreamClient {
         Self::parse_json(resp).await
     }
 
+    /// POST /api/me/purchase —— Kiro Market 下单，返回完整响应（含 total_debit / 每 key 单价）。
+    ///
+    /// `client_order_id` 必填幂等键：网络超时后用同一个值重试是安全的，会命中幂等重放。
+    /// `order_id` 可选，来自 webhook 推送，只拉取该开号批次产出的 key。
+    pub async fn market_purchase(
+        &self,
+        count: u32,
+        client_order_id: &str,
+        order_id: Option<&str>,
+    ) -> anyhow::Result<KiroMarketPurchaseResponse> {
+        self.require_kiro_market("下单购买")?;
+        let mut body = serde_json::json!({
+            "count": count,
+            "client_order_id": client_order_id,
+        });
+        if let Some(order_id) = order_id.map(str::trim).filter(|v| !v.is_empty())
+            && let Some(map) = body.as_object_mut()
+        {
+            map.insert("order_id".into(), serde_json::json!(order_id));
+        }
+        self.kiro_market_json(reqwest::Method::POST, "/api/me/purchase", &[], Some(body))
+            .await
+    }
+
+    /// GET /api/me/orders —— 我的提取订单（分页信封）
+    pub async fn market_orders(
+        &self,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> anyhow::Result<KiroMarketPage<serde_json::Value>> {
+        self.require_kiro_market("订单列表")?;
+        let query = Self::market_page_query(page, page_size);
+        self.kiro_market_json(reqwest::Method::GET, "/api/me/orders", &query, None)
+            .await
+    }
+
+    /// GET /api/me/keys —— 我的密钥（`history=1` 含已失效）
+    pub async fn market_keys(
+        &self,
+        history: bool,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> anyhow::Result<KiroMarketPage<KiroMarketKeyItem>> {
+        self.require_kiro_market("密钥列表")?;
+        let mut query = Self::market_page_query(page, page_size);
+        if history {
+            query.push(("history", "1".to_string()));
+        }
+        self.kiro_market_json(reqwest::Method::GET, "/api/me/keys", &query, None)
+            .await
+    }
+
+    /// GET /api/me/keys/created-at —— 最早密钥时间与总数（估算账龄）
+    pub async fn market_keys_created_at(&self) -> anyhow::Result<KiroMarketKeysCreatedAt> {
+        self.require_kiro_market("最早密钥时间")?;
+        self.kiro_market_json(reqwest::Method::GET, "/api/me/keys/created-at", &[], None)
+            .await
+    }
+
+    /// GET /api/me/tokens —— API 令牌列表（不含明文）
+    pub async fn market_tokens(&self) -> anyhow::Result<Vec<KiroMarketToken>> {
+        self.require_kiro_market("令牌列表")?;
+        // 文档未声明该接口套分页信封，故先按裸数组解析，失败再退回信封。
+        let raw: serde_json::Value = self
+            .kiro_market_json(reqwest::Method::GET, "/api/me/tokens", &[], None)
+            .await?;
+        let items = match raw.get("items") {
+            Some(items) => items.clone(),
+            None => raw,
+        };
+        serde_json::from_value(items)
+            .map_err(|e| anyhow::anyhow!("解析令牌列表失败: {}", e))
+    }
+
+    /// POST /api/me/tokens —— 签发令牌。明文只在这里返回一次。
+    pub async fn market_issue_token(
+        &self,
+        name: Option<&str>,
+        expires_in_days: Option<u32>,
+    ) -> anyhow::Result<KiroMarketIssuedToken> {
+        self.require_kiro_market("签发令牌")?;
+        let mut body = serde_json::Map::new();
+        if let Some(name) = name.map(str::trim).filter(|v| !v.is_empty()) {
+            body.insert("name".into(), serde_json::json!(name));
+        }
+        if let Some(days) = expires_in_days {
+            body.insert("expires_in_days".into(), serde_json::json!(days.min(365)));
+        }
+        self.kiro_market_json(
+            reqwest::Method::POST,
+            "/api/me/tokens",
+            &[],
+            Some(serde_json::Value::Object(body)),
+        )
+        .await
+    }
+
+    /// DELETE /api/me/tokens/{id} —— 吊销令牌，立即生效。
+    pub async fn market_revoke_token(&self, id: &str) -> anyhow::Result<()> {
+        self.require_kiro_market("吊销令牌")?;
+        let _: serde_json::Value = self
+            .kiro_market_json(
+                reqwest::Method::DELETE,
+                &format!("/api/me/tokens/{id}"),
+                &[],
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// POST /api/my/purchase —— 提号。`client_order_id` 幂等键。
+    ///
+    /// `order_id` 仅 Kiro Market 支持：只拉取该开号批次产出的 key，其他平台忽略。
     pub async fn purchase(
         &self,
         count: u32,
         client_order_id: &str,
+        order_id: Option<&str>,
     ) -> anyhow::Result<PurchaseResponse> {
+        if self.platform == UpstreamPlatform::KiroMarket {
+            let response = self
+                .market_purchase(count, client_order_id, order_id)
+                .await?;
+            if response.replayed {
+                tracing::info!(
+                    "Kiro Market 幂等重放命中（client_order_id={}），未二次扣费",
+                    client_order_id
+                );
+            }
+            // 阶梯定价：remaining 复用为剩余库存，实际扣费以 total_debit 为准，仅记日志。
+            tracing::info!(
+                "Kiro Market 下单完成: purchased={} requested={} total_debit={:?} unit_price={:?}",
+                response.purchased,
+                response.requested,
+                response.total_debit,
+                response.unit_price
+            );
+            return Ok(PurchaseResponse {
+                client_order_id: Some(client_order_id.to_string()),
+                purchased: response.purchased,
+                remaining: response.remaining.map(f64::from),
+                keys: response
+                    .keys
+                    .into_iter()
+                    .map(|k| PurchasedKey { key: k.key })
+                    .collect(),
+            });
+        }
         if self.platform == UpstreamPlatform::KiroApp {
             let body = (count > 1).then(|| serde_json::json!({ "count": count }));
             let response: KiroAppClaimResponse = self
@@ -1076,11 +1629,13 @@ impl UpstreamClient {
         Ok(())
     }
 
+    /// 老平台专属能力门。注意不能用 `supports_webhook()` 判断：Kiro Market 也收
+    /// webhook，但走的是 `/api/me/*` 协议，没有这些 `/api/my/*` 接口。
     fn require_legacy(&self, capability: &str) -> anyhow::Result<()> {
-        if self.platform.supports_webhook() {
+        if self.platform.is_legacy() {
             Ok(())
         } else {
-            anyhow::bail!("KiroApp 平台不提供{}接口", capability)
+            anyhow::bail!("当前平台不提供{}接口", capability)
         }
     }
 }
