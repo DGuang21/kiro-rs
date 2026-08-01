@@ -196,7 +196,7 @@ const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
   endpoint: "ide",
   groups: ["开发预览"],
   sourceChannel: "Demo（不保存）",
-  metadata: { type: "normal", saleStatus: "not_for_sale" },
+  metadata: { type: "normal", saleStatus: "for_sale", salePrice: 99 },
   balance: {
     id: -1,
     subscriptionTitle: "KIRO PRO",
