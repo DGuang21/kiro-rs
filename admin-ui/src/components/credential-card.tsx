@@ -48,7 +48,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type {
-  CredentialMetadataFieldSchema,
   CredentialMetadataSchema,
   CredentialStatusItem,
   BalanceResponse,
@@ -80,7 +79,6 @@ import {
 } from "@/components/console/rail";
 import { PriorityPreview } from "@/components/console/priority-preview";
 import { CredentialLabel } from "@/components/console/credential-label";
-import { metadataCssToStyle } from "@/lib/credential-metadata-style";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -178,14 +176,7 @@ function endpointDisplayLabel(endpoint: string): string {
   return endpoint;
 }
 
-function metadataValueLabel(
-  value: unknown,
-  field?: CredentialMetadataFieldSchema,
-): string {
-  const option = field?.oneOf?.find(
-    (item) => JSON.stringify(item.const) === JSON.stringify(value),
-  );
-  if (option) return option.title;
+function metadataValueLabel(value: unknown): string {
   if (typeof value === "boolean") return value ? "是" : "否";
   if (typeof value === "string" || typeof value === "number") {
     return String(value);
@@ -199,36 +190,27 @@ function metadataValueLabel(
 
 function metadataEntries(
   credential: CredentialStatusItem,
-  schema?: CredentialMetadataSchema,
 ) {
   const metadata = credential.metadata ?? {};
-  const schemaKeys = Object.keys(schema?.properties ?? {});
-  const extraKeys = Object.keys(metadata)
-    .filter((key) => !schemaKeys.includes(key))
-    .sort((a, b) => a.localeCompare(b));
-
-  return [...schemaKeys, ...extraKeys]
-    .filter((key, index, keys) => keys.indexOf(key) === index)
-    .flatMap((key) => {
-      const field = schema?.properties[key];
-      const value = metadata[key] ?? field?.default;
-      if (value == null || value === "") return [];
-      return [
-        {
-          key,
-          label: field?.title?.trim() || key,
-          value:
-            key === "salePrice" && typeof value === "number"
-              ? `¥${value.toLocaleString("zh-CN", {
-                  minimumFractionDigits: 2,
-                  maximumFractionDigits: 2,
-                })}`
-              : metadataValueLabel(value, field),
-          emphasized: key === "type" && value === "boom",
-          style: metadataCssToStyle(field?.["x-css"]),
-        },
-      ];
-    });
+  return Object.entries(metadata).flatMap(([key, detail]) => {
+    const value = detail.value;
+    if (value == null || value === "") return [];
+    return [
+      {
+        key,
+        label: detail.title?.trim() || key,
+        description: detail.description,
+        value:
+          key === "salePrice" && typeof value === "number"
+            ? `¥${value.toLocaleString("zh-CN", {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+              })}`
+            : metadataValueLabel(value),
+        emphasized: key === "type" && value === "boom",
+      },
+    ];
+  });
 }
 
 
@@ -348,12 +330,10 @@ function getDisabledReasonStyle(reason?: string | null): {
 
 function MetadataSummary({
   credential,
-  schema,
 }: {
   credential: CredentialStatusItem;
-  schema?: CredentialMetadataSchema;
 }) {
-  const entries = metadataEntries(credential, schema);
+  const entries = metadataEntries(credential);
   if (entries.length === 0) return null;
 
   return (
@@ -369,8 +349,7 @@ function MetadataSummary({
               ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
               : "border-border/60 bg-muted/45 text-foreground"
           }`}
-          title={`${entry.label}: ${entry.value}`}
-          style={entry.style}
+          title={entry.description || `${entry.label}: ${entry.value}`}
         >
           <span className="shrink-0 text-muted-foreground">{entry.label}</span>
           <span className="mx-1 text-border">·</span>
@@ -657,19 +636,18 @@ export function CredentialCard({
     <SubscriptionBadge title={subscriptionTitle} />
   ) : null;
 
-  const metadataItems = metadataEntries(credential, metadataSchema);
+  const metadataItems = metadataEntries(credential);
   const renderMetadataRows = (items: typeof metadataItems) =>
     items.map((entry) => (
       <LedgerRow
         key={entry.key}
         label={entry.label}
-        title={entry.key === entry.label ? undefined : `key: ${entry.key}`}
+        title={entry.description || (entry.key === entry.label ? undefined : `key: ${entry.key}`)}
       >
         <span
           className={`font-medium ${
             entry.emphasized ? "text-amber-600 dark:text-amber-400" : ""
           }`}
-          style={entry.style}
         >
           {entry.value}
         </span>
@@ -854,7 +832,7 @@ export function CredentialCard({
             </span>
           )}
         </div>
-        <MetadataSummary credential={credential} schema={metadataSchema} />
+        <MetadataSummary credential={credential} />
       </div>
 
       <div className="hidden shrink-0 items-center gap-6 lg:flex">

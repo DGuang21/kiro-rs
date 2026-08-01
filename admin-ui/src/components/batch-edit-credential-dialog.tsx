@@ -19,6 +19,7 @@ import {
 } from '@/components/credential-metadata-field'
 import { updateCredential } from '@/api/credentials'
 import type {
+  CredentialMetadata,
   CredentialMetadataSchema,
   CredentialSaleStatus,
   CredentialStatusItem,
@@ -27,6 +28,13 @@ import type {
 } from '@/types/api'
 
 type GroupMode = 'replace' | 'add' | 'remove'
+
+/** 状态接口的 metadata 带展示信息；批量编辑提交时只发送实际值。 */
+function metadataValues(metadata: CredentialStatusItem['metadata']): CredentialMetadata {
+  return Object.fromEntries(
+    Object.entries(metadata ?? {}).map(([key, detail]) => [key, detail.value]),
+  ) as CredentialMetadata
+}
 
 interface BatchEditCredentialDialogProps {
   open: boolean
@@ -123,8 +131,8 @@ export function BatchEditCredentialDialog({
       if (editGroups) req.groups = computeGroups(c.groups ?? [])
       if (editSource) req.sourceChannel = sourceChannel.trim()
       if (editType || editSaleStatus || editSalePrice) {
-        const metadata = {
-          ...c.metadata,
+        const metadata: CredentialMetadata = {
+          ...metadataValues(c.metadata),
           ...(editType ? { type: credentialType } : {}),
           ...(editSaleStatus ? { saleStatus } : {}),
         }

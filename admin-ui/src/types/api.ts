@@ -21,6 +21,16 @@ export interface CredentialMetadata {
   [key: string]: unknown
 }
 
+/** `/api/admin/credentials` 返回的单个 metadata 字段。 */
+export interface CredentialMetadataDisplay {
+  title: string
+  description?: string
+  value: unknown
+}
+
+/** 状态接口中的 metadata：字段 key 映射到其描述与当前值。 */
+export type CredentialStatusMetadata = Record<string, CredentialMetadataDisplay>
+
 export interface CredentialMetadataSchemaOption {
   const: unknown
   title: string
@@ -84,8 +94,8 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
-  /** 可扩展的凭据元数据 */
-  metadata: CredentialMetadata
+  /** 已关联描述与当前值的凭据 metadata。 */
+  metadata: CredentialStatusMetadata
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */

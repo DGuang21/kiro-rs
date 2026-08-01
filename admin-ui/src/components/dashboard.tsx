@@ -197,7 +197,23 @@ const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
   endpoint: "ide",
   groups: ["开发预览"],
   sourceChannel: "Demo（不保存）",
-  metadata: { type: "normal", saleStatus: "for_sale", salePrice: 99 },
+  metadata: {
+    type: {
+      title: "账号类型",
+      description: "账号运营分类，仅用于标记，不参与调度。",
+      value: "normal",
+    },
+    saleStatus: {
+      title: "在售状态",
+      description: "账号运营销售状态，仅用于标记，不参与调度。",
+      value: "for_sale",
+    },
+    salePrice: {
+      title: "销售价格（CNY）",
+      description: "账号销售价格，单位为人民币。",
+      value: 99,
+    },
+  },
   balance: {
     id: -1,
     subscriptionTitle: "KIRO PRO",
@@ -394,6 +410,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // 在队列里 —— 混进禁用/超额的行会让拖拽出来的次序与实际调度顺序对不上。
   // 其余状态的计数仍在账条上，点一下即可切过去。
   const [stateFilter, setStateFilter] = useState<StateFilter>("healthy");
+  const clearAllFilters = () => {
+    setSearchQuery("");
+    setGroupFilter("");
+    setTierFilter(new Set());
+    setStateFilter("");
+  };
   const toggleTier = (t: Tier) => {
     setTierFilter((prev) => {
       const next = new Set(prev);
@@ -2061,12 +2083,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 size="sm"
                 variant="outline"
                 className="mt-3"
-                onClick={() => {
-                  setStateFilter("");
-                  setGroupFilter("");
-                  setTierFilter(new Set());
-                  setSearchQuery("");
-                }}
+                onClick={clearAllFilters}
               >
                 显示全部凭据
               </Button>

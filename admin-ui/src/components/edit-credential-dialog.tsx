@@ -35,6 +35,13 @@ interface EditCredentialDialogProps {
   metadataSchema?: CredentialMetadataSchema
 }
 
+/** 状态接口的 metadata 带展示信息；编辑时只回填其中的实际值。 */
+function metadataValues(metadata: CredentialStatusItem['metadata']): Partial<CredentialMetadata> {
+  return Object.fromEntries(
+    Object.entries(metadata ?? {}).map(([key, detail]) => [key, detail.value]),
+  ) as Partial<CredentialMetadata>
+}
+
 export function EditCredentialDialog({
   open,
   onOpenChange,
@@ -48,7 +55,7 @@ export function EditCredentialDialog({
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
   const [metadata, setMetadata] = useState<CredentialMetadata>(
-    credential.metadata ?? { type: 'normal', saleStatus: 'not_for_sale' },
+    { ...metadataDefaults(metadataSchema), ...metadataValues(credential.metadata) },
   )
   const [manualMode, setManualMode] = useState(false)
 
@@ -71,7 +78,7 @@ export function EditCredentialDialog({
       setSourceChannel(credential.sourceChannel ?? '')
       setMetadata({
         ...metadataDefaults(metadataSchema),
-        ...(credential.metadata ?? { type: 'normal', saleStatus: 'not_for_sale' }),
+        ...metadataValues(credential.metadata),
       })
       setManualMode(false)
     }
