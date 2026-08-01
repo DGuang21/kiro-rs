@@ -15,23 +15,27 @@ export function CredentialLabel({
   email,
   className,
   idClassName,
+  showId = true,
 }: {
   id: number
   email?: string | null
   className?: string
   idClassName?: string
+  showId?: boolean
 }) {
   return (
     <span className={cn('inline-flex min-w-0 items-baseline gap-1.5', className)}>
-      <span
-        className={cn(
-          'console-num shrink-0 text-[0.85em] font-normal text-muted-foreground/70',
-          idClassName,
-        )}
-        title={`凭据 ID ${id} —— 日志与链路里以 #${id} 指代`}
-      >
-        #{id}
-      </span>
+      {showId && (
+        <span
+          className={cn(
+            'console-num shrink-0 text-[0.85em] font-normal text-muted-foreground/70',
+            idClassName,
+          )}
+          title={`凭据 ID ${id} —— 日志与链路里以 #${id} 指代`}
+        >
+          #{id}
+        </span>
+      )}
       <span className="min-w-0 truncate">
         {email || <span className="text-muted-foreground">未设置邮箱</span>}
       </span>

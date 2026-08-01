@@ -675,6 +675,7 @@ impl AdminService {
                     api_key_hash: entry.api_key_hash,
                     masked_api_key: entry.masked_api_key,
                     email: entry.email,
+                    subscription_title: entry.subscription_title,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,

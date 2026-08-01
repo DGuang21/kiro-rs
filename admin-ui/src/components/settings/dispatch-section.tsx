@@ -1,6 +1,8 @@
 import {
   useAccountThrottleConfig,
   useSetAccountThrottleConfig,
+  useAccountRpmLimitConfig,
+  useSetAccountRpmLimitConfig,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useSelfHealConfig,
@@ -17,6 +19,9 @@ import {
 import { reportSaveError } from '@/components/settings/report-error'
 
 const SECS_PER_MIN = 60
+// 与后端 SetAccountRpmLimitConfigRequest 的校验区间保持一致
+const MIN_RPM_LIMIT = 1
+const MAX_RPM_LIMIT = 100000
 
 /**
  * 调度分区：凭据怎么选、失败怎么转、禁用怎么恢复。
@@ -30,6 +35,7 @@ export function DispatchSection() {
     <div className="space-y-6">
       <LoadBalancingGroup />
       <ThrottleGroup />
+      <RpmLimitGroup />
       <SelfHealGroup />
     </div>
   )
@@ -102,6 +108,55 @@ function ThrottleGroup() {
         pending={saver.isSaving('cooldown')}
         saved={saver.isSaved('cooldown')}
         disabled={isLoading || !failover}
+      />
+    </SettingGroup>
+  )
+}
+
+/**
+ * 单账号 RPM 主动限流。
+ *
+ * 紧跟「账号级风控」是有意的：两者都是账号级限速，区别只在谁先动手 ——
+ * 风控是上游 429 之后的被动补救，这里是我们自己先掐住不让它撞上去。
+ * 摆在一起，配了主动限流还在等风控兜底这种误解就不容易发生。
+ */
+function RpmLimitGroup() {
+  const { data, isLoading } = useAccountRpmLimitConfig()
+  const { mutate } = useSetAccountRpmLimitConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const enabled = data?.enabled ?? false
+  const limit = data?.limit ?? 60
+
+  return (
+    <SettingGroup
+      title="单账号限流"
+      description="主动掐住单个账号的每分钟请求数，别等上游风控才反应"
+    >
+      <SettingSwitch
+        label="启用 RPM 限流"
+        hint={
+          enabled
+            ? '每个凭据独立计 60 秒滑动窗口，超限的临时跳过并切到下一个可用凭据'
+            : '关闭时不计数、不影响调度'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', { enabled: next })}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading}
+      />
+      <SettingNumber
+        label="每分钟上限"
+        hint="单个凭据 60 秒内最多放行多少请求。所有凭据都超限时请求返回 429"
+        value={limit}
+        onCommit={(n) => saver.save('limit', { limit: n })}
+        min={MIN_RPM_LIMIT}
+        max={MAX_RPM_LIMIT}
+        unit="次/分钟"
+        presets={[10, 30, 60, 120, 300]}
+        pending={saver.isSaving('limit')}
+        saved={saver.isSaved('limit')}
+        disabled={isLoading || !enabled}
       />
     </SettingGroup>
   )

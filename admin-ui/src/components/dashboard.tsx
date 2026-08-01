@@ -140,7 +140,7 @@ import {
   generateApiKey,
   overageFailureMessage,
 } from "@/lib/utils";
-import type { BalanceResponse } from "@/types/api";
+import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
 import { StatusStrip } from "@/components/console/status-strip";
 import { BulkBar } from "@/components/console/bulk-bar";
 import {
@@ -173,6 +173,43 @@ const TIER_LABELS: Record<Tier, string> = {
 
 // 每页数量可选项；另有“全部”（pageSize = 0）由下拉单独追加
 const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
+
+/** 仅供本地开发预览卡片布局，不会随生产构建或任何 API 请求出现。 */
+const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
+  id: -1,
+  priority: 0,
+  disabled: false,
+  failureCount: 0,
+  totalFailureCount: 0,
+  isCurrent: true,
+  expiresAt: null,
+  authMethod: "api_key",
+  hasProfileArn: false,
+  email: "demo.credential@preview.local",
+  subscriptionTitle: "KIRO PRO",
+  maskedApiKey: "ksk_…demo",
+  successCount: 1_284,
+  lastUsedAt: new Date().toISOString(),
+  hasProxy: true,
+  proxyUrl: "http://demo:demo@127.0.0.1:8080",
+  refreshFailureCount: 0,
+  endpoint: "ide",
+  groups: ["开发预览"],
+  sourceChannel: "Demo（不保存）",
+  metadata: { type: "normal", saleStatus: "not_for_sale" },
+  balance: {
+    id: -1,
+    subscriptionTitle: "KIRO PRO",
+    currentUsage: 186.5,
+    usageLimit: 500,
+    remaining: 313.5,
+    usagePercentage: 37.3,
+    nextResetAt: 1780300800,
+    overageCapable: true,
+    overageEnabled: false,
+  },
+  createdAt: "2026-08-01T10:30:00Z",
+};
 
 // 字段排序：'manual' = 服务端顺序（保留拖拽调优先级）；其余字段选中后拖拽自动禁用
 type SortField =
@@ -288,6 +325,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
   const groupOptions = useGroupOptions();
+  const allCredentials = import.meta.env.DEV
+    ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
+    : (data?.credentials ?? []);
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
   const [groupFilter, setGroupFilter] = useState<string>("");
@@ -329,7 +369,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
   const filteredCredentials = (() => {
-    const all = data?.credentials ?? [];
+    const all = allCredentials;
     let out = all;
     if (groupFilter) {
       out =
@@ -1939,7 +1979,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         )}
 
         {/* 列表 */}
-        {data?.credentials.length === 0 ? (
+        {allCredentials.length === 0 ? (
           <Card>
             <CardContent className="py-16 text-center">
               <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
@@ -2020,7 +2060,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         handleRefreshBalance(credential.id)
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
-                      dragDisabled={dragDisabled}
+                      dragDisabled={dragDisabled || credential.id === DEV_PREVIEW_CREDENTIAL.id}
+                      preview={credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       metadataSchema={data?.metadataSchema}
                     />
                   ))}

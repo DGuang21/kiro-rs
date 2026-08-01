@@ -66,6 +66,8 @@ export interface CredentialStatusItem {
   provider?: string | null
   hasProfileArn: boolean
   email?: string
+  /** 后端持久化的最近一次订阅等级；封禁时仍可显示。 */
+  subscriptionTitle?: string | null
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string

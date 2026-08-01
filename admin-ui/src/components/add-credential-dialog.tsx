@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { RegionSelect } from '@/components/region-select'
 import {
   Select,
   SelectTrigger,
@@ -224,28 +225,32 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <Input
-                    id="authRegion"
-                    placeholder="Auth Region"
+              <div className="space-y-2">
+                <div className="space-y-1">
+                  <span className="text-xs text-muted-foreground">
+                    Auth Region（Token 刷新）
+                  </span>
+                  <RegionSelect
                     value={authRegion}
-                    onChange={(e) => setAuthRegion(e.target.value)}
+                    onChange={setAuthRegion}
+                    allowInherit
                     disabled={isPending}
                   />
                 </div>
-                <div>
-                  <Input
-                    id="apiRegion"
-                    placeholder="API Region"
+                <div className="space-y-1">
+                  <span className="text-xs text-muted-foreground">
+                    API Region（API 请求）
+                  </span>
+                  <RegionSelect
                     value={apiRegion}
-                    onChange={(e) => setApiRegion(e.target.value)}
+                    onChange={setApiRegion}
+                    allowInherit
                     disabled={isPending}
                   />
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                选「跟随全局配置」即沿用 config.json 的 region；预设里没有的区域可直接手输
               </p>
             </div>
 

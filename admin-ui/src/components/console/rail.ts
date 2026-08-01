@@ -59,6 +59,24 @@ export function railDotClass(tone: RailTone): string {
   return DOT_CLASS[tone]
 }
 
+const CHIP_CLASS: Record<RailTone, string> = {
+  ok: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
+  warn: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400',
+  cool: 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-400',
+  dead: 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400',
+  none: 'border-border bg-secondary/60 text-muted-foreground',
+}
+
+/**
+ * 色轨的「实心块」变体：淡底 + 同色描边 + 同色文字。
+ *
+ * 存在的理由是尺度而非样式 —— 3px 的左边框在网格卡片里太细，扫读时得聚焦才能读出
+ * 状态。同一个 tone 在边框、序号章、余额条上各出现一次，眼睛在任一尺度上都能接住。
+ */
+export function railChipClass(tone: RailTone): string {
+  return CHIP_CLASS[tone]
+}
+
 const TEXT_CLASS: Record<RailTone, string> = {
   ok: 'text-emerald-600 dark:text-emerald-400',
   warn: 'text-amber-600 dark:text-amber-400',

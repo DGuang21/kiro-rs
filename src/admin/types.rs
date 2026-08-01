@@ -55,6 +55,9 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 最近一次查询到的 Kiro 订阅等级；不依赖当前余额缓存。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
