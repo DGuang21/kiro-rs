@@ -82,6 +82,11 @@ pub struct CredentialStatusItem {
     pub source_channel: Option<String>,
     /// 凭据扩展元数据
     pub metadata: CredentialMetadata,
+    /// 为客户端预先解析的 metadata 字段信息，包含显示文案、描述和实际值。
+    ///
+    /// 保留 `metadata` 原始对象，兼容依赖原始 key-value 结构的客户端；新客户端无需
+    /// 再自行把 `metadata` 与 `metadata_schema` 做关联。
+    pub metadata_details: Vec<CredentialMetadataDetail>,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -91,6 +96,21 @@ pub struct CredentialStatusItem {
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+}
+
+/// 单个凭据 metadata 字段的可展示信息。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialMetadataDetail {
+    /// Schema 中的字段 key；自定义扩展字段保持原 key。
+    pub key: String,
+    /// 面向用户的字段名称；没有 Schema 定义时回退为 key。
+    pub title: String,
+    /// Schema 字段描述；未定义扩展字段时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 凭据上的实际值；旧凭据缺失时可回退到 Schema 默认值。
+    pub value: serde_json::Value,
 }
 
 // ============ 操作请求 ============

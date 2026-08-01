@@ -15,7 +15,7 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    KiroCredentials, credential_metadata_schema, normalize_credential_metadata_schema,
+    CredentialMetadata, KiroCredentials, credential_metadata_schema, normalize_credential_metadata_schema,
     normalize_import_auth_method, validate_credential_metadata,
     validate_credential_metadata_schema, validate_external_idp_endpoint,
 };
@@ -37,7 +37,8 @@ use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
+    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialMetadataDetail,
+    CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     CredentialMetadataSchemaConfig,
@@ -53,6 +54,65 @@ use super::types::{
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// 将原始 metadata 与 schema 合并为客户端可直接消费的字段列表。
+///
+/// Schema 字段保持其配置顺序，未登记的扩展字段按 key 排序追加；旧凭据缺失的字段
+/// 使用 schema 默认值，既避免客户端重复做 join，也不会丢掉自定义 metadata。
+fn credential_metadata_details(
+    metadata: &CredentialMetadata,
+    schema: &serde_json::Value,
+) -> Vec<CredentialMetadataDetail> {
+    let values = match serde_json::to_value(metadata)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+    {
+        Some(values) => values,
+        None => return Vec::new(),
+    };
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+
+    let mut keys: Vec<String> = properties
+        .map(|fields| fields.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut extra_keys: Vec<String> = values
+        .keys()
+        .filter(|key| !properties.is_some_and(|fields| fields.contains_key(*key)))
+        .cloned()
+        .collect();
+    extra_keys.sort();
+    keys.extend(extra_keys);
+
+    keys.into_iter()
+        .filter_map(|key| {
+            let field = properties.and_then(|fields| fields.get(&key));
+            let value = values.get(&key).cloned().or_else(|| {
+                field.and_then(|schema_field| schema_field.get("default").cloned())
+            })?;
+            let title = field
+                .and_then(|schema_field| schema_field.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|title| !title.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| key.clone());
+            let description = field
+                .and_then(|schema_field| schema_field.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_owned);
+
+            Some(CredentialMetadataDetail {
+                key,
+                title,
+                description,
+                value,
+            })
+        })
+        .collect()
+}
 
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
@@ -642,6 +702,7 @@ impl AdminService {
             snapshot.current_id
         };
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let metadata_schema = self.credential_metadata_schema.lock().clone();
 
         // 一次性快照余额缓存，避免 N 次加锁
         let balance_snapshot: HashMap<u64, CachedBalance> = {
@@ -659,6 +720,8 @@ impl AdminService {
                     .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
+                let metadata_details =
+                    credential_metadata_details(&entry.metadata, &metadata_schema);
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -686,6 +749,7 @@ impl AdminService {
                     groups: entry.groups,
                     source_channel: entry.source_channel,
                     metadata: entry.metadata,
+                    metadata_details,
                     balance,
                     balance_updated_at,
                     created_at: entry.created_at,
@@ -700,7 +764,7 @@ impl AdminService {
             total: snapshot.total,
             available: snapshot.available,
             current_id: exposed_current_id,
-            metadata_schema: self.credential_metadata_schema.lock().clone(),
+            metadata_schema,
             credentials,
         }
     }
@@ -3475,6 +3539,30 @@ mod tests {
         assert!(validate_model_id("auto").is_err());
         assert!(validate_model_id("AUTO").is_err());
         assert!(validate_model_id(&"x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn metadata_details_include_schema_description_and_current_value() {
+        let mut metadata = CredentialMetadata::default();
+        metadata
+            .extra
+            .insert("region".to_string(), serde_json::json!("us-east-1"));
+        let mut schema = credential_metadata_schema();
+        schema["properties"]["region"] = serde_json::json!({
+            "title": "区域",
+            "description": "凭据所属区域",
+            "type": "string"
+        });
+
+        let details = credential_metadata_details(&metadata, &schema);
+        let region = details
+            .iter()
+            .find(|detail| detail.key == "region")
+            .expect("应返回扩展 metadata 字段");
+
+        assert_eq!(region.title, "区域");
+        assert_eq!(region.description.as_deref(), Some("凭据所属区域"));
+        assert_eq!(region.value, serde_json::json!("us-east-1"));
     }
 
     #[tokio::test]
