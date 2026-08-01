@@ -1,6 +1,6 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -62,13 +62,13 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 fn credential_metadata_details(
     metadata: &CredentialMetadata,
     schema: &serde_json::Value,
-) -> Vec<CredentialMetadataDetail> {
+) -> BTreeMap<String, CredentialMetadataDetail> {
     let values = match serde_json::to_value(metadata)
         .ok()
         .and_then(|value| value.as_object().cloned())
     {
         Some(values) => values,
-        None => return Vec::new(),
+        None => return BTreeMap::new(),
     };
     let properties = schema
         .get("properties")
@@ -104,12 +104,14 @@ fn credential_metadata_details(
                 .filter(|description| !description.is_empty())
                 .map(str::to_owned);
 
-            Some(CredentialMetadataDetail {
+            Some((
                 key,
-                title,
-                description,
-                value,
-            })
+                CredentialMetadataDetail {
+                    title,
+                    description,
+                    value,
+                },
+            ))
         })
         .collect()
 }
@@ -720,8 +722,7 @@ impl AdminService {
                     .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
-                let metadata_details =
-                    credential_metadata_details(&entry.metadata, &metadata_schema);
+                let metadata = credential_metadata_details(&entry.metadata, &metadata_schema);
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -748,8 +749,7 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
-                    metadata: entry.metadata,
-                    metadata_details,
+                    metadata,
                     balance,
                     balance_updated_at,
                     created_at: entry.created_at,
@@ -3555,10 +3555,7 @@ mod tests {
         });
 
         let details = credential_metadata_details(&metadata, &schema);
-        let region = details
-            .iter()
-            .find(|detail| detail.key == "region")
-            .expect("应返回扩展 metadata 字段");
+        let region = details.get("region").expect("应返回扩展 metadata 字段");
 
         assert_eq!(region.title, "区域");
         assert_eq!(region.description.as_deref(), Some("凭据所属区域"));
