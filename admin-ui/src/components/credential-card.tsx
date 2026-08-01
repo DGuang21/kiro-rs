@@ -203,7 +203,7 @@ function metadataEntries(
   credential: CredentialStatusItem,
   schema?: CredentialMetadataSchema,
 ) {
-  const metadata = credential.metadata ?? { type: "normal" as const };
+  const metadata = credential.metadata ?? {};
   const schemaKeys = Object.keys(schema?.properties ?? {});
   const extraKeys = Object.keys(metadata)
     .filter((key) => !schemaKeys.includes(key))
@@ -212,9 +212,9 @@ function metadataEntries(
   return [...schemaKeys, ...extraKeys]
     .filter((key, index, keys) => keys.indexOf(key) === index)
     .flatMap((key) => {
-      const value = metadata[key];
-      if (value == null || value === "") return [];
       const field = schema?.properties[key];
+      const value = metadata[key] ?? field?.default;
+      if (value == null || value === "") return [];
       return [
         {
           key,
