@@ -135,6 +135,7 @@ import {
   updateAdminKey,
 } from "@/api/credentials";
 import {
+  cn,
   extractErrorMessage,
   parseError,
   generateApiKey,
@@ -335,7 +336,42 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
   // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
   const [searchQuery, setSearchQuery] = useState("");
-  // 字段排序：'manual' 保留服务端顺序与拖拽调优先级；其余字段按方向排序并禁用拖拽
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // 快捷键支持：按下 '/' 或 'Cmd/Ctrl+K' 聚焦搜索框；'Esc' 快速清空并失焦
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (searchQuery || document.activeElement === searchInputRef.current) {
+          setSearchQuery("");
+          searchInputRef.current?.blur();
+        }
+        return;
+      }
+
+      if (
+        e.key === "/" &&
+        !["INPUT", "TEXTAREA", "SELECT"].includes(
+          (e.target as HTMLElement)?.tagName,
+        ) &&
+        !(e.target as HTMLElement)?.isContentEditable
+      ) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [searchQuery]);
+
+  // 字段排序（来自 PR #56）：'manual' 保留服务端顺序与拖拽调优先级；
+  // 其余字段按方向排序并禁用拖拽。console-ui 没有同类能力，纯增量保留。
   const [sortField, setSortField] = useState<SortField>("manual");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   // 选中排序字段：点已选字段则切换升/降序；换字段时用该字段的直观默认方向
@@ -1501,25 +1537,30 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
             {/* 筛选器 — 左（移动端两列网格并排，桌面端内联） */}
             <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
-              {/* 模糊搜索：来源渠道（备注）/ 邮箱；移动端整行、桌面端 200px */}
-              <div className="relative col-span-2 sm:col-span-1 sm:w-[200px]">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              {/* 模糊搜索：来源渠道（备注）/ 邮箱；移动端整行、桌面端 210px */}
+              <div className="relative col-span-2 sm:col-span-1 sm:w-[210px]">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground opacity-80" />
                 <input
+                  ref={searchInputRef}
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="搜索来源渠道 / 备注 / 邮箱"
-                  className="h-8 w-full rounded-full border border-border bg-card/60 pl-5 pr-5 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
+                  className="h-8 w-full rounded-full border border-border bg-card/60 pl-8 pr-7 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
                 />
-                {searchQuery && (
+                {searchQuery ? (
                   <button
                     type="button"
                     onClick={() => setSearchQuery("")}
                     className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                    title="清除搜索"
+                    title="清除搜索 (Esc)"
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
+                ) : (
+                  <kbd className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 hidden select-none rounded border border-border/70 bg-muted/60 px-1.5 font-mono text-[10px] font-medium text-muted-foreground opacity-60 sm:inline-block">
+                    /
+                  </kbd>
                 )}
               </div>
               <Select
@@ -1964,16 +2005,26 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               },
             ]}
             trailing={
-              <span className="text-[12.5px] text-muted-foreground">
+              <div className="inline-flex items-center gap-1.5 rounded-full border border-border/50 bg-background/60 px-2.5 py-1 text-xs text-muted-foreground backdrop-blur-xs">
+                <span
+                  className={cn(
+                    "h-2 w-2 rounded-full",
+                    loadBalancingData?.mode === "balanced"
+                      ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)] animate-pulse"
+                      : "bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]"
+                  )}
+                />
                 {loadBalancingData?.mode === "balanced" ? (
-                  "均衡负载"
+                  <span className="font-medium text-foreground/90">均衡负载模式</span>
                 ) : (
-                  <>
-                    当前优先{" "}
-                    <span className="console-num">#{data?.currentId || "-"}</span>
-                  </>
+                  <span>
+                    优先调度{" "}
+                    <span className="console-num font-mono font-bold text-foreground">
+                      #{data?.currentId || "-"}
+                    </span>
+                  </span>
                 )}
-              </span>
+              </div>
             }
           />
         )}

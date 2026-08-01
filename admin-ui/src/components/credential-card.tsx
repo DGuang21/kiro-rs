@@ -77,7 +77,6 @@ import { getDisposition } from "@/components/console/credential-state";
 import {
   railBorderClass,
   railChipClass,
-  railTextClass,
 } from "@/components/console/rail";
 import { PriorityPreview } from "@/components/console/priority-preview";
 import { CredentialLabel } from "@/components/console/credential-label";
@@ -657,13 +656,6 @@ export function CredentialCard({
   const subscriptionBadge = subscriptionTitle ? (
     <SubscriptionBadge title={subscriptionTitle} />
   ) : null;
-
-  const isIdle = disposition.state === "healthy" || disposition.state === "current";
-  const dispatchStatus = isIdle
-    ? "空闲"
-    : `${disposition.stateLabel}${
-        isThrottled ? ` · 剩 ${formatThrottleCountdown(throttleRemaining)}` : ""
-      }`;
 
   const metadataItems = metadataEntries(credential, metadataSchema);
   const renderMetadataRows = (items: typeof metadataItems) =>
@@ -1262,17 +1254,6 @@ export function CredentialCard({
             <div className="space-y-1 border-t border-border/40 pt-3 px-3 text-[12px]">
               <CardSectionTitle icon={Activity}>运行与账号信息</CardSectionTitle>
               {groupingBlock && <div className="py-1">{groupingBlock}</div>}
-              <LedgerRow label="调配状态">
-                <span
-                  className={`font-medium ${
-                    isIdle
-                      ? "text-emerald-700 dark:text-emerald-400"
-                      : railTextClass(disposition.tone)
-                  }`}
-                >
-                  {dispatchStatus}
-                </span>
-              </LedgerRow>
               <LedgerRow label="凭据类型">
                 <span className="font-semibold">{authLabel}</span>
               </LedgerRow>
