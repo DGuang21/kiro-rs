@@ -1076,6 +1076,8 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据扩展元数据
+    pub metadata: crate::kiro::model::credentials::CredentialMetadata,
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
@@ -3064,6 +3066,7 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    metadata: e.credentials.metadata.clone(),
                     created_at: e.credentials.created_at.clone(),
                 })
                 .collect(),
@@ -3769,6 +3772,7 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.metadata = new_cred.metadata;
         // 记录添加时间：保留导入时携带的原值（如 KAM 迁移），否则以当前时间入库。
         // 此处为所有添加路径（单条添加 / 批量导入 / 登录回调）的唯一收口。
         if validated_cred.created_at.is_none() {
@@ -3841,6 +3845,7 @@ impl MultiTokenManager {
         proxy_password: Option<Option<String>>,
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
+        metadata: Option<crate::kiro::model::credentials::CredentialMetadata>,
     ) -> anyhow::Result<()> {
         let invalidate_models =
             proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
@@ -3873,6 +3878,9 @@ impl MultiTokenManager {
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            if let Some(v) = metadata {
+                entry.credentials.metadata = v;
             }
         }
         if invalidate_models {
@@ -6540,12 +6548,46 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
         assert_eq!(
             manager.cached_model_support(1, Some("glm-5")),
             CachedModelSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn test_update_credential_preserves_extensible_metadata() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let metadata = crate::kiro::model::credentials::CredentialMetadata {
+            kind: crate::kiro::model::credentials::CredentialType::Boom,
+            extra: std::collections::BTreeMap::from([(
+                "supplier".to_string(),
+                serde_json::Value::String("vendor-a".to_string()),
+            )]),
+        };
+
+        manager
+            .update_credential(1, None, None, None, None, None, None, Some(metadata))
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.entries[0].metadata.kind,
+            crate::kiro::model::credentials::CredentialType::Boom
+        );
+        assert_eq!(
+            snapshot.entries[0].metadata.extra.get("supplier"),
+            Some(&serde_json::Value::String("vendor-a".to_string()))
         );
     }
 

@@ -13,8 +13,12 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { GroupMultiSelect } from '@/components/group-select'
+import {
+  CredentialMetadataField,
+  metadataFieldDefault,
+} from '@/components/credential-metadata-field'
 import { updateCredential } from '@/api/credentials'
-import type { CredentialStatusItem } from '@/types/api'
+import type { CredentialMetadataSchema, CredentialStatusItem, CredentialType, UpdateCredentialRequest } from '@/types/api'
 
 type GroupMode = 'replace' | 'add' | 'remove'
 
@@ -25,6 +29,7 @@ interface BatchEditCredentialDialogProps {
   credentials: CredentialStatusItem[]
   /** 现有分组选项（去重聚合） */
   groupOptions: string[]
+  metadataSchema?: CredentialMetadataSchema
   /** 完成后回调（清空选择等） */
   onDone: () => void
 }
@@ -40,6 +45,7 @@ export function BatchEditCredentialDialog({
   onOpenChange,
   credentials,
   groupOptions,
+  metadataSchema,
   onDone,
 }: BatchEditCredentialDialogProps) {
   const queryClient = useQueryClient()
@@ -50,6 +56,8 @@ export function BatchEditCredentialDialog({
 
   const [editSource, setEditSource] = useState(false)
   const [sourceChannel, setSourceChannel] = useState('')
+  const [editType, setEditType] = useState(false)
+  const [credentialType, setCredentialType] = useState<CredentialType>('normal')
 
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -61,6 +69,8 @@ export function BatchEditCredentialDialog({
       setGroups([])
       setEditSource(false)
       setSourceChannel('')
+      setEditType(false)
+      setCredentialType(metadataFieldDefault(metadataSchema, 'type', 'normal') as CredentialType)
       setRunning(false)
       setProgress({ current: 0, total: 0 })
     }
@@ -74,7 +84,7 @@ export function BatchEditCredentialDialog({
   }
 
   const handleApply = async () => {
-    if (!editGroups && !editSource) {
+    if (!editGroups && !editSource && !editType) {
       toast.error('请至少开启一项要修改的字段')
       return
     }
@@ -84,9 +94,10 @@ export function BatchEditCredentialDialog({
     let fail = 0
     for (let i = 0; i < credentials.length; i++) {
       const c = credentials[i]
-      const req: Record<string, unknown> = {}
+      const req: UpdateCredentialRequest = {}
       if (editGroups) req.groups = computeGroups(c.groups ?? [])
       if (editSource) req.sourceChannel = sourceChannel.trim()
+      if (editType) req.metadata = { ...c.metadata, type: credentialType }
       try {
         await updateCredential(c.id, req)
         ok++
@@ -164,6 +175,26 @@ export function BatchEditCredentialDialog({
                   disabled={running}
                 />
                 <p className="text-[11px] text-muted-foreground">纯备注，标记账号来源/渠道。</p>
+              </>
+            )}
+          </div>
+
+          {/* 账号类型区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改账号类型</span>
+              <Switch checked={editType} onCheckedChange={setEditType} disabled={running} />
+            </label>
+            {editType && (
+              <>
+                <CredentialMetadataField
+                  schema={metadataSchema}
+                  fieldKey="type"
+                  value={credentialType}
+                  onValueChange={(value) => setCredentialType(value as CredentialType)}
+                  disabled={running}
+                />
+                <p className="text-[11px] text-muted-foreground">其他扩展字段保持不变。</p>
               </>
             )}
           </div>

@@ -23,6 +23,7 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
+        CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
@@ -42,6 +43,24 @@ type CredSessionPath = (u64, String);
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/config/credential-metadata-schema
+pub async fn get_credential_metadata_schema(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_credential_metadata_schema())
+}
+
+/// PUT /api/admin/config/credential-metadata-schema
+pub async fn set_credential_metadata_schema(
+    State(state): State<AdminState>,
+    Json(payload): Json<CredentialMetadataSchemaConfig>,
+) -> impl IntoResponse {
+    match state.service.set_credential_metadata_schema(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/credentials/export

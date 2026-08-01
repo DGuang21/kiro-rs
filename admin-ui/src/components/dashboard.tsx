@@ -2021,6 +2021,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
                       dragDisabled={dragDisabled}
+                      metadataSchema={data?.metadataSchema}
                     />
                   ))}
                 </div>
@@ -2165,6 +2166,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+        metadataSchema={data?.metadataSchema}
       />
       <BatchImportDialog
         open={batchImportDialogOpen}
@@ -2177,6 +2179,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           selectedIds.has(c.id),
         )}
         groupOptions={groupOptions}
+        metadataSchema={data?.metadataSchema}
         onDone={deselectAll}
       />
       <SocialLoginDialog

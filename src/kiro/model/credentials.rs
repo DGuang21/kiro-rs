@@ -4,6 +4,7 @@
 //! 支持单凭据和多凭据配置格式
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -14,6 +15,205 @@ pub const BUILDER_ID_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 pub const SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
+/// 凭据账号类型，仅用于运营标记，不参与调度。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialType {
+    /// 正常账号
+    #[default]
+    Normal,
+    /// 炸弹账号
+    Boom,
+}
+
+/// 凭据扩展元数据。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialMetadata {
+    /// 账号类型；旧凭据缺少该字段时默认为 normal。
+    #[serde(default, rename = "type")]
+    pub kind: CredentialType,
+
+    /// 预留扩展字段。未知键在读取、修改和持久化过程中原样保留。
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// 返回凭据 metadata 的标准 JSON Schema。
+///
+/// `additionalProperties: true` 保证 metadata 可扩展；已登记字段则由 properties
+/// 描述 key、值类型、默认值、可选值和 UI 文案。
+pub fn credential_metadata_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://kiro.rs/schemas/credential-metadata.json",
+        "title": "凭据元数据",
+        "type": "object",
+        "properties": {
+            "type": {
+                "title": "账号类型",
+                "description": "账号运营分类，仅用于标记，不参与调度。",
+                "type": "string",
+                "default": "normal",
+                "oneOf": [
+                    { "const": "normal", "title": "正常号" },
+                    { "const": "boom", "title": "炸弹号" }
+                ]
+            }
+        },
+        "required": ["type"],
+        "additionalProperties": true
+    })
+}
+
+/// 校验设置页提交的凭据 metadata schema。
+pub fn validate_credential_metadata_schema(schema: &serde_json::Value) -> anyhow::Result<()> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("metadata schema 必须是 JSON 对象"))?;
+    if object.get("type").and_then(|v| v.as_str()) != Some("object") {
+        anyhow::bail!("metadata schema 的 type 必须是 object");
+    }
+    if object.get("additionalProperties").and_then(|v| v.as_bool()) != Some(true) {
+        anyhow::bail!("metadata schema 必须允许 additionalProperties");
+    }
+    let properties = object
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("metadata schema 缺少 properties 对象"))?;
+    if properties.len() > 100 {
+        anyhow::bail!("metadata schema 最多允许 100 个字段");
+    }
+    let type_field = properties
+        .get("type")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("metadata schema 必须包含 type 字段"))?;
+    if type_field.get("type").and_then(|v| v.as_str()) != Some("string")
+        || type_field.get("default").and_then(|v| v.as_str()) != Some("normal")
+    {
+        anyhow::bail!("metadata.type 必须是 string，默认值必须是 normal");
+    }
+    let type_values: Vec<&str> = type_field
+        .get("oneOf")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("const").and_then(|v| v.as_str()))
+        .collect();
+    if type_values.len() != 2
+        || !type_values.contains(&"normal")
+        || !type_values.contains(&"boom")
+    {
+        anyhow::bail!("metadata.type 只能描述 normal 和 boom 两个可选值");
+    }
+    for (key, field) in properties {
+        if key.trim().is_empty() || key.len() > 64 {
+            anyhow::bail!("metadata 字段 key 不能为空且不能超过 64 字符");
+        }
+        let value_type = field.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(value_type, "string" | "number" | "integer" | "boolean") {
+            anyhow::bail!("metadata.{} 使用了不支持的值类型", key);
+        }
+        if field
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .is_none()
+        {
+            anyhow::bail!("metadata.{} 缺少显示名称 title", key);
+        }
+        let value_matches_type = |value: &serde_json::Value| match value_type {
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "boolean" => value.is_boolean(),
+            _ => false,
+        };
+        if let Some(default) = field.get("default") {
+            if !value_matches_type(default) {
+                anyhow::bail!("metadata.{} 的默认值类型不正确", key);
+            }
+        }
+        if let Some(options) = field.get("oneOf") {
+            let options = options
+                .as_array()
+                .filter(|options| !options.is_empty() && options.len() <= 100)
+                .ok_or_else(|| anyhow::anyhow!("metadata.{} 的 oneOf 必须是 1 到 100 项", key))?;
+            let mut seen = std::collections::HashSet::new();
+            for option in options {
+                let constant = option
+                    .get("const")
+                    .ok_or_else(|| anyhow::anyhow!("metadata.{} 的枚举项缺少 const", key))?;
+                if !value_matches_type(constant) {
+                    anyhow::bail!("metadata.{} 的枚举值类型不正确", key);
+                }
+                if option
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .is_none()
+                {
+                    anyhow::bail!("metadata.{} 的枚举项缺少 title", key);
+                }
+                if !seen.insert(constant.to_string()) {
+                    anyhow::bail!("metadata.{} 存在重复枚举值", key);
+                }
+            }
+            if let Some(default) = field.get("default") {
+                if !options.iter().any(|option| option.get("const") == Some(default)) {
+                    anyhow::bail!("metadata.{} 的默认值不在 oneOf 中", key);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 按当前 schema 校验 metadata 中已登记字段；额外字段由 additionalProperties 放行。
+pub fn validate_credential_metadata(
+    metadata: &CredentialMetadata,
+    schema: &serde_json::Value,
+) -> anyhow::Result<()> {
+    validate_credential_metadata_schema(schema)?;
+    let value = serde_json::to_value(metadata)?;
+    let values = value.as_object().expect("CredentialMetadata 必须序列化为对象");
+    let properties = schema["properties"]
+        .as_object()
+        .expect("schema 已完成 properties 校验");
+    for key in schema["required"].as_array().into_iter().flatten() {
+        if let Some(key) = key.as_str() {
+            if !values.contains_key(key) {
+                anyhow::bail!("metadata 缺少必填字段 {}", key);
+            }
+        }
+    }
+    for (key, field) in properties {
+        let Some(actual) = values.get(key) else { continue };
+        let valid_type = match field.get("type").and_then(|v| v.as_str()) {
+            Some("string") => actual.is_string(),
+            Some("number") => actual.is_number(),
+            Some("integer") => actual.as_i64().is_some() || actual.as_u64().is_some(),
+            Some("boolean") => actual.is_boolean(),
+            _ => false,
+        };
+        if !valid_type {
+            anyhow::bail!("metadata.{} 的值类型不符合 schema", key);
+        }
+        if let Some(options) = field.get("oneOf").and_then(|v| v.as_array()) {
+            let matches = options
+                .iter()
+                .filter_map(|option| option.get("const"))
+                .any(|expected| expected == actual);
+            if !matches {
+                anyhow::bail!("metadata.{} 的值不在 schema 可选项中", key);
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Kiro OAuth 凭证
 ///
@@ -177,6 +377,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
 
+    /// 凭据扩展元数据。旧配置缺失时自动补为 `{ "type": "normal" }`。
+    #[serde(default)]
+    pub metadata: CredentialMetadata,
+
     /// 凭据添加（创建）时间（RFC3339 格式）
     ///
     /// 由 `add_credential` 在首次入库时写入，此后随凭据一起持久化。
@@ -244,6 +448,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
+            .field("metadata", &self.metadata)
             .field("created_at", &self.created_at)
             .finish()
     }
@@ -618,6 +823,72 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_defaults_to_normal_for_legacy_credentials() {
+        let creds = KiroCredentials::from_json(r#"{ "refreshToken": "legacy" }"#).unwrap();
+
+        assert_eq!(creds.metadata.kind, CredentialType::Normal);
+        assert!(creds.metadata.extra.is_empty());
+        let serialized = creds.to_pretty_json().unwrap();
+        assert!(serialized.contains("\"type\": \"normal\""));
+    }
+
+    #[test]
+    fn test_metadata_boom_and_extension_fields_roundtrip() {
+        let json = r#"{
+            "refreshToken": "test",
+            "metadata": {
+                "type": "boom",
+                "supplier": "vendor-a",
+                "labels": ["risk", "manual"]
+            }
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.metadata.kind, CredentialType::Boom);
+        assert_eq!(
+            creds.metadata.extra.get("supplier"),
+            Some(&serde_json::Value::String("vendor-a".to_string()))
+        );
+
+        let serialized = creds.to_pretty_json().unwrap();
+        let reparsed = KiroCredentials::from_json(&serialized).unwrap();
+        assert_eq!(reparsed.metadata, creds.metadata);
+    }
+
+    #[test]
+    fn test_metadata_rejects_unknown_credential_type() {
+        let result = KiroCredentials::from_json(
+            r#"{ "refreshToken": "test", "metadata": { "type": "other" } }"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_metadata_schema_describes_type_and_allows_extensions() {
+        let schema = credential_metadata_schema();
+
+        assert_eq!(schema["properties"]["type"]["default"], "normal");
+        assert_eq!(schema["properties"]["type"]["oneOf"][1]["const"], "boom");
+        assert_eq!(schema["additionalProperties"], true);
+    }
+
+    #[test]
+    fn test_metadata_values_are_validated_by_schema() {
+        let mut metadata = CredentialMetadata::default();
+        metadata.extra.insert("score".to_string(), serde_json::json!(3));
+        let mut schema = credential_metadata_schema();
+        schema["properties"]["score"] = serde_json::json!({
+            "title": "评分",
+            "type": "integer"
+        });
+        assert!(validate_credential_metadata(&metadata, &schema).is_ok());
+
+        metadata.extra.insert("score".to_string(), serde_json::json!("3"));
+        assert!(validate_credential_metadata(&metadata, &schema).is_err());
+    }
+
+    #[test]
     fn test_from_json_with_unknown_keys() {
         let json = r#"{
             "accessToken": "test_token",
@@ -664,6 +935,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            metadata: CredentialMetadata::default(),
             created_at: None,
         };
 
@@ -673,6 +945,7 @@ mod tests {
         assert!(!json.contains("refreshToken"));
         // priority 为 0 时不序列化
         assert!(!json.contains("priority"));
+        assert!(json.contains("\"type\": \"normal\""));
     }
 
     #[test]
@@ -907,6 +1180,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            metadata: CredentialMetadata::default(),
             created_at: None,
         };
 
@@ -951,6 +1225,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            metadata: CredentialMetadata::default(),
             created_at: None,
         };
 
@@ -1078,6 +1353,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            metadata: CredentialMetadata::default(),
             created_at: None,
         };
 

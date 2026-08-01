@@ -30,6 +30,8 @@ import {
   setUpdateConfig,
   resetSuccessCount,
   resetAllSuccessCount,
+  getCredentialMetadataSchema,
+  setCredentialMetadataSchema,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
@@ -37,6 +39,7 @@ import type {
   SetUpdateConfigRequest,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
+  CredentialMetadataSchemaConfig,
 } from '@/types/api'
 
 // 查询凭据列表
@@ -45,6 +48,25 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+export function useCredentialMetadataSchema() {
+  return useQuery({
+    queryKey: ['credential-metadata-schema'],
+    queryFn: getCredentialMetadataSchema,
+  })
+}
+
+export function useSetCredentialMetadataSchema() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: CredentialMetadataSchemaConfig) =>
+      setCredentialMetadataSchema(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credential-metadata-schema'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
   })
 }
 

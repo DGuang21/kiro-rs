@@ -6,6 +6,7 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
@@ -24,18 +25,21 @@ import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
-import type { CredentialStatusItem } from '@/types/api'
+import { CredentialMetadataEditor, metadataDefaults } from '@/components/credential-metadata-field'
+import type { CredentialMetadata, CredentialMetadataSchema, CredentialStatusItem } from '@/types/api'
 
 interface EditCredentialDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   credential: CredentialStatusItem
+  metadataSchema?: CredentialMetadataSchema
 }
 
 export function EditCredentialDialog({
   open,
   onOpenChange,
   credential,
+  metadataSchema,
 }: EditCredentialDialogProps) {
   const [email, setEmail] = useState(credential.email ?? '')
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl ?? '')
@@ -43,6 +47,7 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  const [metadata, setMetadata] = useState<CredentialMetadata>(credential.metadata ?? { type: 'normal' })
   const [manualMode, setManualMode] = useState(false)
 
   const groupOptions = useGroupOptions()
@@ -62,9 +67,10 @@ export function EditCredentialDialog({
       setProxyPassword('')
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
+      setMetadata({ ...metadataDefaults(metadataSchema), ...(credential.metadata ?? { type: 'normal' }) })
       setManualMode(false)
     }
-  }, [open, credential])
+  }, [open, credential, metadataSchema])
 
   const { mutate, isPending } = useUpdateCredential()
 
@@ -81,6 +87,7 @@ export function EditCredentialDialog({
           proxyPassword: proxyPassword || undefined,
           groups: groups,
           sourceChannel: sourceChannel,
+          metadata,
         },
       },
       {
@@ -113,6 +120,9 @@ export function EditCredentialDialog({
           <DialogTitle>
             编辑凭据 #{credential.id}
           </DialogTitle>
+          <DialogDescription>
+            修改凭据标识、分组、Metadata 与代理配置。
+          </DialogDescription>
         </DialogHeader>
 
         <form onSubmit={handleSubmit}>
@@ -165,6 +175,13 @@ export function EditCredentialDialog({
                 纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
               </p>
             </div>
+
+            <CredentialMetadataEditor
+              schema={metadataSchema}
+              value={metadata}
+              onChange={setMetadata}
+              disabled={isPending}
+            />
 
             {/* 代理配置 */}
             <div className="space-y-2">

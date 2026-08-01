@@ -39,7 +39,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { CredentialStatusItem, BalanceResponse } from "@/types/api";
+import type { CredentialMetadataSchema, CredentialStatusItem, BalanceResponse } from "@/types/api";
 import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/utils";
 import {
   useSetDisabled,
@@ -78,6 +78,7 @@ interface CredentialCardProps {
   view?: "card" | "list";
   /** 字段排序开启时禁用拖拽调优先级（隐藏拖拽手柄） */
   dragDisabled?: boolean;
+  metadataSchema?: CredentialMetadataSchema;
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -226,6 +227,7 @@ export function CredentialCard({
   failureStats,
   view = "card",
   dragDisabled = false,
+  metadataSchema,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
   const [priorityValue, setPriorityValue] = useState(
@@ -468,6 +470,15 @@ export function CredentialCard({
   // 订阅 / 状态 / 鉴权 / 分组等徽章 —— 卡片头部与列表行共用
   const badges = (
     <>
+      {credential.metadata?.type === "boom" && (
+        <Badge
+          variant="outline"
+          className="border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+          title="账号类型：炸弹号（仅标记，不参与调度）"
+        >
+          炸弹号
+        </Badge>
+      )}
       {balance?.subscriptionTitle && (
         <SubscriptionBadge
           title={balance.subscriptionTitle}
@@ -1373,6 +1384,7 @@ export function CredentialCard({
         open={showEditDialog}
         onOpenChange={setShowEditDialog}
         credential={credential}
+        metadataSchema={metadataSchema}
       />
       <UpdateTokenDialog
         open={showUpdateTokenDialog}

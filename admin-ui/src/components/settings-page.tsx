@@ -4,6 +4,7 @@ import {
   ScrollText,
   PackageOpen,
   ShieldCheck,
+  Tags,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { useUrlState } from '@/hooks/use-url-state'
@@ -13,6 +14,7 @@ import { NetworkSection } from '@/components/settings/network-section'
 import { LogSection } from '@/components/settings/log-section'
 import { SystemSection } from '@/components/settings/system-section'
 import { SecuritySection } from '@/components/settings/security-section'
+import { MetadataSection } from '@/components/settings/metadata-section'
 
 /**
  * 设置页 —— 把此前散在三处的 7 个配置端点收拢到一处。
@@ -25,7 +27,7 @@ import { SecuritySection } from '@/components/settings/security-section'
  * 一次点击就该切换完；但参数（冷却时长、连续上限、保留天数这些）全部移到这里 ——
  * 下拉菜单里塞数字输入框本来就不是它该干的事。
  */
-type SectionKey = 'dispatch' | 'network' | 'log' | 'system' | 'security'
+type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'system' | 'security'
 
 const SECTIONS: {
   key: SectionKey
@@ -38,6 +40,12 @@ const SECTIONS: {
     label: '调度',
     hint: '凭据怎么选、失败怎么转、禁用怎么恢复',
     icon: <Gauge className="h-4 w-4" />,
+  },
+  {
+    key: 'metadata',
+    label: '凭据字段',
+    hint: '定义 metadata 的 key、类型、默认值和枚举 value',
+    icon: <Tags className="h-4 w-4" />,
   },
   {
     key: 'network',
@@ -120,6 +128,7 @@ export function SettingsPage() {
             </div>
 
             {active === 'dispatch' && <DispatchSection />}
+            {active === 'metadata' && <MetadataSection />}
             {active === 'network' && <NetworkSection />}
             {active === 'log' && <LogSection />}
             {active === 'system' && <SystemSection />}

@@ -1,6 +1,7 @@
 //! Admin API 类型定义
 
 use crate::admin::proxy_pool::ProxyHealth;
+use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
 
 // ============ 凭据状态 ============
@@ -15,6 +16,8 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
     pub current_id: u64,
+    /// 凭据 metadata 的 JSON Schema
+    pub metadata_schema: serde_json::Value,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -74,6 +77,8 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据扩展元数据
+    pub metadata: CredentialMetadata,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -197,6 +202,9 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 凭据扩展元数据（默认账号类型为 normal）
+    #[serde(default)]
+    pub metadata: CredentialMetadata,
 }
 
 fn default_auth_method() -> String {
@@ -235,6 +243,9 @@ pub struct UpdateCredentialRequest {
     /// 账号来源渠道（None 表示不修改，空串表示清除）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 凭据扩展元数据（None 表示不修改）
+    #[serde(default)]
+    pub metadata: Option<CredentialMetadata>,
 }
 
 /// 添加凭据成功响应
@@ -565,6 +576,13 @@ pub struct SetLogGovernanceConfigRequest {
     /// 用量日志保留天数，1..=365
     #[serde(default)]
     pub usage_log_retention_days: Option<u32>,
+}
+
+/// 凭据 metadata schema 配置响应/更新请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialMetadataSchemaConfig {
+    pub schema: serde_json::Value,
 }
 
 // ============ 代理池 ============

@@ -15,7 +15,9 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    KiroCredentials, normalize_import_auth_method, validate_external_idp_endpoint,
+    KiroCredentials, credential_metadata_schema, normalize_import_auth_method,
+    validate_credential_metadata, validate_credential_metadata_schema,
+    validate_external_idp_endpoint,
 };
 use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
 use crate::kiro::model::requests::conversation::{
@@ -38,6 +40,7 @@ use super::types::{
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    CredentialMetadataSchemaConfig,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
@@ -222,6 +225,8 @@ pub struct AdminService {
     proxy_pool: ProxyPoolManager,
     /// 在线镜像更新运行时配置
     update_config: Mutex<RuntimeUpdateConfig>,
+    /// 凭据 metadata schema；设置页修改后即时生效。
+    credential_metadata_schema: Mutex<serde_json::Value>,
     /// 最近一次"检查更新"结果（带 TTL，用于减少 GitHub API 调用）
     update_check_cache: Mutex<Option<CachedUpdateCheck>>,
     /// 进行中的 IdC 设备授权会话
@@ -552,6 +557,20 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let credential_metadata_schema = match token_manager
+            .config()
+            .credential_metadata_schema
+            .clone()
+        {
+            Some(schema) => match validate_credential_metadata_schema(&schema) {
+                Ok(()) => schema,
+                Err(error) => {
+                    tracing::warn!("配置中的 credentialMetadataSchema 无效，回退内置值: {}", error);
+                    credential_metadata_schema()
+                }
+            },
+            None => credential_metadata_schema(),
+        };
 
         let svc = Self {
             token_manager,
@@ -561,6 +580,7 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
             update_config: Mutex::new(update_config),
+            credential_metadata_schema: Mutex::new(credential_metadata_schema),
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -658,6 +678,7 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    metadata: entry.metadata,
                     balance,
                     balance_updated_at,
                     created_at: entry.created_at,
@@ -672,8 +693,31 @@ impl AdminService {
             total: snapshot.total,
             available: snapshot.available,
             current_id: exposed_current_id,
+            metadata_schema: self.credential_metadata_schema.lock().clone(),
             credentials,
         }
+    }
+
+    pub fn get_credential_metadata_schema(&self) -> CredentialMetadataSchemaConfig {
+        CredentialMetadataSchemaConfig {
+            schema: self.credential_metadata_schema.lock().clone(),
+        }
+    }
+
+    pub fn set_credential_metadata_schema(
+        &self,
+        req: CredentialMetadataSchemaConfig,
+    ) -> Result<CredentialMetadataSchemaConfig, AdminServiceError> {
+        validate_credential_metadata_schema(&req.schema)
+            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        let schema_for_save = req.schema.clone();
+        self.token_manager
+            .update_config_file(move |config| {
+                config.credential_metadata_schema = Some(schema_for_save);
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        *self.credential_metadata_schema.lock() = req.schema;
+        Ok(self.get_credential_metadata_schema())
     }
 
     /// 导出凭据为兼容 JSON（嵌套 `Account` 格式）
@@ -1201,6 +1245,8 @@ impl AdminService {
         req: AddCredentialRequest,
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        validate_credential_metadata(&req.metadata, &self.credential_metadata_schema.lock())
+            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
@@ -1293,6 +1339,7 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            metadata: req.metadata,
             // 创建时间由 token_manager.add_credential 在入库时统一写入
             created_at: None,
         };
@@ -1406,6 +1453,10 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
+        if let Some(metadata) = req.metadata.as_ref() {
+            validate_credential_metadata(metadata, &self.credential_metadata_schema.lock())
+                .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        }
         self.token_manager
             .update_credential(
                 id,
@@ -1419,6 +1470,7 @@ impl AdminService {
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
+                req.metadata,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -2573,6 +2625,7 @@ impl AdminService {
                 None,            // proxy_password 不修改
                 None,            // groups 不修改
                 None,            // source_channel 不修改
+                None,            // metadata 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2642,7 +2695,7 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
+                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
                 .is_ok()
             {
                 assigned += 1;

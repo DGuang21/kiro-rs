@@ -36,6 +36,7 @@ import type {
   UpdateCheckInfo,
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
+  CredentialMetadataSchemaConfig,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -59,6 +60,23 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+export async function getCredentialMetadataSchema(): Promise<CredentialMetadataSchemaConfig> {
+  const { data } = await api.get<CredentialMetadataSchemaConfig>(
+    '/config/credential-metadata-schema',
+  )
+  return data
+}
+
+export async function setCredentialMetadataSchema(
+  config: CredentialMetadataSchemaConfig,
+): Promise<CredentialMetadataSchemaConfig> {
+  const { data } = await api.put<CredentialMetadataSchemaConfig>(
+    '/config/credential-metadata-schema',
+    config,
+  )
   return data
 }
 

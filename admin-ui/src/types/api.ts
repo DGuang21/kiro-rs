@@ -4,7 +4,44 @@ export interface CredentialsStatusResponse {
   available: number
   /** 优先级模式下的当前优先凭据 ID；均衡模式为 0 */
   currentId: number
+  /** 描述 metadata 字段、值类型和选项的 JSON Schema */
+  metadataSchema: CredentialMetadataSchema
   credentials: CredentialStatusItem[]
+}
+
+export type CredentialType = 'normal' | 'boom'
+
+/** 可扩展的凭据元数据；type 是固定字段，其余键由后端原样保存。 */
+export interface CredentialMetadata {
+  type: CredentialType
+  [key: string]: unknown
+}
+
+export interface CredentialMetadataSchemaOption {
+  const: unknown
+  title: string
+}
+
+export interface CredentialMetadataFieldSchema {
+  title: string
+  description?: string
+  type: 'string' | 'number' | 'integer' | 'boolean'
+  default?: unknown
+  oneOf?: CredentialMetadataSchemaOption[]
+}
+
+export interface CredentialMetadataSchema {
+  $schema?: string
+  $id?: string
+  title?: string
+  type: 'object'
+  properties: Record<string, CredentialMetadataFieldSchema>
+  required?: string[]
+  additionalProperties: boolean
+}
+
+export interface CredentialMetadataSchemaConfig {
+  schema: CredentialMetadataSchema
 }
 
 // 单个凭据状态
@@ -38,6 +75,8 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 可扩展的凭据元数据 */
+  metadata: CredentialMetadata
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -141,6 +180,7 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
+  metadata?: CredentialMetadata
 }
 
 // 添加凭据响应
@@ -161,6 +201,8 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
+  /** 整体更新 metadata；调用方应保留不认识的扩展字段 */
+  metadata?: CredentialMetadata
 }
 
 // 更新 refreshToken 请求
