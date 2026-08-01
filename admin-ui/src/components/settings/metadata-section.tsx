@@ -192,7 +192,29 @@ export function MetadataSection() {
   const [drafts, setDrafts] = useState<FieldDraft[]>([])
 
   useEffect(() => {
-    if (data?.schema) setDrafts(schemaToDrafts(data.schema))
+    if (!data?.schema) return
+
+    const existingKeys = Object.keys(data.schema.properties ?? {})
+    const hasAllBuiltins = ['type', 'saleStatus', 'salePrice'].every((key) =>
+      existingKeys.includes(key),
+    )
+
+    const initialDrafts = schemaToDrafts(data.schema)
+    setDrafts(initialDrafts)
+
+    // 如果后端的 config.json 尚未持久化这些默认字段，自动触发一次 API 将完整 Payload 写入后端磁盘与内存
+    if (!hasAllBuiltins && !isPending) {
+      const fullSchema = draftsToSchema(data.schema, initialDrafts)
+      mutate(
+        { schema: fullSchema },
+        {
+          onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['credentials'] })
+            queryClient.invalidateQueries({ queryKey: ['credential-metadata-schema'] })
+          },
+        },
+      )
+    }
   }, [data])
 
   const update = (index: number, patch: Partial<FieldDraft>) => {
