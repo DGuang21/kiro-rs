@@ -2069,6 +2069,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </SortableContext>
             </DndContext>
 
+            {/* 隔开与 BulkBar 吸底栏的垂直安全间距 */}
+            <div className="h-6 sm:h-8" />
+
             {/*
               吸底批量栏：选中 > 0 时滑入，操作直接摆在表面。
               解决的是"选完还要去顶部菜单里翻"以及"滚到列表中段后操作入口已滚出视野"。

@@ -20,7 +20,7 @@ export function BulkBar({
   if (count === 0) return null
 
   return (
-    <div className="pointer-events-none sticky bottom-5 z-40 flex justify-center px-4">
+    <div className="pointer-events-none sticky bottom-6 z-40 flex justify-center px-4 mt-8 sm:mt-10 mb-2">
       <div className="console-bulkbar console-scope pointer-events-auto flex max-w-full flex-wrap items-center gap-2.5 sm:gap-3 rounded-full border border-border/80 bg-card/95 px-4 py-2.5 shadow-apple-xl backdrop-blur-2xl">
         <span className="pl-1 text-xs font-medium whitespace-nowrap text-foreground/90">
           已选 <span className="console-num font-bold text-primary">{count}</span> {noun}
