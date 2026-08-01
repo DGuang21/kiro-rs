@@ -15,7 +15,6 @@ import {
   ScrollText,
   Boxes,
   Wallet,
-  CheckCircle2,
   ChevronRight,
   Activity,
   Key,
@@ -1265,13 +1264,12 @@ export function CredentialCard({
               {groupingBlock && <div className="py-1">{groupingBlock}</div>}
               <LedgerRow label="调配状态">
                 <span
-                  className={`inline-flex items-center gap-1 font-medium ${
+                  className={`font-medium ${
                     isIdle
                       ? "text-emerald-700 dark:text-emerald-400"
                       : railTextClass(disposition.tone)
                   }`}
                 >
-                  {isIdle && <CheckCircle2 className="h-3 w-3" />}
                   {dispatchStatus}
                 </span>
               </LedgerRow>
