@@ -76,8 +76,46 @@ const CSS_PRESETS = [
   },
 ]
 
+// 系统默认的基础字段模板 (type, saleStatus, salePrice)
+const DEFAULT_BUILTIN_PROPERTIES: Record<string, CredentialMetadataFieldSchema> = {
+  type: {
+    title: '账号类型',
+    description: '账号运营分类，仅用于标记，不参与调度。',
+    type: 'string',
+    default: 'normal',
+    oneOf: [
+      { const: 'normal', title: '正常号' },
+      { const: 'boom', title: '炸弹号' },
+    ],
+    'x-css': 'color: #b45309; background-color: #fffbeb; border-color: #fde68a;',
+  },
+  saleStatus: {
+    title: '在售状态',
+    description: '账号运营销售状态，仅用于标记，不参与调度。',
+    type: 'string',
+    default: 'not_for_sale',
+    oneOf: [
+      { const: 'not_for_sale', title: '非卖品' },
+      { const: 'for_sale', title: '在售' },
+      { const: 'sold', title: '已售' },
+    ],
+    'x-css': 'color: #047857; background-color: #ecfdf5; border-color: #a7f3d0;',
+  },
+  salePrice: {
+    title: '销售价格（CNY）',
+    description: '账号销售价格，单位为人民币；未设置时不在卡片显示。',
+    type: 'number',
+    minimum: 0,
+    'x-css': 'color: #0284c7; background-color: #f0f9ff; border-color: #bae6fd;',
+  },
+}
+
 function schemaToDrafts(schema: CredentialMetadataSchema): FieldDraft[] {
-  return Object.entries(schema.properties).map(([key, field]) => ({
+  const mergedProperties = {
+    ...DEFAULT_BUILTIN_PROPERTIES,
+    ...(schema?.properties ?? {}),
+  }
+  return Object.entries(mergedProperties).map(([key, field]) => ({
     locked: ['type', 'saleStatus', 'salePrice'].includes(key),
     key,
     title: field.title,
