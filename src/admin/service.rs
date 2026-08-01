@@ -665,8 +665,8 @@ impl AdminService {
             })
             .collect();
 
-        // 按优先级排序（数字越小优先级越高）
-        credentials.sort_by_key(|c| c.priority);
+        // 与调度器保持一致：优先级越小越靠前，同优先级按 ID 升序。
+        credentials.sort_by_key(|c| (c.priority, c.id));
 
         CredentialsStatusResponse {
             total: snapshot.total,
@@ -689,7 +689,7 @@ impl AdminService {
         if let Some(filter) = id_filter {
             credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
         }
-        credentials.sort_by_key(|c| c.priority);
+        credentials.sort_by_key(|c| (c.priority, c.id.unwrap_or(u64::MAX)));
 
         let accounts = credentials
             .into_iter()

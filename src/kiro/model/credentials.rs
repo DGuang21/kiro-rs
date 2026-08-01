@@ -385,8 +385,9 @@ impl CredentialsConfig {
                 vec![cred]
             }
             CredentialsConfig::Multiple(mut creds) => {
-                // 按优先级排序（数字越小优先级越高）
-                creds.sort_by_key(|c| c.priority);
+                // 与运行时调度保持一致：优先级越小越靠前，同优先级按 ID 升序。
+                // 没有 ID 的旧格式凭据保持在已有 ID 之后，后续由管理器统一分配。
+                creds.sort_by_key(|c| (c.priority, c.id.unwrap_or(u64::MAX)));
                 for cred in &mut creds {
                     cred.canonicalize_auth_method();
                 }
@@ -822,6 +823,24 @@ mod tests {
         assert_eq!(list[0].refresh_token, Some("t2".to_string())); // priority 0
         assert_eq!(list[1].refresh_token, Some("t3".to_string())); // priority 1
         assert_eq!(list[2].refresh_token, Some("t1".to_string())); // priority 2
+    }
+
+    #[test]
+    fn test_credentials_config_equal_priority_sorting_uses_id() {
+        let json = r#"[
+            {"id": 3, "refreshToken": "t3", "priority": 0},
+            {"id": 1, "refreshToken": "t1", "priority": 0},
+            {"id": 2, "refreshToken": "t2", "priority": 0}
+        ]"#;
+        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let list = config.into_sorted_credentials();
+
+        assert_eq!(
+            list.iter()
+                .filter_map(|credential| credential.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     // ============ Region 字段测试 ============
