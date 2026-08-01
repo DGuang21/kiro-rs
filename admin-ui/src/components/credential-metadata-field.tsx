@@ -81,7 +81,11 @@ export function metadataDefaults(
   for (const [key, field] of Object.entries(schema?.properties ?? {})) {
     if (field.default !== undefined) values[key] = field.default
   }
-  return { ...values, type: typeof values.type === 'string' ? values.type : 'normal' } as CredentialMetadata
+  return {
+    ...values,
+    type: typeof values.type === 'string' ? values.type : 'normal',
+    saleStatus: typeof values.saleStatus === 'string' ? values.saleStatus : 'not_for_sale',
+  } as CredentialMetadata
 }
 
 interface CredentialMetadataEditorProps {
@@ -149,6 +153,7 @@ export function CredentialMetadataEditor({
               id={`metadata-${key}`}
               type={field.type === 'string' ? 'text' : 'number'}
               step={field.type === 'integer' ? 1 : 'any'}
+              min={field.minimum}
               value={current == null ? '' : String(current)}
               onChange={(event) => {
                 const raw = event.target.value

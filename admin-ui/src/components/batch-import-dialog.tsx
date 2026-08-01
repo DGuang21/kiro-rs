@@ -17,7 +17,12 @@ import {
   type BatchImportItemEvent,
   type BatchImportSummary,
 } from '@/api/credentials'
-import type { AddCredentialRequest, CredentialMetadata, CredentialType } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  CredentialMetadata,
+  CredentialSaleStatus,
+  CredentialType,
+} from '@/types/api'
 import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
 import {
   metadataFieldDefault,
@@ -157,9 +162,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           updateResult(i, { status: 'failed', error: 'metadata.type 不符合当前 schema' })
           continue
         }
+        const saleStatus = cred.metadata?.saleStatus
+          ?? metadataFieldDefault(metadataSchema, 'saleStatus', 'not_for_sale')
+        const saleStatusValues = metadataFieldValues(metadataSchema, 'saleStatus')
+        if (saleStatusValues.length > 0 && !saleStatusValues.includes(saleStatus)) {
+          updateResult(i, { status: 'failed', error: 'metadata.saleStatus 不符合当前 schema' })
+          continue
+        }
         const metadata: CredentialMetadata = {
           ...cred.metadata,
           type: metadataType as CredentialType,
+          saleStatus: saleStatus as CredentialSaleStatus,
         }
 
         // 若凭据未指定代理且代理池有可用代理，随机分配一个

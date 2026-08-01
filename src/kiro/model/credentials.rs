@@ -27,6 +27,19 @@ pub enum CredentialType {
     Boom,
 }
 
+/// 凭据账号在售状态，仅用于运营管理，不参与调度。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSaleStatus {
+    /// 非卖品
+    #[default]
+    NotForSale,
+    /// 在售
+    ForSale,
+    /// 已售
+    Sold,
+}
+
 /// 凭据扩展元数据。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +47,10 @@ pub struct CredentialMetadata {
     /// 账号类型；旧凭据缺少该字段时默认为 normal。
     #[serde(default, rename = "type")]
     pub kind: CredentialType,
+
+    /// 账号在售状态；旧凭据缺少该字段时默认为 not_for_sale。
+    #[serde(default)]
+    pub sale_status: CredentialSaleStatus,
 
     /// 预留扩展字段。未知键在读取、修改和持久化过程中原样保留。
     #[serde(flatten)]
@@ -60,11 +77,123 @@ pub fn credential_metadata_schema() -> serde_json::Value {
                     { "const": "normal", "title": "正常号" },
                     { "const": "boom", "title": "炸弹号" }
                 ]
+            },
+            "saleStatus": {
+                "title": "在售状态",
+                "description": "账号运营销售状态，仅用于标记，不参与调度。",
+                "type": "string",
+                "default": "not_for_sale",
+                "oneOf": [
+                    { "const": "not_for_sale", "title": "非卖品" },
+                    { "const": "for_sale", "title": "在售" },
+                    { "const": "sold", "title": "已售" }
+                ]
+            },
+            "salePrice": {
+                "title": "销售价格（CNY）",
+                "description": "账号销售价格，单位为人民币；未设置时不在卡片显示。",
+                "type": "number",
+                "minimum": 0
             }
         },
-        "required": ["type"],
+        "required": ["type", "saleStatus"],
         "additionalProperties": true
     })
+}
+
+/// 给旧版自定义 Schema 补齐新增的内置字段，同时保留用户定义的扩展字段和样式。
+pub fn normalize_credential_metadata_schema(mut schema: serde_json::Value) -> serde_json::Value {
+    let builtin = credential_metadata_schema();
+    let Some(object) = schema.as_object_mut() else {
+        return schema;
+    };
+    if let Some(properties) = object.get_mut("properties").and_then(|v| v.as_object_mut()) {
+        let builtin_properties = builtin["properties"]
+            .as_object()
+            .expect("内置 metadata schema properties 必须是对象");
+        for key in ["type", "saleStatus", "salePrice"] {
+            if !properties.contains_key(key) {
+                properties.insert(key.to_string(), builtin_properties[key].clone());
+            }
+        }
+    }
+    if let Some(required) = object.get_mut("required").and_then(|v| v.as_array_mut()) {
+        for key in ["type", "saleStatus"] {
+            if !required.iter().any(|value| value.as_str() == Some(key)) {
+                required.push(serde_json::Value::String(key.to_string()));
+            }
+        }
+    }
+    schema
+}
+
+/// 校验 JSON Schema 字段上的 `x-css` UI 扩展。
+///
+/// 允许普通内联声明，但拒绝外链、脚本表达式以及可能让内容脱离卡片边界的布局属性。
+fn validate_metadata_field_css(key: &str, field: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(css) = field.get("x-css") else {
+        return Ok(());
+    };
+    let css = css
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("metadata.{} 的 x-css 必须是字符串", key))?
+        .trim();
+    if css.len() > 1000 {
+        anyhow::bail!("metadata.{} 的 x-css 不能超过 1000 个字符", key);
+    }
+    let lower = css.to_ascii_lowercase();
+    if ["url", "@import", "expression", "javascript", "<", ">"]
+        .iter()
+        .any(|token| lower.contains(token))
+    {
+        anyhow::bail!("metadata.{} 的 x-css 包含不安全内容", key);
+    }
+
+    const BLOCKED_PROPERTIES: &[&str] = &[
+        "position",
+        "z-index",
+        "inset",
+        "top",
+        "right",
+        "bottom",
+        "left",
+        "content",
+        "display",
+        "visibility",
+        "pointer-events",
+        "transform",
+        "animation",
+        "transition",
+    ];
+    for declaration in css.split(';').map(str::trim).filter(|item| !item.is_empty()) {
+        let (property, value) = declaration
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("metadata.{} 的 x-css 声明格式不正确", key))?;
+        let property = property.trim().to_ascii_lowercase();
+        if value.trim().is_empty() {
+            anyhow::bail!("metadata.{} 的 x-css 声明缺少值", key);
+        }
+        let property_body = property.trim_start_matches('-');
+        if property_body.is_empty()
+            || !property_body
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic())
+            || !property
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            anyhow::bail!("metadata.{} 的 x-css 属性名不正确", key);
+        }
+        if BLOCKED_PROPERTIES.contains(&property.as_str()) {
+            anyhow::bail!(
+                "metadata.{} 的 x-css 不允许使用布局属性 {}",
+                key,
+                property
+            );
+        }
+    }
+    Ok(())
 }
 
 /// 校验设置页提交的凭据 metadata schema。
@@ -107,7 +236,58 @@ pub fn validate_credential_metadata_schema(schema: &serde_json::Value) -> anyhow
     {
         anyhow::bail!("metadata.type 只能描述 normal 和 boom 两个可选值");
     }
+    let sale_status_field = properties
+        .get("saleStatus")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("metadata schema 必须包含 saleStatus 字段"))?;
+    if sale_status_field.get("type").and_then(|v| v.as_str()) != Some("string")
+        || sale_status_field.get("default").and_then(|v| v.as_str()) != Some("not_for_sale")
+    {
+        anyhow::bail!("metadata.saleStatus 必须是 string，默认值必须是 not_for_sale");
+    }
+    let sale_status_values: Vec<&str> = sale_status_field
+        .get("oneOf")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("const").and_then(|v| v.as_str()))
+        .collect();
+    if sale_status_values.len() != 3
+        || !sale_status_values.contains(&"not_for_sale")
+        || !sale_status_values.contains(&"for_sale")
+        || !sale_status_values.contains(&"sold")
+    {
+        anyhow::bail!(
+            "metadata.saleStatus 只能描述 not_for_sale、for_sale 和 sold 三个可选值"
+        );
+    }
+    let sale_price_field = properties
+        .get("salePrice")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("metadata schema 必须包含 salePrice 字段"))?;
+    if sale_price_field.get("type").and_then(|v| v.as_str()) != Some("number")
+        || sale_price_field.get("minimum").and_then(|v| v.as_f64()) != Some(0.0)
+        || sale_price_field.contains_key("default")
+    {
+        anyhow::bail!("metadata.salePrice 必须是无默认值且最小值为 0 的 number");
+    }
+    let required = object
+        .get("required")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("metadata schema 缺少 required 数组"))?;
+    for key in ["type", "saleStatus"] {
+        if !required.iter().any(|value| value.as_str() == Some(key)) {
+            anyhow::bail!("metadata schema 的 required 必须包含 {}", key);
+        }
+    }
+    if required
+        .iter()
+        .any(|value| value.as_str() == Some("salePrice"))
+    {
+        anyhow::bail!("metadata.salePrice 必须是可选字段");
+    }
     for (key, field) in properties {
+        validate_metadata_field_css(key, field)?;
         if key.trim().is_empty() || key.len() > 64 {
             anyhow::bail!("metadata 字段 key 不能为空且不能超过 64 字符");
         }
@@ -201,6 +381,14 @@ pub fn validate_credential_metadata(
         };
         if !valid_type {
             anyhow::bail!("metadata.{} 的值类型不符合 schema", key);
+        }
+        if let Some(minimum) = field.get("minimum").and_then(|value| value.as_f64()) {
+            if actual
+                .as_f64()
+                .is_some_and(|value| value < minimum)
+            {
+                anyhow::bail!("metadata.{} 的值不能小于 {}", key, minimum);
+            }
         }
         if let Some(options) = field.get("oneOf").and_then(|v| v.as_array()) {
             let matches = options
@@ -827,9 +1015,11 @@ mod tests {
         let creds = KiroCredentials::from_json(r#"{ "refreshToken": "legacy" }"#).unwrap();
 
         assert_eq!(creds.metadata.kind, CredentialType::Normal);
+        assert_eq!(creds.metadata.sale_status, CredentialSaleStatus::NotForSale);
         assert!(creds.metadata.extra.is_empty());
         let serialized = creds.to_pretty_json().unwrap();
         assert!(serialized.contains("\"type\": \"normal\""));
+        assert!(serialized.contains("\"saleStatus\": \"not_for_sale\""));
     }
 
     #[test]
@@ -838,6 +1028,7 @@ mod tests {
             "refreshToken": "test",
             "metadata": {
                 "type": "boom",
+                "saleStatus": "for_sale",
                 "supplier": "vendor-a",
                 "labels": ["risk", "manual"]
             }
@@ -845,6 +1036,7 @@ mod tests {
 
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.metadata.kind, CredentialType::Boom);
+        assert_eq!(creds.metadata.sale_status, CredentialSaleStatus::ForSale);
         assert_eq!(
             creds.metadata.extra.get("supplier"),
             Some(&serde_json::Value::String("vendor-a".to_string()))
@@ -865,12 +1057,83 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_rejects_unknown_sale_status() {
+        let result = KiroCredentials::from_json(
+            r#"{ "refreshToken": "test", "metadata": { "type": "normal", "saleStatus": "unknown" } }"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_metadata_schema_describes_type_and_allows_extensions() {
         let schema = credential_metadata_schema();
 
         assert_eq!(schema["properties"]["type"]["default"], "normal");
         assert_eq!(schema["properties"]["type"]["oneOf"][1]["const"], "boom");
+        assert_eq!(
+            schema["properties"]["saleStatus"]["default"],
+            "not_for_sale"
+        );
+        assert_eq!(
+            schema["properties"]["saleStatus"]["oneOf"][1]["const"],
+            "for_sale"
+        );
+        assert_eq!(schema["properties"]["salePrice"]["type"], "number");
+        assert_eq!(schema["properties"]["salePrice"]["minimum"], 0);
         assert_eq!(schema["additionalProperties"], true);
+    }
+
+    #[test]
+    fn test_old_metadata_schema_is_normalized_without_losing_extensions() {
+        let mut schema = credential_metadata_schema();
+        schema["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("saleStatus");
+        schema["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("salePrice");
+        schema["required"] = serde_json::json!(["type"]);
+        schema["properties"]["supplier"] = serde_json::json!({
+            "title": "供应商",
+            "type": "string",
+            "x-css": "color: #b45309"
+        });
+
+        let normalized = normalize_credential_metadata_schema(schema);
+
+        assert_eq!(
+            normalized["properties"]["saleStatus"]["default"],
+            "not_for_sale"
+        );
+        assert_eq!(normalized["properties"]["salePrice"]["minimum"], 0);
+        assert_eq!(
+            normalized["properties"]["supplier"]["x-css"],
+            "color: #b45309"
+        );
+        assert!(normalized["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "saleStatus"));
+        assert!(validate_credential_metadata_schema(&normalized).is_ok());
+    }
+
+    #[test]
+    fn test_metadata_schema_validates_safe_custom_css() {
+        let mut schema = credential_metadata_schema();
+        schema["properties"]["type"]["x-css"] =
+            serde_json::json!("color: #b45309; background-color: #fffbeb; font-weight: 600");
+        assert!(validate_credential_metadata_schema(&schema).is_ok());
+
+        schema["properties"]["type"]["x-css"] =
+            serde_json::json!("background-image: url(https://example.com/track)");
+        assert!(validate_credential_metadata_schema(&schema).is_err());
+
+        schema["properties"]["type"]["x-css"] = serde_json::json!("position: fixed");
+        assert!(validate_credential_metadata_schema(&schema).is_err());
     }
 
     #[test]
@@ -885,6 +1148,12 @@ mod tests {
         assert!(validate_credential_metadata(&metadata, &schema).is_ok());
 
         metadata.extra.insert("score".to_string(), serde_json::json!("3"));
+        assert!(validate_credential_metadata(&metadata, &schema).is_err());
+
+        metadata.extra.remove("score");
+        metadata
+            .extra
+            .insert("salePrice".to_string(), serde_json::json!(-0.01));
         assert!(validate_credential_metadata(&metadata, &schema).is_err());
     }
 

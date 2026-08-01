@@ -15,9 +15,9 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    KiroCredentials, credential_metadata_schema, normalize_import_auth_method,
-    validate_credential_metadata, validate_credential_metadata_schema,
-    validate_external_idp_endpoint,
+    KiroCredentials, credential_metadata_schema, normalize_credential_metadata_schema,
+    normalize_import_auth_method, validate_credential_metadata,
+    validate_credential_metadata_schema, validate_external_idp_endpoint,
 };
 use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
 use crate::kiro::model::requests::conversation::{
@@ -562,13 +562,19 @@ impl AdminService {
             .credential_metadata_schema
             .clone()
         {
-            Some(schema) => match validate_credential_metadata_schema(&schema) {
-                Ok(()) => schema,
-                Err(error) => {
-                    tracing::warn!("配置中的 credentialMetadataSchema 无效，回退内置值: {}", error);
-                    credential_metadata_schema()
+            Some(schema) => {
+                let schema = normalize_credential_metadata_schema(schema);
+                match validate_credential_metadata_schema(&schema) {
+                    Ok(()) => schema,
+                    Err(error) => {
+                        tracing::warn!(
+                            "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
+                            error
+                        );
+                        credential_metadata_schema()
+                    }
                 }
-            },
+            }
             None => credential_metadata_schema(),
         };
 

@@ -10,10 +10,14 @@ export interface CredentialsStatusResponse {
 }
 
 export type CredentialType = 'normal' | 'boom'
+export type CredentialSaleStatus = 'not_for_sale' | 'for_sale' | 'sold'
 
-/** 可扩展的凭据元数据；type 是固定字段，其余键由后端原样保存。 */
+/** 可扩展的凭据元数据；type 和 saleStatus 是固定字段，其余键由后端原样保存。 */
 export interface CredentialMetadata {
   type: CredentialType
+  saleStatus: CredentialSaleStatus
+  /** 人民币销售价格；未设置时不展示。 */
+  salePrice?: number
   [key: string]: unknown
 }
 
@@ -27,7 +31,10 @@ export interface CredentialMetadataFieldSchema {
   description?: string
   type: 'string' | 'number' | 'integer' | 'boolean'
   default?: unknown
+  minimum?: number
   oneOf?: CredentialMetadataSchemaOption[]
+  /** 应用于卡片字段值的安全内联 CSS 声明。 */
+  'x-css'?: string
 }
 
 export interface CredentialMetadataSchema {

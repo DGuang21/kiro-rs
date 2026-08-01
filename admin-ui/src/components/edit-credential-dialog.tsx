@@ -47,7 +47,9 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
-  const [metadata, setMetadata] = useState<CredentialMetadata>(credential.metadata ?? { type: 'normal' })
+  const [metadata, setMetadata] = useState<CredentialMetadata>(
+    credential.metadata ?? { type: 'normal', saleStatus: 'not_for_sale' },
+  )
   const [manualMode, setManualMode] = useState(false)
 
   const groupOptions = useGroupOptions()
@@ -67,7 +69,10 @@ export function EditCredentialDialog({
       setProxyPassword('')
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
-      setMetadata({ ...metadataDefaults(metadataSchema), ...(credential.metadata ?? { type: 'normal' }) })
+      setMetadata({
+        ...metadataDefaults(metadataSchema),
+        ...(credential.metadata ?? { type: 'normal', saleStatus: 'not_for_sale' }),
+      })
       setManualMode(false)
     }
   }, [open, credential, metadataSchema])

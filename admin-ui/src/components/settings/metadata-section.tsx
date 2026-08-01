@@ -3,6 +3,7 @@ import { Plus, Save, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectContent,
@@ -16,6 +17,7 @@ import {
   useSetCredentialMetadataSchema,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { validateMetadataCss } from '@/lib/credential-metadata-style'
 import type {
   CredentialMetadataFieldSchema,
   CredentialMetadataSchema,
@@ -31,17 +33,19 @@ interface FieldDraft {
   type: ValueType
   defaultValue: string
   options: string
+  css: string
 }
 
 function schemaToDrafts(schema: CredentialMetadataSchema): FieldDraft[] {
   return Object.entries(schema.properties).map(([key, field]) => ({
-    locked: key === 'type',
+    locked: ['type', 'saleStatus', 'salePrice'].includes(key),
     key,
     title: field.title,
     description: field.description ?? '',
     type: field.type,
     defaultValue: field.default == null ? '' : String(field.default),
     options: field.oneOf?.map((option) => `${String(option.const)}:${option.title}`).join(', ') ?? '',
+    css: field['x-css'] ?? '',
   }))
 }
 
@@ -80,13 +84,15 @@ function draftsToSchema(
         return { const: parsed, title: labelParts.join(':').trim() || raw }
       })
     if (options.length > 0) field.oneOf = options
+    if (draft.css.trim()) field['x-css'] = draft.css.trim()
+    if (draft.key.trim() === 'salePrice') field.minimum = 0
     properties[draft.key.trim()] = field
   }
   return {
     ...base,
     type: 'object',
     properties,
-    required: ['type'],
+    required: ['type', 'saleStatus'],
     additionalProperties: true,
   }
 }
@@ -115,6 +121,7 @@ export function MetadataSection() {
         type: 'string',
         defaultValue: '',
         options: '',
+        css: '',
       },
     ])
   }
@@ -130,9 +137,11 @@ export function MetadataSection() {
       toast.error('字段 key 不能重复')
       return
     }
-    const typeField = drafts.find((field) => field.key === 'type')
-    if (!typeField) {
-      toast.error('内置 type 字段不能删除')
+    const missingBuiltin = ['type', 'saleStatus', 'salePrice'].find(
+      (key) => !drafts.some((field) => field.key === key),
+    )
+    if (missingBuiltin) {
+      toast.error(`内置 ${missingBuiltin} 字段不能删除`)
       return
     }
     for (const field of drafts) {
@@ -150,6 +159,11 @@ export function MetadataSection() {
         toast.error(`${field.key} 的默认值类型不正确`)
         return
       }
+      const cssError = validateMetadataCss(field.css)
+      if (cssError) {
+        toast.error(`${field.key}: ${cssError}`)
+        return
+      }
     }
     mutate(
       { schema: draftsToSchema(data.schema, drafts) },
@@ -163,7 +177,7 @@ export function MetadataSection() {
   return (
     <SettingGroup
       title="凭据 Metadata Schema"
-      description="定义凭据 metadata 的字段 key、值类型、默认值和枚举 value。type 是内置必填字段。"
+      description="定义凭据 metadata 的字段 key、值类型、默认值和枚举 value。type、saleStatus 和 salePrice 是内置字段。"
     >
       <div className="space-y-3 py-2">
         {drafts.map((field, index) => {
@@ -228,6 +242,18 @@ export function MetadataSection() {
                   disabled={builtIn || isPending}
                   className="font-mono text-xs"
                 />
+              </div>
+              <div className="space-y-1.5">
+                <Textarea
+                  value={field.css}
+                  onChange={(event) => update(index, { css: event.target.value })}
+                  placeholder="字段值 CSS，例如：color: #b45309; background-color: #fffbeb; font-weight: 600"
+                  disabled={isPending}
+                  className="min-h-16 font-mono text-xs"
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  应用于卡片中的字段值；不允许外链、脚本表达式及会脱离卡片布局的属性。
+                </p>
               </div>
             </div>
           )

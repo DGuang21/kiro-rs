@@ -53,7 +53,10 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
-  const [metadata, setMetadata] = useState<CredentialMetadata>({ type: 'normal' })
+  const [metadata, setMetadata] = useState<CredentialMetadata>({
+    type: 'normal',
+    saleStatus: 'not_for_sale',
+  })
 
   const groupOptions = useGroupOptions()
 

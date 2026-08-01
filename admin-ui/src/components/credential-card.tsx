@@ -39,7 +39,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { CredentialMetadataSchema, CredentialStatusItem, BalanceResponse } from "@/types/api";
+import type {
+  CredentialMetadataFieldSchema,
+  CredentialMetadataSchema,
+  CredentialStatusItem,
+  BalanceResponse,
+} from "@/types/api";
 import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/utils";
 import {
   useSetDisabled,
@@ -64,6 +69,7 @@ import { getDisposition } from "@/components/console/credential-state";
 import { railBorderClass } from "@/components/console/rail";
 import { PriorityPreview } from "@/components/console/priority-preview";
 import { CredentialLabel } from "@/components/console/credential-label";
+import { metadataCssToStyle } from "@/lib/credential-metadata-style";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -135,6 +141,140 @@ function formatThrottleCountdown(secs: number): string {
   const s = total % 60;
   const pad = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+function metadataValueLabel(
+  value: unknown,
+  field?: CredentialMetadataFieldSchema,
+): string {
+  const option = field?.oneOf?.find(
+    (item) => JSON.stringify(item.const) === JSON.stringify(value),
+  );
+  if (option) return option.title;
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Schema 字段优先按配置顺序展示，未登记的扩展字段随后按 key 排序。
+ * 空值不占卡片空间，但 false 和 0 都是有效 metadata，必须保留。
+ */
+function metadataEntries(
+  credential: CredentialStatusItem,
+  schema?: CredentialMetadataSchema,
+) {
+  const metadata = credential.metadata ?? { type: "normal" as const };
+  const schemaKeys = Object.keys(schema?.properties ?? {});
+  const extraKeys = Object.keys(metadata)
+    .filter((key) => !schemaKeys.includes(key))
+    .sort((a, b) => a.localeCompare(b));
+
+  return [...schemaKeys, ...extraKeys]
+    .filter((key, index, keys) => keys.indexOf(key) === index)
+    .flatMap((key) => {
+      const value = metadata[key];
+      if (value == null || value === "") return [];
+      const field = schema?.properties[key];
+      return [{
+        key,
+        label: field?.title?.trim() || key,
+        value: key === "salePrice" && typeof value === "number"
+          ? `¥${value.toLocaleString("zh-CN", {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2,
+            })}`
+          : metadataValueLabel(value, field),
+        emphasized: key === "type" && value === "boom",
+        style: metadataCssToStyle(field?.["x-css"]),
+      }];
+    });
+}
+
+function MetadataSummary({
+  credential,
+  schema,
+  compact = false,
+}: {
+  credential: CredentialStatusItem;
+  schema?: CredentialMetadataSchema;
+  compact?: boolean;
+}) {
+  const entries = metadataEntries(credential, schema);
+  if (entries.length === 0) return null;
+
+  if (compact) {
+    return (
+      <div
+        className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden"
+        aria-label="凭据 Metadata"
+      >
+        {entries.map((entry) => (
+          <span
+            key={entry.key}
+            className={`inline-flex min-w-0 max-w-full shrink-0 items-center overflow-hidden rounded-md border px-1.5 py-0.5 text-[11px] ${
+              entry.emphasized
+                ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                : "border-border/60 bg-muted/45 text-foreground"
+            }`}
+            title={`${entry.label}: ${entry.value}`}
+            style={entry.style}
+          >
+            <span className="shrink-0 text-muted-foreground">{entry.label}</span>
+            <span className="mx-1 text-border">·</span>
+            <span className="max-w-40 truncate font-medium">{entry.value}</span>
+          </span>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="min-w-0 overflow-hidden rounded-xl border border-border/60"
+      aria-label="凭据 Metadata"
+    >
+      <div className="bg-muted/50 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        Metadata
+      </div>
+      <table className="w-full table-fixed text-[12px]">
+        <colgroup>
+          <col className="w-[38%]" />
+          <col />
+        </colgroup>
+        <tbody>
+          {entries.map((entry) => (
+            <tr key={entry.key} className="border-t border-border/50">
+              <th
+                scope="row"
+                className="bg-muted/20 px-3 py-1.5 text-left font-normal text-muted-foreground"
+                title={entry.key === entry.label ? undefined : `key: ${entry.key}`}
+              >
+                <span className="block truncate">{entry.label}</span>
+              </th>
+              <td
+                className={`px-3 py-1.5 font-medium ${
+                  entry.emphasized
+                    ? "bg-amber-500/[0.07] text-amber-700 dark:text-amber-300"
+                    : "text-foreground"
+                }`}
+                title={entry.value}
+                style={entry.style}
+              >
+                <span className="block truncate">{entry.value}</span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 /**
@@ -467,18 +607,10 @@ export function CredentialCard({
     .filter(Boolean)
     .join(" ");
 
-  // 订阅 / 状态 / 鉴权 / 分组等徽章 —— 卡片头部与列表行共用
+  // 订阅 / 状态 / 鉴权等徽章 —— 卡片头部与列表行共用。
+  // Metadata 独立展示，避免把账号属性和运行状态混为一谈。
   const badges = (
     <>
-      {credential.metadata?.type === "boom" && (
-        <Badge
-          variant="outline"
-          className="border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-          title="账号类型：炸弹号（仅标记，不参与调度）"
-        >
-          炸弹号
-        </Badge>
-      )}
       {balance?.subscriptionTitle && (
         <SubscriptionBadge
           title={balance.subscriptionTitle}
@@ -735,6 +867,11 @@ export function CredentialCard({
             </span>
           )}
         </div>
+        <MetadataSummary
+          credential={credential}
+          schema={metadataSchema}
+          compact
+        />
       </div>
 
       {/* 关键指标（中大屏） */}
@@ -1036,6 +1173,9 @@ export function CredentialCard({
         <CardContent className="flex flex-1 flex-col space-y-3 px-4 pb-4 sm:space-y-4 sm:px-5 sm:pb-5">
           {/* 归属：分组 / 来源 —— 独立成块，与状态徽章分开 */}
           {groupingBlock}
+
+          {/* 账号属性：按设置中的 Schema 显示名称和枚举文案，扩展 key 同样可见 */}
+          <MetadataSummary credential={credential} schema={metadataSchema} />
 
           {/* 信息行 */}
           <dl className="grid grid-cols-1 gap-2 text-[13px] min-[420px]:grid-cols-2 min-[420px]:gap-x-4">
