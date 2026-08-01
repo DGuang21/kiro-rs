@@ -2082,7 +2082,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={() => setBatchEditDialogOpen(true)}
                 size="sm"
                 variant="ghost"
-                className="h-7 px-2.5 text-xs"
+                className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
                 title="批量编辑分组 / 来源渠道"
               >
                 <Tags className="h-3.5 w-3.5" />
@@ -2092,7 +2092,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={handleBatchVerify}
                 size="sm"
                 variant="ghost"
-                className="h-7 px-2.5 text-xs"
+                className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
                 disabled={verifying}
               >
                 <CheckCircle2
@@ -2106,7 +2106,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={handleBatchForceRefresh}
                 size="sm"
                 variant="ghost"
-                className="h-7 px-2.5 text-xs"
+                className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
                 disabled={batchRefreshing}
               >
                 <RefreshCw
@@ -2120,7 +2120,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={handleBatchResetFailure}
                 size="sm"
                 variant="ghost"
-                className="h-7 px-2.5 text-xs"
+                className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
                 title="清零失败计数并恢复禁用状态"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
@@ -2130,7 +2130,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={handleBatchDelete}
                 size="sm"
                 variant="ghost"
-                className="h-7 px-2.5 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+                disabled={batchDeleting}
+                className="h-8 px-3 text-xs gap-1.5 rounded-full text-destructive hover:bg-destructive/10 hover:text-destructive"
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 删除

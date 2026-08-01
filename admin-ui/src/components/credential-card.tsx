@@ -1427,7 +1427,7 @@ export function CredentialCard({
 
             {/* 底栏 ToolBar */}
             {preview ? (
-              <div className="mt-auto flex items-center justify-end gap-1 pt-2 border-t border-border/40">
+              <div className="mt-auto flex items-center justify-end gap-2 pt-2.5 border-t border-border/40">
                 <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
                   <RefreshCw className="h-4 w-4" />
                 </Button>
@@ -1442,7 +1442,7 @@ export function CredentialCard({
                 </Button>
               </div>
             ) : (
-              <div className="mt-auto flex min-w-0 items-center gap-1 pt-2 border-t border-border/40">
+              <div className="mt-auto flex min-w-0 items-center gap-2 pt-2.5 border-t border-border/40">
                 {!dragDisabled && (
                   <Button
                     ref={setActivatorNodeRef}
