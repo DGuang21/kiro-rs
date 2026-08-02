@@ -2,7 +2,8 @@
 //!
 //! 对接上游"提号"API：配置上游账号（baseUrl + usr-key），查询库存/余额、
 //! 手动或自动提取新 Key、注册并接收 Webhook。收到 `new_keys_available` 时按配置
-//! 自动提号并把 `ksk_` Key 作为 api_key 凭据入库（代理池轮询分配）；收到
+//! 自动提号并把 `ksk_` Key 作为 api_key 凭据入库（代理池轮询分配）；也支持
+//! `key_pulled` 直推协议，收到明文 Key 后立即确认并异步入库。收到
 //! `all_keys_dead` 仅记录事件。
 //!
 //! 持久化：`upstreams.json`（配置，含上游 usr-key，与 credentials.json 同目录）
@@ -28,6 +29,8 @@ pub const KIRO_APP_DEFAULT_BASE_URL: &str = "https://kiroapp.cc";
 const KIRO_APP_DEFAULT_COOLDOWN_SECS: u64 = 180;
 /// Kiro Market（kiroapp.io）开放 API 默认地址。
 pub const KIRO_MARKET_DEFAULT_BASE_URL: &str = "https://kiroapp.io";
+/// Kiro CEO 兼容 API 默认地址。
+pub const KIRO_CEO_DEFAULT_BASE_URL: &str = "https://kiro.ceo";
 /// Kiro Market 分页接口的 page_size 上限。
 const KIRO_MARKET_MAX_PAGE_SIZE: u32 = 500;
 
@@ -38,6 +41,9 @@ const KIRO_MARKET_MAX_PAGE_SIZE: u32 = 500;
 /// - `kiro_market`：Kiro Market（kiroapp.io）`/api/me/* + Bearer km_…`，
 ///   支持接收 webhook，但回调地址只能在平台网页「设置 → Webhook 配置」里填，
 ///   没有注册 API
+/// - `kiro_ceo`：Kiro CEO（kiro.ceo）兼容 `/api/my/* + X-API-Key` 协议
+/// - `kiro_key_webhook`：只接收 `key_pulled` 直推通知，不调用上游 API；可用
+///   `X-Webhook-Secret` 校验来源
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamPlatform {
@@ -45,21 +51,31 @@ pub enum UpstreamPlatform {
     Legacy,
     KiroApp,
     KiroMarket,
+    KiroCeo,
+    KiroKeyWebhook,
 }
 
 impl UpstreamPlatform {
     /// 是否接收上游 webhook 推送（决定 receiver_base_url / 自动提号是否可用）。
     pub fn supports_webhook(self) -> bool {
-        matches!(self, Self::Legacy | Self::KiroMarket)
+        matches!(
+            self,
+            Self::Legacy | Self::KiroMarket | Self::KiroCeo | Self::KiroKeyWebhook
+        )
     }
 
     /// 是否提供「注册/测试回调地址」的 API。Kiro Market 只能在网页里配。
     pub fn can_register_webhook(self) -> bool {
-        matches!(self, Self::Legacy)
+        matches!(self, Self::Legacy | Self::KiroCeo)
     }
 
     pub fn is_legacy(self) -> bool {
-        matches!(self, Self::Legacy)
+        matches!(self, Self::Legacy | Self::KiroCeo)
+    }
+
+    /// 是否只接收上游直接推送的 Key，不提供库存、余额或提号 API。
+    pub fn is_direct_key_webhook(self) -> bool {
+        matches!(self, Self::KiroKeyWebhook)
     }
 
     /// 是否支持按开号批次 `order_id` 只拉取该批次产出的 Key。
@@ -73,6 +89,34 @@ impl UpstreamPlatform {
             Self::Legacy => None,
             Self::KiroApp => Some(KIRO_APP_DEFAULT_BASE_URL),
             Self::KiroMarket => Some(KIRO_MARKET_DEFAULT_BASE_URL),
+            Self::KiroCeo => Some(KIRO_CEO_DEFAULT_BASE_URL),
+            Self::KiroKeyWebhook => None,
+        }
+    }
+}
+
+/// Kiro CEO 库存区域。站点按区域严格隔离，不会跨区补货。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KiroCeoZone {
+    #[default]
+    Us,
+    Eu,
+}
+
+impl KiroCeoZone {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "us" => Some(Self::Us),
+            "eu" => Some(Self::Eu),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Us => "us",
+            Self::Eu => "eu",
         }
     }
 }
@@ -168,6 +212,9 @@ pub struct UpstreamConfig {
     pub receiver_base_url: Option<String>,
     /// 本上游 webhook 接收路径的随机密钥（上游回调时带在 path 上鉴别来源）
     pub webhook_token: String,
+    /// `key_pulled` 直推协议的可选请求头口令；只用于校验，不返回明文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
     /// 是否开启自动提号（收到 new_keys_available 时自动 purchase 并入库）
     #[serde(default)]
     pub auto_purchase_enabled: bool,
@@ -230,6 +277,10 @@ pub struct UpstreamView {
     pub receiver_base_url: Option<String>,
     /// 完整 webhook 接收地址（receiver_base_url + 路径）；未配置 receiver_base_url 时为 None
     pub webhook_receiver_url: Option<String>,
+    /// 是否已经配置直推 webhook secret（不返回 secret 本身）
+    pub webhook_secret_set: bool,
+    /// 从事件日志计算的累计成功入库数量；遇到最近一次重置标记后停止向前累计。
+    pub pickup_total: u64,
     pub auto_purchase_enabled: bool,
     pub auto_purchase_count: u32,
     pub schedule: PurchaseSchedule,
@@ -272,6 +323,8 @@ impl UpstreamConfig {
             masked_api_key: mask_api_key(&self.api_key),
             receiver_base_url: self.receiver_base_url.clone(),
             webhook_receiver_url,
+            webhook_secret_set: self.webhook_secret.is_some(),
+            pickup_total: 0,
             auto_purchase_enabled: self.auto_purchase_enabled,
             auto_purchase_count: self.auto_purchase_count,
             schedule: self.schedule.clone(),
@@ -302,6 +355,10 @@ pub enum UpstreamEventKind {
     KeyRevokedAbuse,
     /// Kiro Market：连通性测试推送（仅记录）
     WebhookTest,
+    /// Kiro API Key 通知：上游直接推送一个 Key，后台异步入库
+    KeyPulled,
+    /// 单个上游的累计取货显示已重置；历史提号事件仍保留
+    PickupTotalReset,
     /// 其他/错误
     Error,
 }
@@ -407,6 +464,7 @@ impl UpstreamManager {
         base_url: String,
         api_key: String,
         receiver_base_url: Option<String>,
+        webhook_secret: Option<String>,
         auto_purchase_enabled: bool,
         auto_purchase_count: u32,
         schedule: Option<PurchaseSchedule>,
@@ -418,7 +476,7 @@ impl UpstreamManager {
         if name.is_empty() {
             anyhow::bail!("上游名称不能为空");
         }
-        if api_key.trim().is_empty() {
+        if platform != UpstreamPlatform::KiroKeyWebhook && api_key.trim().is_empty() {
             anyhow::bail!("上游 API Key 不能为空");
         }
         let cfg = UpstreamConfig {
@@ -429,6 +487,7 @@ impl UpstreamManager {
             api_key: api_key.trim().to_string(),
             receiver_base_url: normalize_opt(receiver_base_url),
             webhook_token: random_hex(32),
+            webhook_secret: normalize_opt(webhook_secret),
             auto_purchase_enabled,
             auto_purchase_count,
             schedule: schedule.unwrap_or_default(),
@@ -440,6 +499,7 @@ impl UpstreamManager {
         };
         let mut cfg = cfg;
         apply_platform_capabilities(&mut cfg);
+        validate_platform_config(&cfg)?;
         let mut inner = self.inner.write();
         inner.push(cfg.clone());
         self.save_locked(&inner);
@@ -456,6 +516,7 @@ impl UpstreamManager {
         base_url: Option<String>,
         api_key: Option<String>,
         receiver_base_url: Option<Option<String>>,
+        webhook_secret: Option<Option<String>>,
         auto_purchase_enabled: Option<bool>,
         auto_purchase_count: Option<u32>,
         schedule: Option<PurchaseSchedule>,
@@ -469,6 +530,7 @@ impl UpstreamManager {
             .iter_mut()
             .find(|u| u.id == id)
             .ok_or_else(|| anyhow::anyhow!("上游不存在: {}", id))?;
+        let original = cfg.clone();
         if let Some(v) = name {
             let v = v.trim().to_string();
             if v.is_empty() {
@@ -490,6 +552,9 @@ impl UpstreamManager {
         }
         if let Some(v) = receiver_base_url {
             cfg.receiver_base_url = normalize_opt(v);
+        }
+        if let Some(v) = webhook_secret {
+            cfg.webhook_secret = normalize_opt(v);
         }
         if let Some(v) = auto_purchase_enabled {
             cfg.auto_purchase_enabled = v;
@@ -513,6 +578,17 @@ impl UpstreamManager {
             cfg.note = normalize_opt(v);
         }
         apply_platform_capabilities(cfg);
+        if original.platform == UpstreamPlatform::KiroKeyWebhook
+            && cfg.platform != UpstreamPlatform::KiroKeyWebhook
+            && cfg.api_key.trim().is_empty()
+        {
+            *cfg = original;
+            anyhow::bail!("上游 API Key 不能为空");
+        }
+        if let Err(error) = validate_platform_config(cfg) {
+            *cfg = original;
+            return Err(error);
+        }
         let cloned = cfg.clone();
         self.save_locked(&inner);
         Ok(cloned)
@@ -532,7 +608,10 @@ impl UpstreamManager {
 }
 
 fn normalized_base_url(platform: UpstreamPlatform, value: &str) -> String {
-    let value = value.trim().trim_end_matches('/');
+    let mut value = value.trim().trim_end_matches('/');
+    if platform == UpstreamPlatform::KiroCeo {
+        value = value.strip_suffix("/api/my").unwrap_or(value);
+    }
     match (value.is_empty(), platform.default_base_url()) {
         (true, Some(default)) => default.to_string(),
         _ => value.to_string(),
@@ -546,6 +625,40 @@ fn apply_platform_capabilities(cfg: &mut UpstreamConfig) {
         cfg.auto_purchase_enabled = false;
         cfg.schedule = PurchaseSchedule::default();
     }
+    if cfg.platform.is_direct_key_webhook() {
+        cfg.base_url.clear();
+        cfg.api_key.clear();
+        cfg.auto_purchase_enabled = false;
+        cfg.auto_purchase_count = 0;
+        cfg.schedule = PurchaseSchedule::default();
+    } else {
+        cfg.webhook_secret = None;
+    }
+}
+
+fn validate_platform_config(cfg: &UpstreamConfig) -> anyhow::Result<()> {
+    if !cfg.platform.is_direct_key_webhook() {
+        return Ok(());
+    }
+
+    let receiver = cfg
+        .receiver_base_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Kiro API Key 通知必须配置本服务 HTTPS 对外地址"))?;
+    let uri = receiver
+        .parse::<http::Uri>()
+        .map_err(|_| anyhow::anyhow!("本服务对外地址不是有效的 HTTPS URL"))?;
+    if uri.scheme_str() != Some("https") || uri.authority().is_none() {
+        anyhow::bail!("Kiro API Key 通知的本服务对外地址必须使用 HTTPS");
+    }
+    if cfg
+        .webhook_secret
+        .as_deref()
+        .is_some_and(|secret| secret.len() > 1024)
+    {
+        anyhow::bail!("Webhook Secret 不能超过 1024 字节");
+    }
+    Ok(())
 }
 
 impl Default for UpstreamManager {
@@ -628,6 +741,39 @@ impl UpstreamEventLog {
         inner.iter().take(limit).cloned().collect()
     }
 
+    /// 单个上游当前显示的累计取货数。
+    ///
+    /// 事件按新到旧保存，因此遇到该上游最近一次重置标记后即可停止；重置之前的
+    /// 历史事件仍原样保留在日志中，只是不再计入显示值。
+    pub fn pickup_total(&self, upstream_id: &str) -> u64 {
+        pickup_total_from_events(self.inner.read().iter(), upstream_id)
+    }
+
+    /// 追加累计重置标记并返回重置前的显示值。持有同一写锁完成计算和插入，避免
+    /// 与并发入库事件交错后产生不确定的对账边界。
+    pub fn reset_pickup_total(&self, upstream_id: &str, upstream_name: &str) -> u64 {
+        let mut inner = self.inner.write();
+        let previous = pickup_total_from_events(inner.iter(), upstream_id);
+        inner.insert(
+            0,
+            make_event(
+                upstream_id,
+                upstream_name,
+                UpstreamEventKind::PickupTotalReset,
+                format!("累计取货已重置（重置前 {} 个），历史记录保留", previous),
+                None,
+                None,
+                None,
+                true,
+            ),
+        );
+        if inner.len() > MAX_EVENTS {
+            inner.truncate(MAX_EVENTS);
+        }
+        self.save_locked(&inner);
+        previous
+    }
+
     /// 取货数据统计：累计 / 今日 / 本周成功入库的 Key 数与提货次数。
     ///
     /// 基于事件日志聚合（成功的自动 / 手动提号事件的 `imported` 求和）。
@@ -655,7 +801,9 @@ impl UpstreamEventLog {
             }
             if !matches!(
                 e.kind,
-                UpstreamEventKind::AutoPurchase | UpstreamEventKind::ManualPurchase
+                UpstreamEventKind::AutoPurchase
+                    | UpstreamEventKind::ManualPurchase
+                    | UpstreamEventKind::KeyPulled
             ) {
                 continue;
             }
@@ -681,6 +829,32 @@ impl UpstreamEventLog {
         }
         s
     }
+}
+
+fn pickup_total_from_events<'a>(
+    events: impl Iterator<Item = &'a UpstreamEvent>,
+    upstream_id: &str,
+) -> u64 {
+    let mut total = 0u64;
+    for event in events {
+        if event.upstream_id != upstream_id {
+            continue;
+        }
+        if event.kind == UpstreamEventKind::PickupTotalReset {
+            break;
+        }
+        if event.ok
+            && matches!(
+                event.kind,
+                UpstreamEventKind::AutoPurchase
+                    | UpstreamEventKind::ManualPurchase
+                    | UpstreamEventKind::KeyPulled
+            )
+        {
+            total = total.saturating_add(event.imported.unwrap_or(0) as u64);
+        }
+    }
+    total
 }
 
 /// 取货数据统计（累计 / 今日 / 本周）
@@ -758,6 +932,39 @@ pub fn default_events_path_in(dir: &Path) -> PathBuf {
 
 // ── 上游 API 客户端 ──────────────────────────────────────────────────────────
 
+/// Kiro CEO `GET /api/my/stock` 的单区库存。
+///
+/// 兼容接口会同时返回 `max`、`available`、`stock` 中的一部分；`max` 是账号本次
+/// 实际可购买量，缺失时依次回退到 `available` 与在架库存 `stock`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct KiroCeoZoneStock {
+    pub zone: KiroCeoZone,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub max: Option<u32>,
+    #[serde(default)]
+    pub available: Option<u32>,
+    #[serde(default)]
+    pub stock: Option<u32>,
+    #[serde(default)]
+    pub key_price: Option<f64>,
+    #[serde(default)]
+    pub unit_price: Option<f64>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl KiroCeoZoneStock {
+    pub fn effective_max(&self) -> u32 {
+        self.max.or(self.available).or(self.stock).unwrap_or(0)
+    }
+
+    pub fn effective_price(&self) -> Option<f64> {
+        self.unit_price.or(self.key_price)
+    }
+}
+
 /// GET /api/my/stock 响应
 #[derive(Debug, Clone, Deserialize)]
 pub struct StockResponse {
@@ -773,6 +980,20 @@ pub struct StockResponse {
     /// 单次购买上限（`max_purchase`）。仅 Kiro Market，来自用户档案。
     #[serde(default)]
     pub max_purchase: Option<u32>,
+    /// Kiro CEO 的分区库存；其他平台为空。
+    #[serde(default)]
+    pub zones: Vec<KiroCeoZoneStock>,
+}
+
+impl StockResponse {
+    /// Kiro CEO 分区本次可购买量。旧响应没有 `zones` 时回退到兼容字段 `max`。
+    pub fn max_for_zone(&self, zone: KiroCeoZone) -> u32 {
+        self.zones
+            .iter()
+            .find(|item| item.zone == zone)
+            .map(KiroCeoZoneStock::effective_max)
+            .unwrap_or(self.max)
+    }
 }
 
 /// GET /api/my/profile 响应。
@@ -1296,6 +1517,7 @@ impl UpstreamClient {
                 balance: None,
                 price_max: None,
                 max_purchase: None,
+                zones: Vec::new(),
             });
         }
         if self.platform == UpstreamPlatform::KiroMarket {
@@ -1311,6 +1533,7 @@ impl UpstreamClient {
                 balance: stock.balance,
                 price_max: stock.price_max,
                 max_purchase: None,
+                zones: Vec::new(),
             });
         }
         let resp = self
@@ -1475,8 +1698,7 @@ impl UpstreamClient {
             Some(items) => items.clone(),
             None => raw,
         };
-        serde_json::from_value(items)
-            .map_err(|e| anyhow::anyhow!("解析令牌列表失败: {}", e))
+        serde_json::from_value(items).map_err(|e| anyhow::anyhow!("解析令牌列表失败: {}", e))
     }
 
     /// POST /api/me/tokens —— 签发令牌。明文只在这里返回一次。
@@ -1524,6 +1746,7 @@ impl UpstreamClient {
         count: u32,
         client_order_id: &str,
         order_id: Option<&str>,
+        kiro_ceo_zone: Option<KiroCeoZone>,
     ) -> anyhow::Result<PurchaseResponse> {
         if self.platform == UpstreamPlatform::KiroMarket {
             let response = self
@@ -1571,15 +1794,13 @@ impl UpstreamClient {
                 keys: keys.into_iter().map(|key| PurchasedKey { key }).collect(),
             });
         }
+        let body = legacy_purchase_body(self.platform, count, client_order_id, kiro_ceo_zone);
         let resp = self
             .client()?
             .post(self.url("/api/my/purchase"))
             .header("X-API-Key", &self.api_key)
             .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "count": count,
-                "client_order_id": client_order_id,
-            }))
+            .json(&body)
             .send()
             .await?;
         Self::parse_json(resp).await
@@ -1640,6 +1861,27 @@ impl UpstreamClient {
     }
 }
 
+fn legacy_purchase_body(
+    platform: UpstreamPlatform,
+    count: u32,
+    client_order_id: &str,
+    kiro_ceo_zone: Option<KiroCeoZone>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "count": count,
+        "client_order_id": client_order_id,
+    });
+    if platform == UpstreamPlatform::KiroCeo
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert(
+            "zone".into(),
+            serde_json::json!(kiro_ceo_zone.unwrap_or_default()),
+        );
+    }
+    body
+}
+
 fn upstream_error_message(text: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     match value.get("error") {
@@ -1684,10 +1926,95 @@ pub fn new_client_order_id() -> String {
 mod tests {
     use super::*;
 
+    fn in_memory_event_log() -> UpstreamEventLog {
+        UpstreamEventLog {
+            inner: RwLock::new(Vec::new()),
+            path: None,
+            seen_event_ids: RwLock::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    fn pickup_event(
+        upstream_id: &str,
+        kind: UpstreamEventKind,
+        imported: u32,
+        ok: bool,
+    ) -> UpstreamEvent {
+        make_event(
+            upstream_id,
+            upstream_id,
+            kind,
+            "test".to_string(),
+            None,
+            None,
+            Some(imported),
+            ok,
+        )
+    }
+
     #[test]
     fn mask_hides_middle() {
         assert_eq!(mask_api_key("usr-abcdefgh"), "usr****fgh");
         assert_eq!(mask_api_key("short"), "****");
+    }
+
+    #[test]
+    fn pickup_total_sums_only_successful_pickups_for_one_upstream() {
+        let log = in_memory_event_log();
+        log.push(pickup_event(
+            "up_a",
+            UpstreamEventKind::AutoPurchase,
+            2,
+            true,
+        ));
+        log.push(pickup_event(
+            "up_a",
+            UpstreamEventKind::ManualPurchase,
+            9,
+            false,
+        ));
+        log.push(pickup_event("up_b", UpstreamEventKind::KeyPulled, 7, true));
+        log.push(pickup_event("up_a", UpstreamEventKind::Error, 100, true));
+        log.push(pickup_event("up_a", UpstreamEventKind::KeyPulled, 1, true));
+
+        assert_eq!(log.pickup_total("up_a"), 3);
+        assert_eq!(log.pickup_total("up_b"), 7);
+    }
+
+    #[test]
+    fn pickup_total_reset_preserves_history_and_starts_a_new_total() {
+        let log = in_memory_event_log();
+        log.push(pickup_event(
+            "up_a",
+            UpstreamEventKind::AutoPurchase,
+            4,
+            true,
+        ));
+        log.push(pickup_event(
+            "up_a",
+            UpstreamEventKind::ManualPurchase,
+            3,
+            true,
+        ));
+        let events_before_reset = log.recent(MAX_EVENTS);
+
+        assert_eq!(log.reset_pickup_total("up_a", "Upstream A"), 7);
+        assert_eq!(log.pickup_total("up_a"), 0);
+        let events_after_reset = log.recent(MAX_EVENTS);
+        assert_eq!(events_after_reset.len(), events_before_reset.len() + 1);
+        assert_eq!(
+            events_after_reset[0].kind,
+            UpstreamEventKind::PickupTotalReset
+        );
+        assert!(events_before_reset.iter().all(|old| {
+            events_after_reset
+                .iter()
+                .any(|current| current.id == old.id)
+        }));
+
+        log.push(pickup_event("up_a", UpstreamEventKind::KeyPulled, 2, true));
+        assert_eq!(log.pickup_total("up_a"), 2);
+        assert_eq!(log.stats().total_keys, 9);
     }
 
     #[test]
@@ -1700,6 +2027,7 @@ mod tests {
                 "https://api.example.com/".into(),
                 "usr-xxx".into(),
                 Some("https://me.example.com".into()),
+                None,
                 true,
                 5,
                 None,
@@ -1734,6 +2062,7 @@ mod tests {
                 "https://a.com".into(),
                 "usr-keep".into(),
                 None,
+                None,
                 false,
                 0,
                 None,
@@ -1749,6 +2078,7 @@ mod tests {
                 None,
                 None,
                 Some("".into()), // 空串 → 不改 api_key
+                None,
                 None,
                 Some(true),
                 Some(3),
@@ -1774,6 +2104,7 @@ mod tests {
                 UpstreamPlatform::Legacy,
                 "https://a.com".into(),
                 "usr".into(),
+                None,
                 None,
                 false,
                 0,
@@ -1814,6 +2145,7 @@ mod tests {
                 "".into(),
                 "secret".into(),
                 Some("https://receiver.example.com".into()),
+                None,
                 true,
                 5,
                 Some(PurchaseSchedule {
@@ -1831,6 +2163,161 @@ mod tests {
         assert!(!cfg.schedule.enabled);
         assert!(!cfg.platform.supports_webhook());
         assert!(mgr.find_by_token(&cfg.webhook_token).is_none());
+    }
+
+    #[test]
+    fn kiro_ceo_uses_legacy_compatible_protocol() {
+        let mgr = UpstreamManager::new();
+        let cfg = mgr
+            .create(
+                "kiro-ceo".into(),
+                UpstreamPlatform::KiroCeo,
+                "https://kiro.ceo/api/my/".into(),
+                "secret".into(),
+                Some("https://receiver.example.com".into()),
+                None,
+                true,
+                5,
+                None,
+                None,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(cfg.base_url, KIRO_CEO_DEFAULT_BASE_URL);
+        assert!(cfg.platform.is_legacy());
+        assert!(cfg.platform.supports_webhook());
+        assert!(cfg.platform.can_register_webhook());
+        assert!(mgr.find_by_token(&cfg.webhook_token).is_some());
+    }
+
+    #[test]
+    fn kiro_ceo_purchase_body_selects_zone_without_changing_legacy() {
+        let eu = legacy_purchase_body(
+            UpstreamPlatform::KiroCeo,
+            2,
+            "0123456789abcdef0123456789abcdef",
+            Some(KiroCeoZone::Eu),
+        );
+        assert_eq!(eu["zone"], "eu");
+
+        let us = legacy_purchase_body(
+            UpstreamPlatform::KiroCeo,
+            2,
+            "0123456789abcdef0123456789abcdef",
+            None,
+        );
+        assert_eq!(us["zone"], "us");
+
+        let legacy = legacy_purchase_body(
+            UpstreamPlatform::Legacy,
+            2,
+            "0123456789abcdef0123456789abcdef",
+            Some(KiroCeoZone::Eu),
+        );
+        assert!(legacy.get("zone").is_none());
+    }
+
+    #[test]
+    fn kiro_ceo_stock_exposes_each_zone_limit() {
+        let stock: StockResponse = serde_json::from_value(serde_json::json!({
+            "max": 8,
+            "key_price": 20,
+            "zones": [
+                { "zone": "us", "max": 8, "unit_price": 20 },
+                { "zone": "eu", "available": 5, "stock": 9, "unit_price": 15 }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(stock.max_for_zone(KiroCeoZone::Us), 8);
+        assert_eq!(stock.max_for_zone(KiroCeoZone::Eu), 5);
+        assert_eq!(stock.zones[1].effective_price(), Some(15.0));
+    }
+
+    #[test]
+    fn direct_key_webhook_requires_https_and_keeps_secret_private() {
+        let mgr = UpstreamManager::new();
+        let cfg = mgr
+            .create(
+                "push".into(),
+                UpstreamPlatform::KiroKeyWebhook,
+                "https://unused.example.com".into(),
+                String::new(),
+                Some("https://receiver.example.com".into()),
+                Some("hook-secret".into()),
+                true,
+                10,
+                Some(PurchaseSchedule {
+                    enabled: true,
+                    ..PurchaseSchedule::default()
+                }),
+                Some("cli".into()),
+                vec!["push-group".into()],
+                None,
+            )
+            .unwrap();
+
+        assert!(cfg.platform.supports_webhook());
+        assert_eq!(cfg.base_url, "");
+        assert_eq!(cfg.api_key, "");
+        assert!(!cfg.auto_purchase_enabled);
+        assert!(!cfg.schedule.enabled);
+        assert_eq!(cfg.webhook_secret.as_deref(), Some("hook-secret"));
+        assert!(mgr.find_by_token(&cfg.webhook_token).is_some());
+
+        let view = cfg.to_view();
+        assert!(view.webhook_secret_set);
+        assert_eq!(
+            view.webhook_receiver_url.as_deref().unwrap(),
+            format!(
+                "https://receiver.example.com/api/upstream/webhook/{}",
+                cfg.webhook_token
+            )
+        );
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(!serialized.contains("hook-secret"));
+
+        let updated = mgr
+            .update(
+                &cfg.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(None),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(updated.webhook_secret.is_none());
+        assert!(!updated.to_view().webhook_secret_set);
+    }
+
+    #[test]
+    fn direct_key_webhook_rejects_non_https_receiver() {
+        let result = UpstreamManager::new().create(
+            "push".into(),
+            UpstreamPlatform::KiroKeyWebhook,
+            String::new(),
+            String::new(),
+            Some("http://receiver.example.com".into()),
+            None,
+            false,
+            0,
+            None,
+            None,
+            vec![],
+            None,
+        );
+        assert!(result.unwrap_err().to_string().contains("HTTPS"));
     }
 
     #[test]
@@ -1912,6 +2399,7 @@ mod tests {
             api_key: "k".into(),
             receiver_base_url: None,
             webhook_token: "t".into(),
+            webhook_secret: None,
             auto_purchase_enabled: true,
             auto_purchase_count: 7,
             schedule: sched,

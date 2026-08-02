@@ -12,19 +12,24 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-export type UpstreamPlatform = 'legacy' | 'kiro_app' | 'kiro_market'
+export type UpstreamPlatform = 'legacy' | 'kiro_app' | 'kiro_market' | 'kiro_ceo' | 'kiro_key_webhook'
+export type KiroCeoZone = 'us' | 'eu'
 
 /** 各平台的默认 baseUrl；legacy 必须用户自填。与后端 `default_base_url()` 保持一致。 */
 export const PLATFORM_DEFAULT_BASE_URL: Record<UpstreamPlatform, string> = {
   legacy: '',
   kiro_app: 'https://kiroapp.cc',
   kiro_market: 'https://kiroapp.io',
+  kiro_ceo: 'https://kiro.ceo',
+  kiro_key_webhook: '',
 }
 
 export const PLATFORM_LABEL: Record<UpstreamPlatform, string> = {
   legacy: 'Webhook API',
   kiro_app: 'KiroApp',
   kiro_market: 'Kiro Market',
+  kiro_ceo: 'Kiro CEO',
+  kiro_key_webhook: 'Kiro Key 通知',
 }
 
 /**
@@ -35,11 +40,15 @@ export const PLATFORM_LABEL: Record<UpstreamPlatform, string> = {
  * 自己贴到平台网页的「设置 → Webhook 配置」里。
  */
 export function supportsWebhook(platform: UpstreamPlatform): boolean {
-  return platform === 'legacy' || platform === 'kiro_market'
+  return platform === 'legacy' || platform === 'kiro_market' || platform === 'kiro_ceo' || platform === 'kiro_key_webhook'
 }
 
 export function canRegisterWebhook(platform: UpstreamPlatform): boolean {
-  return platform === 'legacy'
+  return platform === 'legacy' || platform === 'kiro_ceo'
+}
+
+export function isDirectKeyWebhook(platform: UpstreamPlatform): boolean {
+  return platform === 'kiro_key_webhook'
 }
 
 /** 平台把配额叫「积分」还是「余额」 */
@@ -86,6 +95,10 @@ export interface UpstreamConfig {
   receiverBaseUrl?: string
   /** 完整 webhook 接收地址（receiverBaseUrl + 路径 + token）；未配置 receiverBaseUrl 时为空 */
   webhookReceiverUrl?: string
+  /** 是否已配置 X-Webhook-Secret；不会返回 secret 明文 */
+  webhookSecretSet: boolean
+  /** 从历史提货事件计算，最近一次重置之后的成功入库数量 */
+  pickupTotal: number
   /** 是否开启自动提号 */
   autoPurchaseEnabled: boolean
   /** 自动提号数量（0 = 按 stock.max 提满） */
@@ -114,6 +127,8 @@ export interface UpsertUpstreamRequest {
   /** 明文 apiKey；更新时留空表示不改 */
   apiKey?: string
   receiverBaseUrl?: string | null
+  /** 直推 webhook 的可选口令；null 表示清除 */
+  webhookSecret?: string | null
   autoPurchaseEnabled?: boolean
   autoPurchaseCount?: number
   schedule?: PurchaseSchedule
@@ -130,6 +145,16 @@ export interface StockResponse {
   balance?: number
   /** 仅 Kiro Market：阶梯定价最高价（keyPrice 为最低价） */
   priceMax?: number
+  /** Kiro CEO 的分区库存 */
+  zones?: StockZone[]
+}
+
+export interface StockZone {
+  zone: KiroCeoZone
+  max: number
+  keyPrice?: number
+  label?: string
+  enabled?: boolean
 }
 
 export interface UpstreamProfile {
@@ -179,6 +204,8 @@ export type UpstreamEventKind =
   | 'all_keys_dead'
   | 'auto_purchase'
   | 'manual_purchase'
+  | 'key_pulled'
+  | 'pickup_total_reset'
   | 'error'
 
 export interface UpstreamEvent {
@@ -275,9 +302,27 @@ export async function queryUpstreamStatus(id: string): Promise<Record<string, un
   return data
 }
 
-/** 手动提号并入库。count 传 0 表示按 stock.max 提满 */
-export async function purchaseUpstream(id: string, count: number): Promise<PurchaseResult> {
-  const { data } = await api.post<PurchaseResult>(`/upstream/${id}/purchase`, { count })
+/** 手动提号并入库；Kiro CEO 可显式选择 us / eu。 */
+export async function purchaseUpstream(
+  id: string,
+  count: number,
+  zone?: KiroCeoZone,
+): Promise<PurchaseResult> {
+  const { data } = await api.post<PurchaseResult>(`/upstream/${id}/purchase`, { count, zone })
+  return data
+}
+
+export interface ResetPickupTotalResult {
+  success: boolean
+  previousTotal: number
+  pickupTotal: number
+}
+
+/** 重置单个上游的累计取货显示；后端仅追加分界事件，不删除历史。 */
+export async function resetUpstreamPickupTotal(id: string): Promise<ResetPickupTotalResult> {
+  const { data } = await api.post<ResetPickupTotalResult>(
+    `/upstream/${id}/pickup-total/reset`,
+  )
   return data
 }
 

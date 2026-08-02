@@ -35,11 +35,11 @@ use super::{
     },
     middleware::{AdminState, admin_auth_middleware},
     upstream_handlers::{
-        create_upstream, delete_upstream, list_upstreams, receive_webhook, update_upstream,
-        upstream_created_at, upstream_events, upstream_issue_token, upstream_keys, upstream_ledger,
-        upstream_orders, upstream_profile, upstream_purchase, upstream_redeem,
-        upstream_register_webhook, upstream_revoke_token, upstream_status, upstream_stock,
-        upstream_test_webhook, upstream_tokens,
+        create_upstream, delete_upstream, list_upstreams, receive_webhook,
+        reset_upstream_pickup_total, update_upstream, upstream_created_at, upstream_events,
+        upstream_issue_token, upstream_keys, upstream_ledger, upstream_orders, upstream_profile,
+        upstream_purchase, upstream_redeem, upstream_register_webhook, upstream_revoke_token,
+        upstream_status, upstream_stock, upstream_test_webhook, upstream_tokens,
     },
 };
 
@@ -229,6 +229,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/upstream/{id}/orders", get(upstream_orders))
         .route("/upstream/{id}/status", get(upstream_status))
         .route("/upstream/{id}/purchase", post(upstream_purchase))
+        .route(
+            "/upstream/{id}/pickup-total/reset",
+            post(reset_upstream_pickup_total),
+        )
         // Kiro Market 专属：积分流水 / 兑换码 / API 令牌
         .route("/upstream/{id}/ledger", get(upstream_ledger))
         .route("/upstream/{id}/redeem", post(upstream_redeem))
