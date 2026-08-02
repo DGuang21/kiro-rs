@@ -8,7 +8,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use chrono::{Datelike, Timelike};
@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::middleware::AdminState;
 use super::upstream::{
-    UpstreamEventKind, UpstreamPlatform, WEBHOOK_PATH_PREFIX, make_event, new_client_order_id,
+    KiroCeoZone, UpstreamEventKind, UpstreamPlatform, WEBHOOK_PATH_PREFIX, make_event,
+    new_client_order_id,
 };
 
 // ── 请求体 ───────────────────────────────────────────────────────────────────
@@ -31,6 +32,9 @@ pub struct CreateUpstreamRequest {
     pub api_key: String,
     #[serde(default)]
     pub receiver_base_url: Option<String>,
+    /// `key_pulled` 直推协议可选的 `X-Webhook-Secret` 口令。
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
     #[serde(default)]
     pub auto_purchase_enabled: bool,
     #[serde(default)]
@@ -62,6 +66,9 @@ pub struct UpdateUpstreamRequest {
     /// 传 null 清除，传字符串设置，不传则不改（用 Option<Option<T>> 表达）
     #[serde(default, deserialize_with = "double_option")]
     pub receiver_base_url: Option<Option<String>>,
+    /// 传 null 清除，传字符串设置，不传则不改。
+    #[serde(default, deserialize_with = "double_option")]
+    pub webhook_secret: Option<Option<String>>,
     #[serde(default)]
     pub auto_purchase_enabled: Option<bool>,
     #[serde(default)]
@@ -84,6 +91,9 @@ pub struct ManualPurchaseRequest {
     /// 期望数量；缺省或 0 表示按 stock.max 提满
     #[serde(default)]
     pub count: u32,
+    /// Kiro CEO 库存区域；缺省保持兼容行为，使用美国区。
+    #[serde(default)]
+    pub zone: Option<KiroCeoZone>,
 }
 
 // serde: 区分"字段缺失"与"显式 null"
@@ -109,6 +119,22 @@ pub struct StockView {
     /// 仅 Kiro Market：阶梯定价的最高价（key_price 是最低价）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_max: Option<f64>,
+    /// Kiro CEO 的两区库存；其他平台省略。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<StockZoneView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockZoneView {
+    pub zone: KiroCeoZone,
+    pub max: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,7 +149,16 @@ pub struct PurchaseResult {
 
 /// GET /api/admin/upstream —— 列出所有上游（脱敏）
 pub async fn list_upstreams(State(state): State<AdminState>) -> impl IntoResponse {
-    let views: Vec<_> = state.upstreams.list().iter().map(|u| u.to_view()).collect();
+    let views: Vec<_> = state
+        .upstreams
+        .list()
+        .iter()
+        .map(|upstream| {
+            let mut view = upstream.to_view();
+            view.pickup_total = state.upstream_events.pickup_total(&upstream.id);
+            view
+        })
+        .collect();
     Json(serde_json::json!({ "total": views.len(), "upstreams": views }))
 }
 
@@ -138,6 +173,7 @@ pub async fn create_upstream(
         req.base_url,
         req.api_key,
         req.receiver_base_url,
+        req.webhook_secret,
         req.auto_purchase_enabled,
         req.auto_purchase_count,
         req.schedule,
@@ -145,7 +181,11 @@ pub async fn create_upstream(
         req.groups,
         req.note,
     ) {
-        Ok(cfg) => Json(cfg.to_view()).into_response(),
+        Ok(cfg) => {
+            let mut view = cfg.to_view();
+            view.pickup_total = state.upstream_events.pickup_total(&cfg.id);
+            Json(view).into_response()
+        }
         Err(e) => bad_request(e.to_string()),
     }
 }
@@ -163,6 +203,7 @@ pub async fn update_upstream(
         req.base_url,
         req.api_key,
         req.receiver_base_url,
+        req.webhook_secret,
         req.auto_purchase_enabled,
         req.auto_purchase_count,
         req.schedule,
@@ -171,7 +212,11 @@ pub async fn update_upstream(
         req.enabled,
         req.note,
     ) {
-        Ok(cfg) => Json(cfg.to_view()).into_response(),
+        Ok(cfg) => {
+            let mut view = cfg.to_view();
+            view.pickup_total = state.upstream_events.pickup_total(&cfg.id);
+            Json(view).into_response()
+        }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("不存在") {
@@ -181,6 +226,25 @@ pub async fn update_upstream(
             }
         }
     }
+}
+
+/// POST /api/admin/upstream/{id}/pickup-total/reset
+///
+/// 追加一个对账分界事件，不删除任何历史提货记录。
+pub async fn reset_upstream_pickup_total(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(cfg) = state.upstreams.get(&id) else {
+        return (StatusCode::NOT_FOUND, Json(err_body("上游不存在"))).into_response();
+    };
+    let previous_total = state.upstream_events.reset_pickup_total(&cfg.id, &cfg.name);
+    Json(serde_json::json!({
+        "success": true,
+        "previousTotal": previous_total,
+        "pickupTotal": 0,
+    }))
+    .into_response()
 }
 
 /// DELETE /api/admin/upstream/{id}
@@ -207,13 +271,27 @@ pub async fn upstream_stock(
     };
     let client = state.service.build_upstream_client(&cfg);
     match client.get_stock().await {
-        Ok(s) => Json(StockView {
-            max: s.max,
-            key_price: s.key_price,
-            balance: s.balance,
-            price_max: s.price_max,
-        })
-        .into_response(),
+        Ok(s) => {
+            let zones = s
+                .zones
+                .iter()
+                .map(|zone| StockZoneView {
+                    zone: zone.zone,
+                    max: zone.effective_max(),
+                    key_price: zone.effective_price(),
+                    label: zone.label.clone(),
+                    enabled: zone.enabled,
+                })
+                .collect();
+            Json(StockView {
+                max: s.max,
+                key_price: s.key_price,
+                balance: s.balance,
+                price_max: s.price_max,
+                zones,
+            })
+            .into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(err_body(e.to_string()))).into_response(),
     }
 }
@@ -340,6 +418,8 @@ pub async fn upstream_purchase(
     }
     let order_id = new_client_order_id();
     let count = Some(req.count);
+    let kiro_ceo_zone =
+        (cfg.platform == UpstreamPlatform::KiroCeo).then_some(req.zone.unwrap_or_default());
     let source_channel = Some(cfg.name.clone());
     // 手动提号不限定开号批次，从全量库存里取。
     let result = state
@@ -351,6 +431,7 @@ pub async fn upstream_purchase(
             None,
             cfg.groups.clone(),
             source_channel,
+            kiro_ceo_zone,
         )
         .await;
 
@@ -361,8 +442,13 @@ pub async fn upstream_purchase(
                 &cfg.name,
                 UpstreamEventKind::ManualPurchase,
                 format!(
-                    "手动提号：请求 {} 个，出 Key {} 个，入库 {} 个",
-                    req.count, purchased, imported
+                    "手动提号{}：请求 {} 个，出 Key {} 个，入库 {} 个",
+                    kiro_ceo_zone
+                        .map(|zone| format!("（{}）", zone.as_str()))
+                        .unwrap_or_default(),
+                    req.count,
+                    purchased,
+                    imported
                 ),
                 Some(order_id.clone()),
                 count,
@@ -583,6 +669,9 @@ pub struct WebhookPayload {
     /// Kiro Market 的开号批次 id。原样回传给 `POST /api/me/purchase` 即可只拉该批次的 Key。
     #[serde(default)]
     pub order_id: Option<String>,
+    /// Kiro CEO 补货区域（us / eu）。
+    #[serde(default)]
+    pub zone: Option<String>,
     /// Kiro Market：母号 id，仅记录
     #[serde(default)]
     pub mother_id: Option<String>,
@@ -592,16 +681,30 @@ pub struct WebhookPayload {
     pub new_keys: Option<u32>,
     #[serde(default)]
     pub dead: Option<u32>,
+    /// `key_pulled`：来源平台。
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// `key_pulled`：上游拉取时间（Unix 毫秒）。
+    #[serde(default)]
+    pub pulled_at: Option<i64>,
+    /// `key_pulled`：用于对账的打码 Key。
+    #[serde(default)]
+    pub key_masked: Option<String>,
+    /// `key_pulled`：可直接使用的完整 Kiro API Key。
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 /// POST /api/upstream/webhook/{token}
 ///
+/// - `key_pulled`：先回 200，再在后台将 payload.key 去重入库。
 /// - `new_keys_available`：按上游配置自动提号（若开启），后台异步执行，立即 ack。
 /// - `all_keys_dead`：仅记录事件。
 /// - 未知 token → 404；未知/停用上游 → 404；其余一律 200 ack（避免上游反复重试）。
 pub async fn receive_webhook(
     State(state): State<AdminState>,
     Path(token): Path<String>,
+    headers: HeaderMap,
     Json(payload): Json<WebhookPayload>,
 ) -> impl IntoResponse {
     let Some(cfg) = state.upstreams.find_by_token(&token) else {
@@ -609,6 +712,48 @@ pub async fn receive_webhook(
     };
     if !cfg.enabled {
         return (StatusCode::NOT_FOUND, Json(err_body("上游已禁用"))).into_response();
+    }
+
+    if cfg.platform.is_direct_key_webhook() {
+        if !webhook_secret_authorized(&headers, cfg.webhook_secret.as_deref()) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(err_body("X-Webhook-Secret 校验失败")),
+            )
+                .into_response();
+        }
+        if payload.event != "key_pulled" {
+            return bad_request("Kiro API Key 通知只接受 key_pulled 事件");
+        }
+        let Some(key) = payload
+            .key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+        else {
+            return bad_request("key_pulled 事件缺少 key");
+        };
+        if !key.starts_with("ksk_") {
+            return bad_request("key_pulled 事件的 key 格式无效");
+        }
+
+        let masked_key = payload
+            .key_masked
+            .as_deref()
+            .and_then(safe_masked_key)
+            .unwrap_or_else(|| mask_pushed_key(&key));
+        let provider = payload
+            .provider
+            .as_deref()
+            .and_then(safe_provider)
+            .unwrap_or_else(|| "kiroapp.io".to_string());
+        let pulled_at = payload.pulled_at;
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            import_pushed_key(state2, cfg, key, masked_key, provider, pulled_at).await;
+        });
+        return Json(serde_json::json!({ "ok": true })).into_response();
     }
 
     // 推送失败会重试，同一事件可能送达多次：按 event_id 去重后再处理。
@@ -660,6 +805,23 @@ pub async fn receive_webhook(
             ));
 
             if cfg.auto_purchase_enabled {
+                let kiro_ceo_zone =
+                    match webhook_kiro_ceo_zone(cfg.platform, payload.zone.as_deref()) {
+                        Ok(zone) => zone,
+                        Err(message) => {
+                            state.upstream_events.push(make_event(
+                                &cfg.id,
+                                &cfg.name,
+                                UpstreamEventKind::Error,
+                                message,
+                                payload.purchase_order_id.clone(),
+                                Some(new_keys),
+                                Some(0),
+                                false,
+                            ));
+                            return Json(serde_json::json!({ "ok": true })).into_response();
+                        }
+                    };
                 // 后台异步提号，避免阻塞 webhook 响应；上游重试时 client_order_id 不变 → 幂等
                 let state2 = state.clone();
                 let order_id = payload
@@ -669,7 +831,8 @@ pub async fn receive_webhook(
                 // Kiro Market：把批次 order_id 一并带上，只拉取该批次产出的 Key
                 let upstream_order_id = payload.order_id.clone();
                 tokio::spawn(async move {
-                    run_auto_purchase(state2, cfg, order_id, upstream_order_id).await;
+                    run_auto_purchase(state2, cfg, order_id, upstream_order_id, kiro_ceo_zone)
+                        .await;
                 });
             } else {
                 tracing::info!("上游 {} 未开启自动提号，仅记录通知", cfg.name);
@@ -716,12 +879,68 @@ pub async fn receive_webhook(
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
+/// 直推协议必须尽快 ack；实际入库与事件落盘都在后台完成。
+async fn import_pushed_key(
+    state: AdminState,
+    cfg: super::upstream::UpstreamConfig,
+    key: String,
+    masked_key: String,
+    provider: String,
+    pulled_at: Option<i64>,
+) {
+    let source = pulled_at
+        .map(|timestamp| format!("{} @ {}", provider, timestamp))
+        .unwrap_or(provider);
+    match state.service.upstream_import_pushed_key(&cfg, &key).await {
+        Ok(true) => {
+            tracing::info!("上游 {} 直推 Key 已入库", cfg.name);
+            state.upstream_events.push(make_event(
+                &cfg.id,
+                &cfg.name,
+                UpstreamEventKind::KeyPulled,
+                format!("收到 {} 直推 Key {}，已入库", source, masked_key),
+                None,
+                Some(1),
+                Some(1),
+                true,
+            ));
+        }
+        Ok(false) => {
+            tracing::info!("上游 {} 直推了重复 Key，已忽略", cfg.name);
+            state.upstream_events.push(make_event(
+                &cfg.id,
+                &cfg.name,
+                UpstreamEventKind::KeyPulled,
+                format!("收到 {} 重复直推 Key {}，已去重", source, masked_key),
+                None,
+                Some(1),
+                Some(0),
+                true,
+            ));
+        }
+        Err(error) => {
+            tracing::warn!("上游 {} 直推 Key 入库失败: {}", cfg.name, error);
+            state.upstream_events.push(make_event(
+                &cfg.id,
+                &cfg.name,
+                UpstreamEventKind::KeyPulled,
+                format!("{} 直推 Key {} 入库失败: {}", source, masked_key, error),
+                None,
+                Some(1),
+                Some(0),
+                false,
+            ));
+        }
+    }
+}
+
 /// 执行一次自动提号并入库，结果记入事件日志
 async fn run_auto_purchase(
     state: AdminState,
     cfg: super::upstream::UpstreamConfig,
     order_id: String,
     upstream_order_id: Option<String>,
+    kiro_ceo_zone: Option<KiroCeoZone>,
 ) {
     // 按**北京时间 UTC+8** 当前 (星期几, 小时) 决定提货量（分时段：命中任一高峰规则用高峰量，
     // 否则用低谷量；未启用分时段则用固定量）。不依赖服务器/容器时区。None 表示按 stock.max 提满。
@@ -739,6 +958,7 @@ async fn run_auto_purchase(
             upstream_order_id.as_deref(),
             cfg.groups.clone(),
             source_channel,
+            kiro_ceo_zone,
         )
         .await
     {
@@ -786,6 +1006,61 @@ fn bad_request(msg: impl Into<String>) -> axum::response::Response {
     (StatusCode::BAD_REQUEST, Json(err_body(msg))).into_response()
 }
 
+fn webhook_secret_authorized(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    let Some(expected) = expected.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    headers
+        .get("x-webhook-secret")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|actual| crate::common::auth::constant_time_eq(actual, expected))
+}
+
+fn webhook_kiro_ceo_zone(
+    platform: UpstreamPlatform,
+    value: Option<&str>,
+) -> Result<Option<KiroCeoZone>, String> {
+    if platform != UpstreamPlatform::KiroCeo {
+        return Ok(None);
+    }
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(Some(KiroCeoZone::Us)),
+        Some(value) => KiroCeoZone::parse(value)
+            .map(Some)
+            .ok_or_else(|| format!("Kiro CEO Webhook 区域无效: {value}")),
+    }
+}
+
+fn mask_pushed_key(key: &str) -> String {
+    let prefix: String = key.chars().take(6).collect();
+    format!("{}****", prefix)
+}
+
+fn safe_masked_key(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > 64
+        || !value.contains('*')
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn safe_provider(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// 「不支持注册/测试回调」的提示文案。
 ///
 /// Kiro Market 会推送 webhook，但回调地址只能在平台网页里填，没有注册 API，
@@ -795,6 +1070,67 @@ fn webhook_register_unsupported_hint(platform: UpstreamPlatform) -> &'static str
         UpstreamPlatform::KiroMarket => {
             "Kiro Market 不提供注册接口，请到平台网页「设置 → Webhook 配置」填写回调地址，可在那里发送 test 事件验证连通"
         }
+        UpstreamPlatform::KiroKeyWebhook => {
+            "Kiro API Key 通知没有注册接口，请把生成的 HTTPS 接收地址和可选 Secret 提供给推送方"
+        }
         _ => "当前平台不支持 Webhook",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_key_pulled_payload() {
+        let payload: WebhookPayload = serde_json::from_value(serde_json::json!({
+            "event": "key_pulled",
+            "provider": "kiroapp.io",
+            "pulled_at": 1730300000000_i64,
+            "key_masked": "ksk_ab****",
+            "key": "ksk_live_xxxxxxxx"
+        }))
+        .unwrap();
+
+        assert_eq!(payload.event, "key_pulled");
+        assert_eq!(payload.provider.as_deref(), Some("kiroapp.io"));
+        assert_eq!(payload.pulled_at, Some(1730300000000));
+        assert_eq!(payload.key_masked.as_deref(), Some("ksk_ab****"));
+        assert_eq!(payload.key.as_deref(), Some("ksk_live_xxxxxxxx"));
+    }
+
+    #[test]
+    fn kiro_ceo_webhook_zone_is_strict_and_defaults_to_us() {
+        assert_eq!(
+            webhook_kiro_ceo_zone(UpstreamPlatform::KiroCeo, Some("eu")).unwrap(),
+            Some(KiroCeoZone::Eu)
+        );
+        assert_eq!(
+            webhook_kiro_ceo_zone(UpstreamPlatform::KiroCeo, None).unwrap(),
+            Some(KiroCeoZone::Us)
+        );
+        assert!(webhook_kiro_ceo_zone(UpstreamPlatform::KiroCeo, Some("ap")).is_err());
+        assert_eq!(
+            webhook_kiro_ceo_zone(UpstreamPlatform::KiroMarket, Some("eu")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn webhook_secret_is_optional_and_compared_exactly() {
+        let mut headers = HeaderMap::new();
+        assert!(webhook_secret_authorized(&headers, None));
+        assert!(!webhook_secret_authorized(&headers, Some("secret")));
+
+        headers.insert("x-webhook-secret", "secret".parse().unwrap());
+        assert!(webhook_secret_authorized(&headers, Some("secret")));
+        assert!(!webhook_secret_authorized(&headers, Some("different")));
+    }
+
+    #[test]
+    fn untrusted_masked_key_cannot_put_plain_key_in_events() {
+        assert_eq!(safe_masked_key("ksk_ab****").as_deref(), Some("ksk_ab****"));
+        assert!(safe_masked_key("ksk_live_plaintext").is_none());
+        assert_eq!(mask_pushed_key("ksk_live_xxxxxxxx"), "ksk_li****");
     }
 }

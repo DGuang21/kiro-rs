@@ -2986,6 +2986,7 @@ impl AdminService {
     /// - `client_order_id`：幂等键（自动提号必须传 webhook 的 purchase_order_id）。
     /// - `upstream_order_id`：仅 Kiro Market 有效，来自 webhook 的开号批次 `order_id`，
     ///   只拉取该批次产出的 Key；其他平台忽略。
+    /// - `kiro_ceo_zone`：仅 Kiro CEO 有效；EU Key 入库时写入独立 Auth/API Region。
     /// - `groups` / `source_channel`：入库凭据的分组与来源渠道备注。
     ///
     /// 返回 `(purchased, imported)`：实际出 Key 数与成功入库数。
@@ -3000,6 +3001,7 @@ impl AdminService {
         upstream_order_id: Option<&str>,
         groups: Vec<String>,
         source_channel: Option<String>,
+        kiro_ceo_zone: Option<crate::admin::upstream::KiroCeoZone>,
     ) -> anyhow::Result<(u32, u32)> {
         let client = self.build_upstream_client(cfg);
 
@@ -3012,7 +3014,12 @@ impl AdminService {
             Some(n) if n > 0 => n,
             _ => {
                 let stock = client.get_stock().await?;
-                let mut want = stock.max;
+                let mut want = if cfg.platform == crate::admin::upstream::UpstreamPlatform::KiroCeo
+                {
+                    stock.max_for_zone(kiro_ceo_zone.unwrap_or_default())
+                } else {
+                    stock.max
+                };
                 if cfg.platform == crate::admin::upstream::UpstreamPlatform::KiroMarket {
                     // 限购取自用户档案；查不到就保守放行，让上游自己裁决
                     match client.market_profile().await {
@@ -3038,7 +3045,7 @@ impl AdminService {
 
         // 提号（真实错误原样透出）
         let resp = client
-            .purchase(want, client_order_id, upstream_order_id)
+            .purchase(want, client_order_id, upstream_order_id, kiro_ceo_zone)
             .await?;
 
         let keys: Vec<String> = resp.keys.into_iter().map(|k| k.key).collect();
@@ -3049,6 +3056,7 @@ impl AdminService {
 
         // 代理池可分配 URL（轮询）；为空则不分配（用全局配置）
         let proxy_urls = self.proxy_pool.assignable_urls();
+        let (auth_region, api_region) = api_key_credential_regions(cfg.platform, kiro_ceo_zone);
 
         let mut imported = 0u32;
         for (i, key) in keys.iter().enumerate() {
@@ -3063,6 +3071,8 @@ impl AdminService {
                 cfg.endpoint.clone(),
                 groups.clone(),
                 source_channel.clone(),
+                auth_region.clone(),
+                api_region.clone(),
             );
             // 自动入库不阻塞在余额校验上（fetch_balance = false），失败仅记录不中断整体
             match self.add_credential_inner(req, false).await {
@@ -3074,6 +3084,52 @@ impl AdminService {
         }
 
         Ok((purchased, imported))
+    }
+
+    /// 把直推 webhook 携带的单个 Kiro API Key 入库。
+    ///
+    /// 返回 `true` 表示新入库，`false` 表示该 Key 已存在。重复检测由
+    /// `MultiTokenManager` 基于 Key 哈希完成，因此进程重启后仍然有效。
+    pub async fn upstream_import_pushed_key(
+        &self,
+        cfg: &crate::admin::upstream::UpstreamConfig,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!("Webhook 推送缺少 key");
+        }
+        if !key.starts_with("ksk_") {
+            anyhow::bail!("Webhook 推送的 key 格式无效");
+        }
+
+        let proxy_urls = self.proxy_pool.assignable_urls();
+        let proxy_url = if proxy_urls.is_empty() {
+            None
+        } else {
+            Some(proxy_urls[fastrand::usize(0..proxy_urls.len())].clone())
+        };
+        let req = build_api_key_credential_request(
+            key.to_string(),
+            proxy_url,
+            cfg.endpoint.clone(),
+            cfg.groups.clone(),
+            Some(cfg.name.clone()),
+            None,
+            None,
+        );
+
+        match self.add_credential_inner(req, false).await {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("kiroApiKey 重复") || message.contains("凭据已存在") {
+                    Ok(false)
+                } else {
+                    Err(anyhow::anyhow!(message))
+                }
+            }
+        }
     }
 
     // ============ 错误分类 ============
@@ -3795,6 +3851,8 @@ fn build_api_key_credential_request(
     endpoint: Option<String>,
     groups: Vec<String>,
     source_channel: Option<String>,
+    auth_region: Option<String>,
+    api_region: Option<String>,
 ) -> AddCredentialRequest {
     AddCredentialRequest {
         refresh_token: None,
@@ -3811,8 +3869,8 @@ fn build_api_key_credential_request(
         scopes: None,
         priority: 0,
         region: None,
-        auth_region: None,
-        api_region: None,
+        auth_region,
+        api_region,
         machine_id: None,
         email: None,
         proxy_url,
@@ -3823,6 +3881,18 @@ fn build_api_key_credential_request(
         groups,
         source_channel,
     }
+}
+
+fn api_key_credential_regions(
+    platform: crate::admin::upstream::UpstreamPlatform,
+    zone: Option<crate::admin::upstream::KiroCeoZone>,
+) -> (Option<String>, Option<String>) {
+    if platform == crate::admin::upstream::UpstreamPlatform::KiroCeo
+        && zone == Some(crate::admin::upstream::KiroCeoZone::Eu)
+    {
+        return (Some("eu".to_string()), Some("eu-central-1".to_string()));
+    }
+    (None, None)
 }
 
 fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
@@ -4045,6 +4115,78 @@ mod tests {
         cred.auth_method = Some("api_key".to_string());
         // 无 refreshToken → 跳过
         assert!(credential_to_export_account(cred).is_none());
+    }
+
+    #[test]
+    fn kiro_ceo_eu_keys_get_independent_regions() {
+        use crate::admin::upstream::{KiroCeoZone, UpstreamPlatform};
+
+        let (auth_region, api_region) =
+            api_key_credential_regions(UpstreamPlatform::KiroCeo, Some(KiroCeoZone::Eu));
+        let request = build_api_key_credential_request(
+            "ksk_eu".to_string(),
+            None,
+            Some("cli".to_string()),
+            Vec::new(),
+            Some("Kiro CEO".to_string()),
+            auth_region,
+            api_region,
+        );
+        assert_eq!(request.auth_region.as_deref(), Some("eu"));
+        assert_eq!(request.api_region.as_deref(), Some("eu-central-1"));
+
+        assert_eq!(
+            api_key_credential_regions(UpstreamPlatform::KiroCeo, Some(KiroCeoZone::Us)),
+            (None, None)
+        );
+        assert_eq!(
+            api_key_credential_regions(UpstreamPlatform::Legacy, Some(KiroCeoZone::Eu)),
+            (None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn pushed_key_import_is_persistently_deduplicated() {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), vec!["cli".to_string()]);
+        let cfg = crate::admin::upstream::UpstreamManager::new()
+            .create(
+                "Kiro push".into(),
+                crate::admin::upstream::UpstreamPlatform::KiroKeyWebhook,
+                String::new(),
+                String::new(),
+                Some("https://receiver.example.com".into()),
+                None,
+                false,
+                0,
+                None,
+                Some("cli".into()),
+                vec!["webhook".into()],
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            service
+                .upstream_import_pushed_key(&cfg, "ksk_live_once")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !service
+                .upstream_import_pushed_key(&cfg, "ksk_live_once")
+                .await
+                .unwrap()
+        );
+
+        let credentials = service.get_all_credentials().credentials;
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].endpoint, "cli");
+        assert_eq!(credentials[0].groups, vec!["webhook"]);
+        assert_eq!(credentials[0].source_channel.as_deref(), Some("Kiro push"));
     }
 
     #[test]

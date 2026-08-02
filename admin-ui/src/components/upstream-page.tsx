@@ -9,6 +9,7 @@ import {
   KeyRound,
   Webhook,
   RefreshCw,
+  RotateCcw,
   Loader2,
   Info,
   Copy,
@@ -53,6 +54,7 @@ import {
   purchaseUpstream,
   registerUpstreamWebhook,
   testUpstreamWebhook,
+  resetUpstreamPickupTotal,
   queryUpstreamCreatedAt,
   queryUpstreamOrders,
   queryUpstreamStatus,
@@ -65,10 +67,13 @@ import {
   type PeakWindow,
   type PickupStats,
   type UpstreamPlatform,
+  type KiroCeoZone,
+  type StockZone,
   PLATFORM_DEFAULT_BASE_URL,
   PLATFORM_LABEL,
   supportsWebhook,
   canRegisterWebhook,
+  isDirectKeyWebhook,
   balanceLabel,
 } from '@/api/upstream'
 import { extractErrorMessage } from '@/lib/utils'
@@ -77,6 +82,14 @@ import { extractErrorMessage } from '@/lib/utils'
 function fmtCount(n: number): string {
   return n > 0 ? `×${n}` : '提满'
 }
+
+type UpstreamQueryResult = UpstreamProfile & {
+  max?: number
+  keyPrice?: number
+  priceMax?: number
+  zones?: StockZone[]
+}
+
 interface EditState {
   id?: string
   name: string
@@ -84,6 +97,9 @@ interface EditState {
   baseUrl: string
   apiKey: string
   receiverBaseUrl: string
+  webhookSecret: string
+  webhookSecretEnabled: boolean
+  webhookSecretSet: boolean
   autoPurchaseEnabled: boolean
   autoPurchaseCount: string
   // 分时段：多条高峰规则 + 高峰/低谷两档
@@ -102,6 +118,9 @@ const emptyEdit: EditState = {
   baseUrl: '',
   apiKey: '',
   receiverBaseUrl: '',
+  webhookSecret: '',
+  webhookSecretEnabled: false,
+  webhookSecretSet: false,
   autoPurchaseEnabled: false,
   autoPurchaseCount: '0',
   scheduleEnabled: false,
@@ -124,7 +143,7 @@ const WEEKDAY_LABELS = ['日', '一', '二', '三', '四', '五', '六']
  */
 export function UpstreamPage() {
   const { data: upstreams, isLoading, isFetching, refetch } = useUpstreams()
-  const { data: eventsData } = useUpstreamEvents()
+  const { data: eventsData, refetch: refetchEvents } = useUpstreamEvents()
   const events = eventsData?.events ?? []
   const stats = eventsData?.stats
   const createUpstream = useCreateUpstream()
@@ -138,13 +157,11 @@ export function UpstreamPage() {
 
   // 余额 / 库存缓存：id → 结果
   const [profiles, setProfiles] = useState<
-    Record<
-      string,
-      UpstreamProfile & { max?: number; keyPrice?: number; priceMax?: number }
-    >
+    Record<string, UpstreamQueryResult>
   >({})
   const [loadingId, setLoadingId] = useState<string | null>(null)
   const [purchasingId, setPurchasingId] = useState<string | null>(null)
+  const [resettingId, setResettingId] = useState<string | null>(null)
 
   const list = upstreams ?? []
 
@@ -162,6 +179,9 @@ export function UpstreamPage() {
       baseUrl: u.baseUrl,
       apiKey: '', // 不回填明文，留空表示不改
       receiverBaseUrl: u.receiverBaseUrl ?? '',
+      webhookSecret: '',
+      webhookSecretEnabled: u.webhookSecretSet,
+      webhookSecretSet: u.webhookSecretSet,
       autoPurchaseEnabled: u.autoPurchaseEnabled,
       autoPurchaseCount: String(u.autoPurchaseCount),
       scheduleEnabled: s?.enabled ?? false,
@@ -185,6 +205,19 @@ export function UpstreamPage() {
       const n = parseInt(s, 10)
       return Number.isNaN(n) || n < 0 ? 0 : n
     }
+    const directKeyWebhook = isDirectKeyWebhook(edit.platform)
+    if (directKeyWebhook) {
+      try {
+        if (new URL(edit.receiverBaseUrl.trim()).protocol !== 'https:') throw new Error()
+      } catch {
+        toast.error('Kiro API Key 通知必须配置有效的 HTTPS 对外地址')
+        return
+      }
+      if (edit.webhookSecretEnabled && !edit.webhookSecretSet && !edit.webhookSecret.trim()) {
+        toast.error('已开启 Secret 校验，请填写 Secret')
+        return
+      }
+    }
     // 校验：开启分时段但没配任何高峰规则
     if (supportsWebhook(edit.platform) && edit.scheduleEnabled && edit.peakWindows.length === 0) {
       toast.error('已开启分时段，请至少添加一条高峰时段规则')
@@ -199,13 +232,20 @@ export function UpstreamPage() {
     const req = {
       name: edit.name.trim(),
       platform: edit.platform,
-      baseUrl: edit.baseUrl.trim() || PLATFORM_DEFAULT_BASE_URL[edit.platform],
+      baseUrl: directKeyWebhook
+        ? ''
+        : edit.baseUrl.trim() || PLATFORM_DEFAULT_BASE_URL[edit.platform],
       // Kiro Market 也收 webhook，回调地址与自动提号对它同样有效
       receiverBaseUrl: supportsWebhook(edit.platform)
         ? edit.receiverBaseUrl.trim() || null
         : null,
+      webhookSecret: directKeyWebhook
+        ? edit.webhookSecretEnabled
+          ? edit.webhookSecret.trim() || undefined
+          : null
+        : null,
       autoPurchaseEnabled:
-        supportsWebhook(edit.platform) && edit.autoPurchaseEnabled,
+        !directKeyWebhook && supportsWebhook(edit.platform) && edit.autoPurchaseEnabled,
       autoPurchaseCount: Number.isNaN(count) || count < 0 ? 0 : count,
       schedule,
       endpoint: edit.endpoint.trim() || null,
@@ -220,11 +260,14 @@ export function UpstreamPage() {
         })
         toast.success('上游已更新')
       } else {
-        if (!edit.apiKey.trim()) {
+        if (!directKeyWebhook && !edit.apiKey.trim()) {
           toast.error('上游 API Key 不能为空')
           return
         }
-        await createUpstream.mutateAsync({ ...req, apiKey: edit.apiKey.trim() })
+        await createUpstream.mutateAsync({
+          ...req,
+          apiKey: directKeyWebhook ? '' : edit.apiKey.trim(),
+        })
         toast.success('上游已添加')
       }
       setEditOpen(false)
@@ -251,6 +294,28 @@ export function UpstreamPage() {
     }
   }
 
+  const handleResetPickupTotal = async (u: UpstreamConfig) => {
+    if (
+      !(await confirm({
+        title: `重置 ${u.name} 的累计取货？`,
+        description: `当前累计为 ${u.pickupTotal} 个。重置后从 0 重新计算，历史事件不会删除。`,
+        confirmText: '重置累计',
+        destructive: true,
+      }))
+    )
+      return
+    setResettingId(u.id)
+    try {
+      const result = await resetUpstreamPickupTotal(u.id)
+      await Promise.all([refetch(), refetchEvents()])
+      toast.success(`已重置 ${u.name} 的累计取货（重置前 ${result.previousTotal} 个）`)
+    } catch (e) {
+      toast.error('重置失败: ' + extractErrorMessage(e))
+    } finally {
+      setResettingId(null)
+    }
+  }
+
   // 查询余额 + 库存（并发两个请求）
   const handleQuery = async (u: UpstreamConfig) => {
     setLoadingId(u.id)
@@ -259,16 +324,13 @@ export function UpstreamPage() {
         queryUpstreamProfile(u.id),
         queryUpstreamStock(u.id),
       ])
-      const merged: UpstreamProfile & {
-        max?: number
-        keyPrice?: number
-        priceMax?: number
-      } = {}
+      const merged: UpstreamQueryResult = {}
       if (profile.status === 'fulfilled') Object.assign(merged, profile.value)
       if (stock.status === 'fulfilled') {
         merged.max = stock.value.max
         merged.keyPrice = stock.value.keyPrice
         merged.priceMax = stock.value.priceMax
+        merged.zones = stock.value.zones
         // Kiro Market 的 stock 自带余额：profile 失败时也能显示余额
         if (merged.remaining == null && stock.value.balance != null) {
           merged.remaining = stock.value.balance
@@ -278,8 +340,12 @@ export function UpstreamPage() {
       if (profile.status === 'rejected' && stock.status === 'rejected') {
         toast.error('查询失败: ' + extractErrorMessage(stock.reason))
       } else {
+        const zoneSummary =
+          u.platform === 'kiro_ceo' && merged.zones?.length
+            ? merged.zones.map((zone) => `${zone.zone.toUpperCase()} ${zone.max}`).join(' / ')
+            : `${merged.max ?? '-'} 个`
         toast.success(
-          `${u.name}：${balanceLabel(u.platform)} ${merged.remaining ?? '-'}，可提取 ${merged.max ?? '-'} 个`,
+          `${u.name}：${balanceLabel(u.platform)} ${merged.remaining ?? '-'}，可提取 ${zoneSummary}`,
         )
       }
     } finally {
@@ -290,10 +356,12 @@ export function UpstreamPage() {
   // 手动提号：必须指定数量（弹窗输入）
   const [purchaseTarget, setPurchaseTarget] = useState<UpstreamConfig | null>(null)
   const [purchaseCount, setPurchaseCount] = useState('')
+  const [purchaseZone, setPurchaseZone] = useState<KiroCeoZone>('us')
 
   const openPurchase = (u: UpstreamConfig) => {
     setPurchaseTarget(u)
     setPurchaseCount('')
+    setPurchaseZone('us')
   }
 
   const handlePurchase = async () => {
@@ -305,7 +373,8 @@ export function UpstreamPage() {
     }
     setPurchasingId(purchaseTarget.id)
     try {
-      const res = await purchaseUpstream(purchaseTarget.id, n)
+      const zone = purchaseTarget.platform === 'kiro_ceo' ? purchaseZone : undefined
+      const res = await purchaseUpstream(purchaseTarget.id, n, zone)
       toast.success(`提号完成：出 Key ${res.purchased} 个，入库 ${res.imported} 个`)
       setPurchaseTarget(null)
     } catch (e) {
@@ -314,6 +383,14 @@ export function UpstreamPage() {
       setPurchasingId(null)
     }
   }
+
+  const selectedZoneStock =
+    purchaseTarget?.platform === 'kiro_ceo'
+      ? profiles[purchaseTarget.id]?.zones?.find((zone) => zone.zone === purchaseZone)
+      : undefined
+  const purchaseMax = purchaseTarget
+    ? selectedZoneStock?.max ?? profiles[purchaseTarget.id]?.max
+    : undefined
 
   return (
     <div className="space-y-5">
@@ -359,10 +436,12 @@ export function UpstreamPage() {
               profile={profiles[u.id]}
               loading={loadingId === u.id}
               purchasing={purchasingId === u.id}
+              resetting={resettingId === u.id}
               onQuery={() => handleQuery(u)}
               onPurchase={() => openPurchase(u)}
               onEdit={() => openEdit(u)}
               onDelete={() => handleDelete(u)}
+              onResetPickupTotal={() => handleResetPickupTotal(u)}
             />
           ))}
         </div>
@@ -390,15 +469,48 @@ export function UpstreamPage() {
               手动提号必须指定数量。将提取并作为 api_key 凭据入库（代理池轮询分配），产生真实消费。
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-1.5 py-2">
+          <div className="space-y-3 py-2">
+            {purchaseTarget?.platform === 'kiro_ceo' && (
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">库存区域</label>
+                <div className="grid grid-cols-2 rounded-md border p-1" role="radiogroup" aria-label="库存区域">
+                  {(['us', 'eu'] as const).map((zone) => (
+                    <Button
+                      key={zone}
+                      type="button"
+                      size="sm"
+                      variant={purchaseZone === zone ? 'default' : 'ghost'}
+                      role="radio"
+                      aria-checked={purchaseZone === zone}
+                      onClick={() => setPurchaseZone(zone)}
+                      disabled={!!purchasingId}
+                      className="h-8"
+                    >
+                      {zone === 'us' ? 'US 美国区' : 'EU 欧洲区'}
+                      {profiles[purchaseTarget.id]?.zones && (
+                        <span className="ml-1 text-xs opacity-75">
+                          {profiles[purchaseTarget.id]?.zones?.find((item) => item.zone === zone)?.max ?? 0}
+                        </span>
+                      )}
+                    </Button>
+                  ))}
+                </div>
+                {purchaseZone === 'eu' && (
+                  <p className="text-xs text-muted-foreground">
+                    EU Key 将使用 Auth Region eu、API Region eu-central-1。
+                  </p>
+                )}
+              </div>
+            )}
+            <div className="space-y-1.5">
             <label className="text-sm font-medium">提货数量 <span className="text-red-500">*</span></label>
             <Input
               type="number"
               min={1}
-              max={purchaseTarget ? profiles[purchaseTarget.id]?.max ?? undefined : undefined}
+              max={purchaseMax}
               placeholder={
-                purchaseTarget && profiles[purchaseTarget.id]?.max
-                  ? `1 ~ ${profiles[purchaseTarget.id]?.max}`
+                purchaseMax
+                  ? `1 ~ ${purchaseMax}`
                   : '请输入要提取的数量'
               }
               value={purchaseCount}
@@ -407,6 +519,7 @@ export function UpstreamPage() {
               autoFocus
               autoComplete="off"
             />
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setPurchaseTarget(null)} disabled={!!purchasingId}>
@@ -454,23 +567,23 @@ function UpstreamCard({
   profile,
   loading,
   purchasing,
+  resetting,
   onQuery,
   onPurchase,
   onEdit,
   onDelete,
+  onResetPickupTotal,
 }: {
   upstream: UpstreamConfig
-  profile?: UpstreamProfile & {
-    max?: number
-    keyPrice?: number
-    priceMax?: number
-  }
+  profile?: UpstreamQueryResult
   loading: boolean
   purchasing: boolean
+  resetting: boolean
   onQuery: () => void
   onPurchase: () => void
   onEdit: () => void
   onDelete: () => void
+  onResetPickupTotal: () => void
 }) {
   const [registering, setRegistering] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -521,6 +634,12 @@ function UpstreamCard({
                 {PLATFORM_LABEL[upstream.platform] ?? upstream.platform}
               </Badge>
               {!upstream.enabled && <Badge variant="outline" className="text-xs text-muted-foreground">已禁用</Badge>}
+              {isDirectKeyWebhook(upstream.platform) && (
+                <Badge variant="secondary" className="text-xs gap-1 shrink-0">
+                  <Webhook className="h-3 w-3" />
+                  自动入库
+                </Badge>
+              )}
               {upstream.autoPurchaseEnabled && (
                 <Badge variant="secondary" className="text-xs gap-1 shrink-0">
                   <Zap className="h-3 w-3" />
@@ -530,7 +649,13 @@ function UpstreamCard({
                 </Badge>
               )}
             </div>
-            <div className="text-xs text-muted-foreground font-mono truncate">Key: {upstream.maskedApiKey}</div>
+            {isDirectKeyWebhook(upstream.platform) ? (
+              <div className="text-xs text-muted-foreground">
+                Secret: {upstream.webhookSecretSet ? '已配置' : '未配置'}
+              </div>
+            ) : (
+              <div className="text-xs text-muted-foreground font-mono truncate">Key: {upstream.maskedApiKey}</div>
+            )}
             {upstream.note && <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{upstream.note}</p>}
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -549,16 +674,40 @@ function UpstreamCard({
           </div>
         </div>
 
+        <div className="flex h-8 items-center gap-2 rounded-md bg-secondary/40 px-2.5 text-xs">
+          <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-muted-foreground">累计取货</span>
+          <span className="font-semibold tabular-nums">{upstream.pickupTotal}</span>
+          <span className="text-muted-foreground">个</span>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="ml-auto h-6 w-6"
+            onClick={onResetPickupTotal}
+            disabled={resetting}
+            title="重置累计取货（保留历史记录）"
+          >
+            <RotateCcw className={`h-3.5 w-3.5 ${resetting ? 'animate-spin' : ''}`} />
+          </Button>
+        </div>
+
         {/* 余额 / 库存 */}
-        {profile && (
+        {!isDirectKeyWebhook(upstream.platform) && profile && (
           <div className="flex flex-wrap items-center gap-2 text-xs">
             {profile.remaining != null && (
               <Badge variant="secondary" className="gap-1"><Wallet className="h-3 w-3" />{balanceLabel(upstream.platform)} {profile.remaining}</Badge>
             )}
-            {profile.max != null && (
+            {upstream.platform === 'kiro_ceo' && profile.zones?.map((zone) => (
+              <Badge key={zone.zone} variant="secondary" className="gap-1">
+                <KeyRound className="h-3 w-3" />
+                {zone.zone.toUpperCase()} {zone.max} 个
+                {zone.keyPrice != null ? ` · ${zone.keyPrice} 积分` : ''}
+              </Badge>
+            ))}
+            {!(upstream.platform === 'kiro_ceo' && profile.zones?.length) && profile.max != null && (
               <Badge variant="secondary" className="gap-1"><KeyRound className="h-3 w-3" />可提取 {profile.max} 个</Badge>
             )}
-            {profile.keyPrice != null && (
+            {!(upstream.platform === 'kiro_ceo' && profile.zones?.length) && profile.keyPrice != null && (
               <Badge variant="secondary" className="gap-1">
                 单价{' '}
                 {profile.priceMax != null && profile.priceMax !== profile.keyPrice
@@ -576,7 +725,9 @@ function UpstreamCard({
             <span className="flex-1 min-w-0 truncate text-[11px] text-muted-foreground">
               {canRegisterWebhook(upstream.platform)
                 ? '回调地址已配置 ·····'
-                : '回调地址已生成 ····· 需手动填到平台网页'}
+                : isDirectKeyWebhook(upstream.platform)
+                  ? '接收地址已生成 ····· 请提供给推送方'
+                  : '回调地址已生成 ····· 需手动填到平台网页'}
             </span>
             <Button size="icon" variant="ghost" className="h-6 w-6" onClick={copyWebhook} title="复制完整接收地址">
               <Copy className="h-3 w-3" />
@@ -588,14 +739,18 @@ function UpstreamCard({
 
         {/* 操作 */}
         <div className="flex flex-wrap items-center gap-1.5">
-          <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onQuery} disabled={loading}>
-            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />}
-            {upstream.platform === 'legacy' ? '查询余额' : '查询库存'}
-          </Button>
-          <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onPurchase} disabled={purchasing}>
-            {purchasing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
-            提号入库
-          </Button>
+          {!isDirectKeyWebhook(upstream.platform) && (
+            <>
+              <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onQuery} disabled={loading}>
+                {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />}
+                {upstream.platform === 'legacy' ? '查询余额' : '查询库存'}
+              </Button>
+              <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onPurchase} disabled={purchasing}>
+                {purchasing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
+                提号入库
+              </Button>
+            </>
+          )}
           {canRegisterWebhook(upstream.platform) && (
             <>
               <Button
@@ -780,7 +935,10 @@ function eventIcon(e: UpstreamEvent) {
       return <AlertCircle className="h-4 w-4 text-yellow-500 shrink-0" />
     case 'auto_purchase':
     case 'manual_purchase':
+    case 'key_pulled':
       return <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
+    case 'pickup_total_reset':
+      return <RotateCcw className="h-4 w-4 text-amber-500 shrink-0" />
     default:
       return <Info className="h-4 w-4 text-muted-foreground shrink-0" />
   }
@@ -978,6 +1136,15 @@ function UpstreamEditDialog({
     const baseUrl = defaults.includes(edit.baseUrl)
       ? PLATFORM_DEFAULT_BASE_URL[platform]
       : edit.baseUrl || PLATFORM_DEFAULT_BASE_URL[platform]
+    if (isDirectKeyWebhook(platform)) {
+      set({
+        platform,
+        baseUrl: '',
+        autoPurchaseEnabled: false,
+        scheduleEnabled: false,
+      })
+      return
+    }
     // 不收 webhook 的平台清掉回调与自动提号，避免留下无效配置
     if (!supportsWebhook(platform)) {
       set({
@@ -1025,41 +1192,91 @@ function UpstreamEditDialog({
                 <SelectItem value="legacy">千羽架构</SelectItem>
                 <SelectItem value="kiro_app">KiroApp</SelectItem>
                 <SelectItem value="kiro_market">Kiro Market</SelectItem>
+                <SelectItem value="kiro_ceo">Kiro CEO</SelectItem>
+                <SelectItem value="kiro_key_webhook">Kiro API Key 通知</SelectItem>
               </SelectContent>
             </Select>
           </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">API 基础地址</label>
-            <Input
-              placeholder={PLATFORM_DEFAULT_BASE_URL[edit.platform] || 'https://api.example.com'}
-              value={edit.baseUrl}
-              onChange={(e) => set({ baseUrl: e.target.value })}
-              disabled={saving}
-              className="font-mono text-sm"
-              autoComplete="off"
-            />
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">
-              上游 API Key {edit.id ? <span className="text-xs text-muted-foreground">（留空不修改）</span> : <span className="text-red-500">*</span>}
-            </label>
-            <Input
-              type="password"
-              placeholder={
-                edit.platform === 'kiro_market'
-                  ? 'km_xxxxxxxx（设置 → API 令牌 生成）'
-                  : edit.platform === 'kiro_app'
-                    ? 'KiroApp Open API Key'
-                    : 'usr-xxxxxxxx'
-              }
-              value={edit.apiKey}
-              onChange={(e) => set({ apiKey: e.target.value })}
-              disabled={saving}
-              className="font-mono text-sm"
-              autoComplete="new-password"
-            />
-          </div>
-          {supportsWebhook(edit.platform) && (
+          {!isDirectKeyWebhook(edit.platform) && (
+            <>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">API 基础地址</label>
+                <Input
+                  placeholder={PLATFORM_DEFAULT_BASE_URL[edit.platform] || 'https://api.example.com'}
+                  value={edit.baseUrl}
+                  onChange={(e) => set({ baseUrl: e.target.value })}
+                  disabled={saving}
+                  className="font-mono text-sm"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">
+                  上游 API Key {edit.id ? <span className="text-xs text-muted-foreground">（留空不修改）</span> : <span className="text-red-500">*</span>}
+                </label>
+                <Input
+                  type="password"
+                  placeholder={
+                    edit.platform === 'kiro_market'
+                      ? 'km_xxxxxxxx（设置 → API 令牌 生成）'
+                      : edit.platform === 'kiro_ceo'
+                        ? 'Kiro CEO API Key'
+                        : edit.platform === 'kiro_app'
+                          ? 'KiroApp Open API Key'
+                          : 'usr-xxxxxxxx'
+                  }
+                  value={edit.apiKey}
+                  onChange={(e) => set({ apiKey: e.target.value })}
+                  disabled={saving}
+                  className="font-mono text-sm"
+                  autoComplete="new-password"
+                />
+              </div>
+            </>
+          )}
+          {isDirectKeyWebhook(edit.platform) && (
+            <>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">HTTPS 接收地址 <span className="text-red-500">*</span></label>
+                <Input
+                  placeholder="https://your-host:8990"
+                  value={edit.receiverBaseUrl}
+                  onChange={(e) => set({ receiverBaseUrl: e.target.value })}
+                  disabled={saving}
+                  className="font-mono text-sm"
+                  autoComplete="off"
+                />
+                <p className="text-xs text-muted-foreground">
+                  保存后复制生成的完整接收地址并提供给推送方。
+                </p>
+              </div>
+              <div className="space-y-2 rounded-xl border p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <div className="text-sm font-medium">校验 Webhook Secret</div>
+                    <p className="text-xs text-muted-foreground">校验请求头 X-Webhook-Secret</p>
+                  </div>
+                  <Switch
+                    checked={edit.webhookSecretEnabled}
+                    onCheckedChange={(enabled) => set({ webhookSecretEnabled: enabled })}
+                    disabled={saving}
+                  />
+                </div>
+                {edit.webhookSecretEnabled && (
+                  <Input
+                    type="password"
+                    placeholder={edit.webhookSecretSet ? '已配置；留空不修改' : '输入约定的 Secret'}
+                    value={edit.webhookSecret}
+                    onChange={(e) => set({ webhookSecret: e.target.value })}
+                    disabled={saving}
+                    className="font-mono text-sm"
+                    autoComplete="new-password"
+                  />
+                )}
+              </div>
+            </>
+          )}
+          {!isDirectKeyWebhook(edit.platform) && supportsWebhook(edit.platform) && (
             <>
               <div className="space-y-1.5">
                 <label className="text-sm font-medium">本服务对外地址</label>
