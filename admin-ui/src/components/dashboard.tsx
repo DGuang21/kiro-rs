@@ -2027,13 +2027,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               },
             ]}
             trailing={
-              <div className="inline-flex items-center gap-1.5 rounded-full border border-border/50 bg-background/60 px-2.5 py-1 text-xs text-muted-foreground backdrop-blur-xs">
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground">
                 <span
                   className={cn(
-                    "h-2 w-2 rounded-full",
+                    "h-2 w-2 rounded-sm",
                     loadBalancingData?.mode === "balanced"
-                      ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)] animate-pulse"
-                      : "bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]"
+                      ? "bg-emerald-500 animate-pulse"
+                      : "bg-blue-500"
                   )}
                 />
                 {loadBalancingData?.mode === "balanced" ? (

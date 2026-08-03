@@ -922,7 +922,7 @@ export function CredentialCard({
           >
             {failureStats ? (
               <span className="tabular-nums font-mono">
-                <span className="text-destructive font-bold">{failureStats.auth}</span>
+                <span className="text-destructive font-semibold">{failureStats.auth}</span>
                 <span className="text-muted-foreground/40">/</span>
                 <span className="text-amber-600 dark:text-amber-400">{failureStats.throttle}</span>
                 <span className="text-muted-foreground/40">/</span>
@@ -932,7 +932,7 @@ export function CredentialCard({
               <span
                 className={
                   credential.totalFailureCount > 0
-                    ? "font-mono font-bold text-destructive"
+                    ? "font-mono font-semibold text-destructive"
                     : "font-mono text-muted-foreground"
                 }
               >
@@ -1163,7 +1163,7 @@ export function CredentialCard({
                     onClick={() => {
                       if (!preview) setEditingPriority(true);
                     }}
-                    className={`mt-0.5 inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-xs font-bold border transition-colors hover:brightness-105 ${railChipClass(disposition.tone)}`}
+                    className={`mt-0.5 inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-xs font-semibold border transition-colors hover:brightness-105 ${railChipClass(disposition.tone)}`}
                     title={credential.isCurrent ? "当前调度优先凭据 · 点击编辑优先级" : "点击编辑优先级（数字越小越先被使用）"}
                   >
                     {credential.isCurrent && (
@@ -1184,7 +1184,7 @@ export function CredentialCard({
                   type="button"
                   onClick={preview ? undefined : handleResetSuccess}
                   disabled={preview}
-                  className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs font-bold text-emerald-600 dark:text-emerald-400 hover:text-emerald-500 transition-colors"
+                  className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs font-semibold text-emerald-600 dark:text-emerald-400 hover:text-emerald-500 transition-colors"
                   title="点击重置成功次数"
                 >
                   {credential.successCount}
@@ -1201,7 +1201,7 @@ export function CredentialCard({
                   type="button"
                   onClick={preview ? undefined : () => setShowFailuresDialog(true)}
                   disabled={preview}
-                  className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs font-bold hover:text-primary transition-colors"
+                  className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs font-semibold hover:text-primary transition-colors"
                   title="查看失败日志"
                 >
                   {failureStats ? (
@@ -1280,7 +1280,7 @@ export function CredentialCard({
                         剩余可用
                       </div>
                       <div
-                        className={`console-num font-mono text-xl font-bold tracking-tight ${
+                        className={`console-num font-mono text-xl font-semibold tracking-tight ${
                           balance.remaining < 0
                             ? "text-red-600 dark:text-red-400"
                             : balance.remaining === 0
