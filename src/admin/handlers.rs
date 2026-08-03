@@ -22,7 +22,7 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
+        CreateClientKeyResponse, ModelTestRequest,
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
@@ -714,9 +714,7 @@ pub async fn complete_social_login(
 /// GET /api/admin/config/global-proxy
 /// 获取当前全局代理配置
 pub async fn get_global_proxy(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(GlobalProxyResponse {
-        proxy_url: state.service.get_global_proxy(),
-    })
+    Json(state.service.get_global_proxy())
 }
 
 /// PUT /api/admin/config/global-proxy
@@ -725,7 +723,10 @@ pub async fn set_global_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<SetGlobalProxyRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_global_proxy(payload.proxy_url) {
+    match state
+        .service
+        .set_global_proxy(payload.proxy_url, payload.proxy_username, payload.proxy_password)
+    {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

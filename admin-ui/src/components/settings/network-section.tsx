@@ -14,12 +14,8 @@ import { reportSaveError } from '@/components/settings/report-error'
 /**
  * 网络分区：全局出站代理。
  *
- * 这一项是即时保存范式里唯一的例外，理由具体：代理地址填错会让**所有**上游请求
- * 立刻失败，而失焦即提交意味着输到一半切走焦点就会生效。所以这里要求显式「应用」，
- * 并且做基本的协议校验。
- *
- * 按凭据分配的代理池仍在凭据页的「IP 代理池管理」里 —— 那是每凭据的绑定关系，
- * 属于凭据数据而非全局配置。
+ * 代理地址填错会让**所有**上游请求立刻失败，所以要求显式「应用」按钮，
+ * 并对 URL 做基本协议校验。
  */
 const PROXY_SCHEMES = ['http://', 'https://', 'socks5://', 'socks5h://']
 
@@ -29,15 +25,33 @@ export function NetworkSection() {
   const saver = useFieldSaver(mutate, reportSaveError)
   const isPending = saver.isSaving('proxy')
   const saved = saver.isSaved('proxy')
-  const current = data?.proxyUrl ?? null
-  const [draft, setDraft] = useState('')
+
+  const currentUrl = data?.proxyUrl ?? null
+  const currentUsername = data?.proxyUsername ?? null
+  const currentPassword = data?.proxyPassword ?? null
+
+  const [draftUrl, setDraftUrl] = useState('')
+  const [draftUsername, setDraftUsername] = useState('')
+  const [draftPassword, setDraftPassword] = useState('')
 
   useEffect(() => {
-    setDraft(current ?? '')
-  }, [current])
+    setDraftUrl(currentUrl ?? '')
+    setDraftUsername(currentUsername ?? '')
+    setDraftPassword(currentPassword ?? '')
+  }, [currentUrl, currentUsername, currentPassword])
+
+  const buildPayload = () => {
+    const url = draftUrl.trim() || null
+    if (!url) return null
+    return {
+      proxyUrl: url,
+      proxyUsername: draftUsername.trim() || null,
+      proxyPassword: draftPassword || null,
+    }
+  }
 
   const apply = () => {
-    const url = draft.trim()
+    const url = draftUrl.trim()
     if (!url) {
       toast.error('代理地址不能为空。要停用请点「清除」。')
       return
@@ -46,38 +60,41 @@ export function NetworkSection() {
       toast.error(`代理地址需以 ${PROXY_SCHEMES.join(' / ')} 开头`)
       return
     }
-    if (url === current) return
-    saver.save('proxy', { proxyUrl: url })
+    const payload = buildPayload()
+    if (!payload) return
+    saver.save('proxy', payload)
   }
 
   const clear = () => {
+    setDraftUrl('')
+    setDraftUsername('')
+    setDraftPassword('')
     saver.save('proxy', { proxyUrl: null })
   }
+
+  const hint = currentUrl
+    ? `当前生效：${maskProxyUrl(currentUrl)}${currentUsername ? ` (${currentUsername})` : ''}`
+    : '未配置，直连上游。支持 http / https / socks5，可填写认证凭据'
 
   return (
     <SettingGroup
       title="全局出站代理"
       description="所有上游请求默认走这个代理；未绑定专属代理的凭据都受它影响"
     >
-      <SettingRow
-        label="代理地址"
-        hint={
-          current
-            ? `当前生效：${maskProxyUrl(current)}`
-            : '未配置，直连上游。支持 http / https / socks5，可带 user:pass 认证'
-        }
-        pending={isPending}
-        saved={saved}
-      >
+      <SettingRow label="代理地址" hint={hint} pending={isPending} saved={saved}>
         <div className="flex flex-wrap items-center gap-1.5">
           <Input
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            value={draftUrl}
+            onChange={(e) => setDraftUrl(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') apply()
-              if (e.key === 'Escape') setDraft(current ?? '')
+              if (e.key === 'Escape') {
+                setDraftUrl(currentUrl ?? '')
+                setDraftUsername(currentUsername ?? '')
+                setDraftPassword(currentPassword ?? '')
+              }
             }}
-            placeholder="socks5://user:pass@host:1080"
+            placeholder="socks5://host:1080"
             disabled={isLoading || isPending}
             spellCheck={false}
             autoComplete="off"
@@ -87,11 +104,11 @@ export function NetworkSection() {
             size="sm"
             variant="outline"
             onClick={apply}
-            disabled={isLoading || isPending || !draft.trim() || draft.trim() === current}
+            disabled={isLoading || isPending || !draftUrl.trim()}
           >
             应用
           </Button>
-          {current && (
+          {currentUrl && (
             <Button
               size="sm"
               variant="ghost"
@@ -104,6 +121,50 @@ export function NetworkSection() {
           )}
         </div>
       </SettingRow>
+
+      {(currentUrl || draftUrl.trim()) && (
+        <>
+          <SettingRow
+            label="认证用户名"
+            hint="选填，代理要求 Basic Auth 时填写"
+            pending={isPending}
+            saved={saved}
+          >
+            <Input
+              value={draftUsername}
+              onChange={(e) => setDraftUsername(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') setDraftUsername(currentUsername ?? '')
+              }}
+              placeholder="留空则不认证"
+              disabled={isLoading || isPending}
+              spellCheck={false}
+              autoComplete="off"
+              className="console-num h-8 w-[min(16rem,50vw)] text-[12.5px]"
+            />
+          </SettingRow>
+          <SettingRow
+            label="认证密码"
+            hint="选填，与用户名配合使用"
+            pending={isPending}
+            saved={saved}
+          >
+            <Input
+              type="password"
+              value={draftPassword}
+              onChange={(e) => setDraftPassword(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') setDraftPassword(currentPassword ?? '')
+              }}
+              placeholder="留空则不认证"
+              disabled={isLoading || isPending}
+              spellCheck={false}
+              autoComplete="new-password"
+              className="console-num h-8 w-[min(16rem,50vw)] text-[12.5px]"
+            />
+          </SettingRow>
+        </>
+      )}
     </SettingGroup>
   )
 }

@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::admin::types::GlobalProxyResponse;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
@@ -1571,13 +1572,23 @@ impl AdminService {
         }
     }
 
-    /// 获取全局代理 URL
-    pub fn get_global_proxy(&self) -> Option<String> {
-        self.token_manager.proxy().map(|p| p.url.clone())
+    /// 获取全局代理配置
+    pub fn get_global_proxy(&self) -> GlobalProxyResponse {
+        let proxy = self.token_manager.proxy();
+        GlobalProxyResponse {
+            proxy_url: proxy.as_ref().map(|p| p.url.clone()),
+            proxy_username: proxy.as_ref().and_then(|p| p.username.clone()),
+            proxy_password: proxy.as_ref().and_then(|p| p.password.clone()),
+        }
     }
 
-    /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
-    pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
+    /// 设置全局代理配置（None url 表示清除）并持久化到配置文件
+    pub fn set_global_proxy(
+        &self,
+        url: Option<String>,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Result<(), AdminServiceError> {
         if let Some(ref u) = url {
             let valid_prefix = u.starts_with("http://")
                 || u.starts_with("https://")
@@ -1591,12 +1602,24 @@ impl AdminService {
             }
         }
 
-        let proxy = url.as_deref().map(ProxyConfig::new);
+        let username_for_save = username.clone().filter(|s| !s.is_empty());
+        let password_for_save = password.clone().filter(|s| !s.is_empty());
+
+        let proxy = url.as_deref().map(|u| {
+            let mut cfg = ProxyConfig::new(u);
+            cfg.username = username_for_save.clone();
+            cfg.password = password_for_save.clone();
+            cfg
+        });
         self.token_manager.set_global_proxy(proxy);
 
         // 从磁盘加载最新 config 再写，避免覆盖其他字段的并发修改
         let url_for_save = url;
-        self.update_config_file(move |c| c.proxy_url = url_for_save);
+        self.update_config_file(move |c| {
+            c.proxy_url = url_for_save;
+            c.proxy_username = username_for_save;
+            c.proxy_password = password_for_save;
+        });
         Ok(())
     }
 

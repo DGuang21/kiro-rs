@@ -716,6 +716,10 @@ pub struct AssignProxyRequest {
 pub struct GlobalProxyResponse {
     /// 当前全局代理 URL（null 表示未配置）
     pub proxy_url: Option<String>,
+    /// 代理认证用户名
+    pub proxy_username: Option<String>,
+    /// 代理认证密码
+    pub proxy_password: Option<String>,
 }
 
 /// 设置全局代理请求
@@ -724,6 +728,12 @@ pub struct GlobalProxyResponse {
 pub struct SetGlobalProxyRequest {
     /// 代理 URL，null 表示清除全局代理
     pub proxy_url: Option<String>,
+    /// 代理认证用户名（仅 proxy_url 不为 null 时有效）
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// 代理认证密码（仅 proxy_url 不为 null 时有效）
+    #[serde(default)]
+    pub proxy_password: Option<String>,
 }
 
 // ============ 在线更新配置 ============

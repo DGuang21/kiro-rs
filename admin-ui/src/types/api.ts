@@ -309,10 +309,14 @@ export interface AssignRoundRobinResponse {
 // 全局代理配置
 export interface GlobalProxyResponse {
   proxyUrl: string | null
+  proxyUsername: string | null
+  proxyPassword: string | null
 }
 
 export interface SetGlobalProxyRequest {
   proxyUrl: string | null
+  proxyUsername?: string | null
+  proxyPassword?: string | null
 }
 
 // 在线更新配置
