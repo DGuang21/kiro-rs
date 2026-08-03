@@ -827,6 +827,7 @@ impl KiroCredentials {
     pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
         match self.proxy_url.as_deref() {
             Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
+            Some(url) if url.trim().is_empty() => global_proxy.cloned(),
             Some(url) => {
                 let mut proxy = ProxyConfig::new(url);
                 if let (Some(username), Some(password)) =
