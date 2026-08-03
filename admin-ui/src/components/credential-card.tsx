@@ -188,27 +188,13 @@ function metadataValueLabel(value: unknown): string {
   }
 }
 
-/** schema oneOf 中匹配 value 的 title。如 "normal" → "正常号"。 */
-function resolveOneOfLabel(
-  schema: CredentialMetadataSchema | undefined,
-  key: string,
-  value: unknown,
-): string | undefined {
-  const field = schema?.properties?.[key];
-  if (!field?.oneOf) return undefined;
-  const match = field.oneOf.find((opt) => opt.const === value);
-  return match?.title;
-}
-
 function metadataEntries(
   credential: CredentialStatusItem,
-  schema?: CredentialMetadataSchema,
 ) {
   const metadata = credential.metadata ?? {};
   return Object.entries(metadata).flatMap(([key, detail]) => {
     const rawValue = detail.value;
     if (rawValue == null || rawValue === "") return [];
-    const oneOfLabel = resolveOneOfLabel(schema, key, rawValue);
     return [
       {
         key,
@@ -220,7 +206,7 @@ function metadataEntries(
                 minimumFractionDigits: 2,
                 maximumFractionDigits: 2,
               })}`
-            : oneOfLabel ?? metadataValueLabel(rawValue),
+            : detail.valueLabel ?? metadataValueLabel(rawValue),
         emphasized: key === "type" && rawValue === "boom",
       },
     ];
@@ -353,12 +339,10 @@ function getDisabledReasonStyle(reason?: string | null): {
 
 function MetadataSummary({
   credential,
-  metadataSchema,
 }: {
   credential: CredentialStatusItem;
-  metadataSchema?: CredentialMetadataSchema;
 }) {
-  const entries = metadataEntries(credential, metadataSchema);
+  const entries = metadataEntries(credential);
   if (entries.length === 0) return null;
 
   return (
@@ -661,7 +645,7 @@ export function CredentialCard({
     <SubscriptionBadge title={subscriptionTitle} />
   ) : null;
 
-  const metadataItems = metadataEntries(credential, metadataSchema);
+  const metadataItems = metadataEntries(credential);
   const renderMetadataRows = (items: typeof metadataItems) =>
     items.map((entry) => (
       <LedgerRow
@@ -858,7 +842,7 @@ export function CredentialCard({
             </span>
           )}
         </div>
-        <MetadataSummary credential={credential} metadataSchema={metadataSchema} />
+        <MetadataSummary credential={credential} />
       </div>
 
       <div className="hidden shrink-0 items-center gap-6 lg:flex">

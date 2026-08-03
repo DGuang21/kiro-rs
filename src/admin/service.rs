@@ -104,6 +104,21 @@ fn credential_metadata_details(
                 .map(str::trim)
                 .filter(|description| !description.is_empty())
                 .map(str::to_owned);
+            let value_label = field
+                .and_then(|schema_field| schema_field.get("oneOf"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|options| {
+                    options.iter().find_map(|opt| {
+                        let konst = opt.get("const")?;
+                        if konst == &value {
+                            opt.get("title")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                });
 
             Some((
                 key,
@@ -111,6 +126,7 @@ fn credential_metadata_details(
                     title,
                     description,
                     value,
+                    value_label,
                 },
             ))
         })

@@ -26,6 +26,8 @@ export interface CredentialMetadataDisplay {
   title: string
   description?: string
   value: unknown
+  /** Schema oneOf 中匹配 value 的显示名（如 "normal" → "正常号"），无命中时为 undefined。 */
+  valueLabel?: string
 }
 
 /** 状态接口中的 metadata：字段 key 映射到其描述与当前值。 */

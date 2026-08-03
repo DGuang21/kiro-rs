@@ -104,6 +104,10 @@ pub struct CredentialMetadataDetail {
     pub description: Option<String>,
     /// 凭据上的实际值；旧凭据缺失时可回退到 Schema 默认值。
     pub value: serde_json::Value,
+    /// Schema oneOf 中匹配 value 的显示名（如 "normal" → "正常号"）。
+    /// 未命中 oneOf 或该字段无 oneOf 时为 None，前端可回退显示 value。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_label: Option<String>,
 }
 
 // ============ 操作请求 ============
