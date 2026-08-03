@@ -188,26 +188,40 @@ function metadataValueLabel(value: unknown): string {
   }
 }
 
+/** schema oneOf 中匹配 value 的 title。如 "normal" → "正常号"。 */
+function resolveOneOfLabel(
+  schema: CredentialMetadataSchema | undefined,
+  key: string,
+  value: unknown,
+): string | undefined {
+  const field = schema?.properties?.[key];
+  if (!field?.oneOf) return undefined;
+  const match = field.oneOf.find((opt) => opt.const === value);
+  return match?.title;
+}
+
 function metadataEntries(
   credential: CredentialStatusItem,
+  schema?: CredentialMetadataSchema,
 ) {
   const metadata = credential.metadata ?? {};
   return Object.entries(metadata).flatMap(([key, detail]) => {
-    const value = detail.value;
-    if (value == null || value === "") return [];
+    const rawValue = detail.value;
+    if (rawValue == null || rawValue === "") return [];
+    const oneOfLabel = resolveOneOfLabel(schema, key, rawValue);
     return [
       {
         key,
         label: detail.title?.trim() || key,
         description: detail.description,
         value:
-          key === "salePrice" && typeof value === "number"
-            ? `¥${value.toLocaleString("zh-CN", {
+          key === "salePrice" && typeof rawValue === "number"
+            ? `¥${(rawValue as number).toLocaleString("zh-CN", {
                 minimumFractionDigits: 2,
                 maximumFractionDigits: 2,
               })}`
-            : metadataValueLabel(value),
-        emphasized: key === "type" && value === "boom",
+            : oneOfLabel ?? metadataValueLabel(rawValue),
+        emphasized: key === "type" && rawValue === "boom",
       },
     ];
   });
@@ -215,29 +229,38 @@ function metadataEntries(
 
 
 
-/** 账目行 —— 标签在左，值贴右边缘 */
+/** 账目行 —— 标签 + 描述在左，值贴右边缘 */
 function LedgerRow({
   label,
   hint,
   title,
+  description,
   icon: Icon,
   children,
 }: {
   label: string;
   hint?: string;
   title?: string;
+  description?: string;
   icon?: React.ElementType;
   children: React.ReactNode;
 }) {
   return (
     <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2.5 gap-y-0.5 py-0.5">
-      <dt className="flex shrink-0 items-center gap-1.5" title={title}>
-        {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground/70" />}
-        <span className="text-[12px] font-normal tracking-normal text-muted-foreground">
-          {label}
+      <dt className="flex shrink-0 flex-col" title={title}>
+        <span className="flex items-center gap-1.5">
+          {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground/70" />}
+          <span className="text-[12px] font-normal tracking-normal text-muted-foreground">
+            {label}
+          </span>
+          {hint && (
+            <span className="text-[10px] text-muted-foreground/50">{hint}</span>
+          )}
         </span>
-        {hint && (
-          <span className="text-[10px] text-muted-foreground/50">{hint}</span>
+        {description && (
+          <span className="text-[10px] leading-tight text-muted-foreground/50 mt-0.5">
+            {description}
+          </span>
         )}
       </dt>
       <dd className="min-w-0 break-all text-right text-[12px] leading-4 text-foreground/90 font-medium">
@@ -330,10 +353,12 @@ function getDisabledReasonStyle(reason?: string | null): {
 
 function MetadataSummary({
   credential,
+  metadataSchema,
 }: {
   credential: CredentialStatusItem;
+  metadataSchema?: CredentialMetadataSchema;
 }) {
-  const entries = metadataEntries(credential);
+  const entries = metadataEntries(credential, metadataSchema);
   if (entries.length === 0) return null;
 
   return (
@@ -636,12 +661,13 @@ export function CredentialCard({
     <SubscriptionBadge title={subscriptionTitle} />
   ) : null;
 
-  const metadataItems = metadataEntries(credential);
+  const metadataItems = metadataEntries(credential, metadataSchema);
   const renderMetadataRows = (items: typeof metadataItems) =>
     items.map((entry) => (
       <LedgerRow
         key={entry.key}
         label={entry.label}
+        description={entry.description}
         title={entry.description || (entry.key === entry.label ? undefined : `key: ${entry.key}`)}
       >
         <span
@@ -832,7 +858,7 @@ export function CredentialCard({
             </span>
           )}
         </div>
-        <MetadataSummary credential={credential} />
+        <MetadataSummary credential={credential} metadataSchema={metadataSchema} />
       </div>
 
       <div className="hidden shrink-0 items-center gap-6 lg:flex">
