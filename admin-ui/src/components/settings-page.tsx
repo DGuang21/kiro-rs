@@ -1,4 +1,5 @@
 import {
+  Cpu,
   Gauge,
   Globe,
   ScrollText,
@@ -15,6 +16,7 @@ import { LogSection } from '@/components/settings/log-section'
 import { SystemSection } from '@/components/settings/system-section'
 import { SecuritySection } from '@/components/settings/security-section'
 import { MetadataSection } from '@/components/settings/metadata-section'
+import { ModelsSection } from '@/components/settings/models-section'
 
 /**
  * 设置页 —— 把此前散在三处的 7 个配置端点收拢到一处。
@@ -27,7 +29,7 @@ import { MetadataSection } from '@/components/settings/metadata-section'
  * 一次点击就该切换完；但参数（冷却时长、连续上限、保留天数这些）全部移到这里 ——
  * 下拉菜单里塞数字输入框本来就不是它该干的事。
  */
-type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'system' | 'security'
+type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'system' | 'security'
 
 const SECTIONS: {
   key: SectionKey
@@ -58,6 +60,12 @@ const SECTIONS: {
     label: '日志',
     hint: '链路追踪与保留期',
     icon: <ScrollText className="h-4 w-4" />,
+  },
+  {
+    key: 'models',
+    label: '模型',
+    hint: '自定义模型别名与元数据',
+    icon: <Cpu className="h-4 w-4" />,
   },
   {
     key: 'system',
@@ -129,6 +137,7 @@ export function SettingsPage() {
 
             {active === 'dispatch' && <DispatchSection />}
             {active === 'metadata' && <MetadataSection />}
+            {active === 'models' && <ModelsSection />}
             {active === 'network' && <NetworkSection />}
             {active === 'log' && <LogSection />}
             {active === 'system' && <SystemSection />}

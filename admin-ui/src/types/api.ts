@@ -637,6 +637,19 @@ export interface FailureStats {
 /** credentialId(字符串) → 失败分类计数 */
 export type FailureStatsMap = Record<string, FailureStats>
 
+// ============ 自定义模型 ============
+
+/** 单条自定义模型（与 config.json customModels 数组一一对应） */
+export interface CustomModelItem {
+  id: string
+  backendId: string
+  displayName?: string
+  contextWindow?: number
+  maxTokens?: number
+  supportsReasoning?: boolean
+  ownedBy?: string
+}
+
 // ============ 账号分组（独立实体）============
 
 export interface GroupItem {

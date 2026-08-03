@@ -10,6 +10,7 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  CustomModelItem,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   ProxyPoolEntry,
@@ -561,6 +562,23 @@ export async function getGlobalProxy(): Promise<GlobalProxyResponse> {
 // 设置全局代理配置
 export async function setGlobalProxy(req: SetGlobalProxyRequest): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>('/config/global-proxy', req)
+  return data
+}
+
+// 获取自定义模型配置
+export async function getCustomModels(): Promise<{ models: CustomModelItem[] }> {
+  const { data } = await api.get<{ models: CustomModelItem[] }>('/config/custom-models')
+  return data
+}
+
+// 批量替换自定义模型配置
+export async function setCustomModels(
+  req: { models: CustomModelItem[] },
+): Promise<{ models: CustomModelItem[] }> {
+  const { data } = await api.put<{ models: CustomModelItem[] }>(
+    '/config/custom-models',
+    req,
+  )
   return data
 }
 

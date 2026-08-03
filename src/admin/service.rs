@@ -40,7 +40,8 @@ use super::types::{
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialMetadataDetail,
     CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
+    CredentialsExportResponse, CredentialsStatusResponse, CustomModelsConfigResponse, CustomModelItem,
+    EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     CredentialMetadataSchemaConfig,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
@@ -48,7 +49,7 @@ use super::types::{
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
     SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
     SetLogGovernanceConfigRequest,
-    SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
@@ -1637,6 +1638,74 @@ impl AdminService {
             c.proxy_password = password_for_save;
         });
         Ok(())
+    }
+
+    /// 获取所有自定义模型配置。
+    pub fn get_custom_models(&self) -> CustomModelsConfigResponse {
+        let models = crate::model::custom_models::all()
+            .into_iter()
+            .map(|m| CustomModelItem {
+                id: m.id,
+                backend_id: m.backend_id,
+                display_name: m.display_name,
+                context_window: m.context_window,
+                max_tokens: m.max_tokens,
+                supports_reasoning: m.supports_reasoning,
+                owned_by: m.owned_by,
+            })
+            .collect();
+        CustomModelsConfigResponse { models }
+    }
+
+    /// 批量替换自定义模型配置（校验 → 持久化 config.json → 热更新内存注册表）。
+    pub fn set_custom_models(
+        &self,
+        req: SetCustomModelsRequest,
+    ) -> Result<CustomModelsConfigResponse, AdminServiceError> {
+        // 校验必填字段
+        for (i, m) in req.models.iter().enumerate() {
+            if m.id.trim().is_empty() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条模型的 id 不能为空",
+                    i + 1
+                )));
+            }
+            if m.backend_id.trim().is_empty() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条模型（{}）的 backend_id 不能为空",
+                    i + 1,
+                    m.id
+                )));
+            }
+        }
+
+        // 转换为 config::CustomModel 并持久化
+        let custom_models: Vec<crate::model::config::CustomModel> = req
+            .models
+            .into_iter()
+            .map(|m| crate::model::config::CustomModel {
+                id: m.id,
+                backend_id: m.backend_id,
+                display_name: m.display_name,
+                context_window: m.context_window,
+                max_tokens: m.max_tokens,
+                supports_reasoning: m.supports_reasoning,
+                owned_by: m.owned_by,
+            })
+            .collect();
+
+        let models_for_config = custom_models.clone();
+        self.update_config_file(move |c| {
+            c.custom_models = models_for_config;
+        });
+
+        // 热更新内存注册表
+        crate::model::custom_models::init(custom_models);
+
+        // 使所有已缓存的模型列表失效，确保下次查询反映最新自定义模型
+        self.token_manager.invalidate_all_model_caches();
+
+        Ok(self.get_custom_models())
     }
 
     /// 持久化新的登录API密钥（adminApiKey）到配置文件（内存中的 key 由 handler 层负责更新）

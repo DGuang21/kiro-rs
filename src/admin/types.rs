@@ -1226,3 +1226,44 @@ pub struct DeleteGroupQuery {
     #[serde(default)]
     pub force: bool,
 }
+
+// ============ 自定义模型 ============
+
+/// 自定义模型配置响应（列表）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModelsConfigResponse {
+    pub models: Vec<CustomModelItem>,
+}
+
+/// 单条自定义模型条目（与 `config::CustomModel` 字段一一对应，仅用于 Admin API 序列化）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModelItem {
+    /// 客户端请求时使用的模型名（别名）。匹配大小写不敏感。
+    pub id: String,
+    /// 映射到的 Kiro 后端模型 ID（实际下发给上游）。
+    pub backend_id: String,
+    /// `/v1/models` 展示名（可选，缺省用 `id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// 上下文窗口大小（可选，缺省 200000）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i32>,
+    /// 单次响应最大 token 数（可选，缺省 64000）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
+    /// 是否支持原生 reasoning（可选，缺省 false）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
+    /// `/v1/models` 的 `owned_by` 字段（可选，缺省 "custom"）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_by: Option<String>,
+}
+
+/// 批量设置自定义模型请求（整体替换 `config.json` 中的 `customModels` 数组）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCustomModelsRequest {
+    pub models: Vec<CustomModelItem>,
+}

@@ -31,6 +31,7 @@ use super::{
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
+        SetCustomModelsRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -728,6 +729,24 @@ pub async fn set_global_proxy(
         .set_global_proxy(payload.proxy_url, payload.proxy_username, payload.proxy_password)
     {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/custom-models
+/// 获取所有自定义模型配置
+pub async fn get_custom_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_custom_models())
+}
+
+/// PUT /api/admin/config/custom-models
+/// 批量替换自定义模型配置（运行时热更新 + 持久化 config.json）
+pub async fn set_custom_models(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCustomModelsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_custom_models(payload) {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

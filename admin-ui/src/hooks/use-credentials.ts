@@ -26,6 +26,8 @@ import {
   setLogGovernanceConfig,
   getGlobalProxy,
   setGlobalProxy,
+  getCustomModels,
+  setCustomModels,
   getUpdateConfig,
   setUpdateConfig,
   resetSuccessCount,
@@ -35,6 +37,7 @@ import {
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
+  CustomModelItem,
   SetGlobalProxyRequest,
   SetUpdateConfigRequest,
   UpdateCredentialRequest,
@@ -86,6 +89,7 @@ export function useCredentialModels(id: number | null) {
     queryKey: ['credential-models', id],
     queryFn: () => getCredentialModels(id!),
     enabled: id !== null,
+    staleTime: 0, // 始终视为过期，每次打开对话框都实时查上游
     retry: false, // 失败不重试，避免对被封禁/异常账号反复请求
   })
 }
@@ -96,6 +100,7 @@ export function useCurrentCredentialModels(enabled: boolean) {
     queryKey: ['current-credential-models'],
     queryFn: getCurrentCredentialModels,
     enabled,
+    staleTime: 0, // 始终视为过期，每次打开对话框都实时查上游
     retry: false,
   })
 }
@@ -345,6 +350,25 @@ export function useSetGlobalProxy() {
     mutationFn: (req: SetGlobalProxyRequest) => setGlobalProxy(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
+    },
+  })
+}
+
+// 自定义模型配置
+export function useCustomModels() {
+  return useQuery({
+    queryKey: ['custom-models'],
+    queryFn: getCustomModels,
+  })
+}
+
+export function useSetCustomModels() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: { models: CustomModelItem[] }) =>
+      setCustomModels(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-models'] })
     },
   })
 }

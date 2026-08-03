@@ -51,8 +51,9 @@ import type {
   CredentialMetadataSchema,
   CredentialStatusItem,
   BalanceResponse,
+  ProxyPoolEntry,
 } from "@/types/api";
-import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/utils";
+import { maskProxyUrl, extractErrorMessage, overageFailureMessage, cn } from "@/lib/utils";
 import {
   useSetDisabled,
   useSetPriority,
@@ -62,8 +63,8 @@ import {
   useResetSuccessCount,
   useClearThrottle,
 } from "@/hooks/use-credentials";
-import { setCredentialOverage } from "@/api/credentials";
-import { useQueryClient } from "@tanstack/react-query";
+import { setCredentialOverage, getProxyPool } from "@/api/credentials";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { EditCredentialDialog } from "@/components/edit-credential-dialog";
@@ -222,6 +223,7 @@ function LedgerRow({
   title,
   description,
   icon: Icon,
+  danger,
   children,
 }: {
   label: string;
@@ -229,10 +231,14 @@ function LedgerRow({
   title?: string;
   description?: string;
   icon?: React.ElementType;
+  danger?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2.5 gap-y-0.5 py-0.5">
+    <div className={cn(
+      "grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2.5 gap-y-0.5 py-0.5 -mx-2 px-2 rounded",
+      danger && "bg-destructive/10 border border-destructive/30",
+    )}>
       <dt className="flex shrink-0 flex-col" title={title}>
         <span className="flex items-center gap-1.5">
           {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground/70" />}
@@ -403,6 +409,21 @@ export function CredentialCard({
   const resetSuccess = useResetSuccessCount();
   const clearThrottle = useClearThrottle();
   const queryClient = useQueryClient();
+
+  // 代理池健康数据，用于标记凭据专属代理是否异常
+  const { data: proxyPool } = useQuery({
+    queryKey: ['proxy-pool'],
+    queryFn: getProxyPool,
+    staleTime: 30_000,
+  });
+
+  /** 凭据专属代理在代理池中的健康信息（仅当 proxyUrl 匹配到池内条目时有效） */
+  const proxyEntry: ProxyPoolEntry | undefined = (() => {
+    if (!credential.proxyUrl || !proxyPool?.proxies) return undefined;
+    return proxyPool.proxies.find((p) => p.url === credential.proxyUrl);
+  })();
+
+  const proxyUnhealthy = proxyEntry && (proxyEntry.health === 'unhealthy' || proxyEntry.autoDisabled);
 
   const {
     attributes,
@@ -1381,13 +1402,18 @@ export function CredentialCard({
                     </LedgerRow>
                   )}
                   {credential.hasProxy && (
-                    <LedgerRow label="代理地址" icon={Globe}>
+                    <LedgerRow label="代理地址" icon={Globe} danger={proxyUnhealthy}>
                       <span
                         className="font-mono text-xs"
                         title={maskProxyUrl(credential.proxyUrl ?? "")}
                       >
                         {proxyDisplayLabel(credential.proxyUrl ?? "")}
                       </span>
+                      {proxyEntry && proxyUnhealthy && (
+                        <span className="ml-1.5 text-[11px] font-medium text-destructive">
+                          {proxyEntry.autoDisabled ? '已自动禁用' : `异常 ×${proxyEntry.consecutiveFailures}`}
+                        </span>
+                      )}
                     </LedgerRow>
                   )}
                 </div>

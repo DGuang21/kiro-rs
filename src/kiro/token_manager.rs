@@ -1517,7 +1517,7 @@ impl MultiTokenManager {
         self.model_refresh_locks.lock().remove(&id);
     }
 
-    fn invalidate_all_model_caches(&self) {
+    pub fn invalidate_all_model_caches(&self) {
         self.model_cache_epoch.fetch_add(1, Ordering::Relaxed);
         self.model_cache.lock().clear();
     }
