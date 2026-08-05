@@ -1,133 +1,57 @@
-export const THEME_STORAGE_KEY = 'adminTheme'
+import { PREF_KEYS, readPref, reviveOneOf, writePref } from '@/lib/preferences'
 
-export type ThemeId =
-  | 'system'
-  | 'ocean'
-  | 'forest'
-  | 'violet'
-  | 'amber'
-  | 'rose'
-
+/**
+ * 主题模式。`system` 跟随操作系统的 `prefers-color-scheme`，是首次访问的默认值。
+ * 用户手动点过切换按钮后固定为 `light` / `dark`，不再随系统变化。
+ */
 export type ThemeMode = 'light' | 'dark' | 'system'
 
-export interface ThemeSelection {
-  palette: ThemeId
-  mode: ThemeMode
+const THEME_MODES: readonly ThemeMode[] = ['light', 'dark', 'system']
+const reviveThemeMode = reviveOneOf(THEME_MODES)
+
+export function getThemeMode(): ThemeMode {
+  return readPref<ThemeMode>(PREF_KEYS.theme, 'system', reviveThemeMode)
 }
 
-export interface ThemeMetadata {
-  id: ThemeId
-  name: string
-  description: string
-  swatch: string
+export function setThemeMode(mode: ThemeMode) {
+  writePref(PREF_KEYS.theme, mode)
+  applyTheme(mode)
 }
 
-export const DEFAULT_THEME_SELECTION: ThemeSelection = {
-  palette: 'system',
-  mode: 'system',
-}
-
-export const THEME_METADATA: readonly ThemeMetadata[] = [
-  {
-    id: 'system',
-    name: '系统蓝',
-    description: '清爽中性的系统蓝',
-    swatch: 'hsl(211 100% 50%)',
-  },
-  {
-    id: 'ocean',
-    name: '海洋青',
-    description: '冷静通透的海洋青',
-    swatch: 'hsl(193 84% 42%)',
-  },
-  {
-    id: 'forest',
-    name: '森林绿',
-    description: '稳定自然的森林绿',
-    swatch: 'hsl(151 60% 38%)',
-  },
-  {
-    id: 'violet',
-    name: '紫罗兰',
-    description: '沉静鲜明的紫罗兰',
-    swatch: 'hsl(262 72% 56%)',
-  },
-  {
-    id: 'amber',
-    name: '琥珀',
-    description: '温暖醒目的琥珀色',
-    swatch: 'hsl(38 92% 50%)',
-  },
-  {
-    id: 'rose',
-    name: '玫瑰',
-    description: '柔和有力的玫瑰色',
-    swatch: 'hsl(347 75% 52%)',
-  },
-] as const
-
-const THEME_IDS = new Set<ThemeId>(THEME_METADATA.map(({ id }) => id))
-const THEME_MODES = new Set<ThemeMode>(['light', 'dark', 'system'])
-let transitionTimer: number | undefined
-
-export function isThemeId(value: unknown): value is ThemeId {
-  return typeof value === 'string' && THEME_IDS.has(value as ThemeId)
-}
-
-export function isThemeMode(value: unknown): value is ThemeMode {
-  return typeof value === 'string' && THEME_MODES.has(value as ThemeMode)
-}
-
-export function parseThemeSelection(value: unknown): ThemeSelection {
-  if (!value || typeof value !== 'object') return { ...DEFAULT_THEME_SELECTION }
-
-  const candidate = value as { palette?: unknown; mode?: unknown }
-  if (!isThemeId(candidate.palette) || !isThemeMode(candidate.mode)) {
-    return { ...DEFAULT_THEME_SELECTION }
-  }
-
-  return { palette: candidate.palette, mode: candidate.mode }
-}
-
-export function resolveSystemDarkMode(): boolean {
-  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
-    return false
-  }
+/** 系统偏好；不支持 matchMedia 的环境按浅色处理 */
+export function systemPrefersDark(): boolean {
+  if (typeof window === 'undefined' || !window.matchMedia) return false
   return window.matchMedia('(prefers-color-scheme: dark)').matches
 }
 
-export function resolveDarkMode(selection: ThemeSelection): boolean {
-  return selection.mode === 'dark' || (selection.mode === 'system' && resolveSystemDarkMode())
+export function resolveTheme(mode: ThemeMode): 'light' | 'dark' {
+  if (mode === 'system') return systemPrefersDark() ? 'dark' : 'light'
+  return mode
 }
 
-export function applyTheme(selection: ThemeSelection, isDark = resolveDarkMode(selection)): boolean {
-  if (typeof document === 'undefined') return isDark
-
+/** 把主题写到 `<html>` 上：`.dark` 驱动 CSS 变量，`color-scheme` 驱动原生控件配色 */
+export function applyTheme(mode: ThemeMode) {
+  if (typeof document === 'undefined') return
+  const resolved = resolveTheme(mode)
   const root = document.documentElement
-  root.dataset.theme = selection.palette
-  root.classList.toggle('dark', isDark)
-  return isDark
+  root.classList.toggle('dark', resolved === 'dark')
+  root.style.colorScheme = resolved
 }
 
-export function applyThemeWithTransition(
-  selection: ThemeSelection,
-  isDark = resolveDarkMode(selection),
-): boolean {
-  if (typeof document === 'undefined') return isDark
+/**
+ * 在 React 挂载前调用一次，避免首帧用浅色渲染、随后再跳到深色（白闪）。
+ */
+export function initTheme() {
+  applyTheme(getThemeMode())
+}
 
-  const root = document.documentElement
-  root.classList.add('theme-transition')
-  // Ensure the transition rule is committed before changing the custom properties.
-  void root.offsetWidth
-  const resolved = applyTheme(selection, isDark)
-  if (typeof window !== 'undefined') {
-    if (transitionTimer !== undefined) window.clearTimeout(transitionTimer)
-    transitionTimer = window.setTimeout(() => {
-      root.classList.remove('theme-transition')
-      transitionTimer = undefined
-    }, 260)
-  } else {
-    root.classList.remove('theme-transition')
-  }
-  return resolved
+/**
+ * 订阅系统主题变化。仅在当前模式为 `system` 时才需要跟随，
+ * 回调由调用方决定做什么（通常是重新 apply 并刷新 React 状态）。
+ */
+export function watchSystemTheme(onChange: () => void): () => void {
+  if (typeof window === 'undefined' || !window.matchMedia) return () => {}
+  const mq = window.matchMedia('(prefers-color-scheme: dark)')
+  mq.addEventListener('change', onChange)
+  return () => mq.removeEventListener('change', onChange)
 }

@@ -6,6 +6,8 @@ import { Activity, Calendar, Coins, Cpu, Gauge, KeyRound, Server } from 'lucide-
 import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
+import { usePersistentState } from '@/hooks/use-persistent-state'
+import { PREF_KEYS, reviveString, type Revive } from '@/lib/preferences'
 import type {
   ClientKeyItem,
   CredentialDistribution,
@@ -182,23 +184,54 @@ export function OverviewPage() {
 
 function useOverviewFilters() {
   const today = useMemo(() => toDateInputValue(new Date()), [])
-  const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>(() =>
-    customTimeFilter(presetStartDate('24h', today), today, 'hour'),
+  // 时间选择持久化。preset（近 24h / 7d / 30d）存的是相对区间，重新进页面时
+  // 按“今天”重算起止日期，避免下次打开还停在旧日期上；自定义区间则原样恢复。
+  const [savedTime, setSavedTime] = usePersistentState<SavedTimeSelection>(
+    PREF_KEYS.overviewTime,
+    { granularity: 'hour', range: '24h' },
+    reviveSavedTime,
   )
-  const [customStartDate, setCustomStartDate] = useState(() => presetStartDate('24h', today))
-  const [customEndDate, setCustomEndDate] = useState(today)
-  const [draftGranularity, setDraftGranularity] = useState<StatsGranularity>('hour')
-  const [draftRange, setDraftRange] = useState<StatsRange | undefined>('24h')
-  const [keyFilter, setKeyFilter] = useState('all')
-  const [groupFilter, setGroupFilter] = useState('all')
+  // 挂载时解析一次即可：后续变化都由用户操作驱动，各 state 已同步更新
+  const [initial] = useState(() => resolveSavedTime(savedTime, today))
+  const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>(initial.timeFilter)
+  const [customStartDate, setCustomStartDate] = useState(initial.startDate)
+  const [customEndDate, setCustomEndDate] = useState(initial.endDate)
+  const [draftGranularity, setDraftGranularity] = useState<StatsGranularity>(
+    initial.granularity,
+  )
+  const [draftRange, setDraftRange] = useState<StatsRange | undefined>(initial.range)
+  const [keyFilter, setKeyFilter] = usePersistentState<string>(
+    PREF_KEYS.overviewKeyFilter,
+    'all',
+    reviveString,
+  )
+  const [groupFilter, setGroupFilter] = usePersistentState<string>(
+    PREF_KEYS.overviewGroupFilter,
+    'all',
+    reviveString,
+  )
   const statsFilter = useMemo<StatsFilter>(() => {
     const f: StatsFilter = {}
     if (keyFilter !== 'all') f.keyId = Number(keyFilter)
     if (groupFilter !== 'all') f.group = groupFilter
     return f
   }, [keyFilter, groupFilter])
+  /**
+   * 「应用」是唯一让图表换数据的入口，所以也只在这里落盘 —— 保证「存下来的」
+   * 永远等于「图上画的」。若当前草稿来自 preset 按钮，存相对区间（range），
+   * 下次打开按当天重算；否则存用户手填的绝对日期。
+   */
   const applyCustomRange = () => {
     setTimeFilter(customTimeFilter(customStartDate, customEndDate, draftGranularity))
+    setSavedTime(
+      draftRange
+        ? { granularity: draftGranularity, range: draftRange }
+        : {
+            endDate: customEndDate,
+            granularity: draftGranularity,
+            startDate: customStartDate,
+          },
+    )
   }
   const updateCustomStartDate = (value: string) => {
     setCustomStartDate(value)
@@ -230,6 +263,61 @@ function useOverviewFilters() {
     setGroupFilter,
     statsFilter,
     timeFilter,
+  }
+}
+
+/**
+ * 持久化的时间选择。二者互斥：
+ * - `range` 有值 → 相对区间（近 24h/7d/30d），每次打开按当天重算起止
+ * - `startDate`/`endDate` 有值 → 用户显式应用过的绝对区间，原样恢复
+ */
+interface SavedTimeSelection {
+  endDate?: string
+  granularity: StatsGranularity
+  range?: StatsRange
+  startDate?: string
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+const reviveSavedTime: Revive<SavedTimeSelection> = (raw) => {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const o = raw as Record<string, unknown>
+  const granularity = GRANULARITIES.some((g) => g.value === o.granularity)
+    ? (o.granularity as StatsGranularity)
+    : 'hour'
+  if (typeof o.range === 'string' && RANGES.some((r) => r.value === o.range)) {
+    return { granularity, range: o.range as StatsRange }
+  }
+  const startDate = typeof o.startDate === 'string' ? o.startDate : ''
+  const endDate = typeof o.endDate === 'string' ? o.endDate : ''
+  if (DATE_RE.test(startDate) && DATE_RE.test(endDate) && startDate <= endDate) {
+    return { endDate, granularity, startDate }
+  }
+  // 区间坏了但粒度还能用，回落到默认 preset
+  return { granularity, range: '24h' }
+}
+
+/** 把持久化的选择还原成页面初始状态 */
+function resolveSavedTime(saved: SavedTimeSelection, today: string) {
+  if (saved.range) {
+    const startDate = presetStartDate(saved.range, today)
+    return {
+      endDate: today,
+      granularity: saved.granularity,
+      range: saved.range,
+      startDate,
+      timeFilter: customTimeFilter(startDate, today, saved.granularity),
+    }
+  }
+  const startDate = saved.startDate ?? presetStartDate('24h', today)
+  const endDate = saved.endDate ?? today
+  return {
+    endDate,
+    granularity: saved.granularity,
+    range: undefined,
+    startDate,
+    timeFilter: customTimeFilter(startDate, endDate, saved.granularity),
   }
 }
 

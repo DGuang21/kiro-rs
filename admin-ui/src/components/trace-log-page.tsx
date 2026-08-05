@@ -6,8 +6,8 @@ import {
   AlertTriangle,
   CheckCircle2,
   Unplug,
-  Search,
-  X,
+  Settings2,
+  FilterX,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -25,8 +25,13 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
-import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
-import { PageHeader } from '@/components/console/page-header'
+import { usePersistentState } from '@/hooks/use-persistent-state'
+import {
+  PREF_KEYS,
+  reviveBoolean,
+  reviveOneOf,
+  reviveString,
+} from '@/lib/preferences'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { useUrlState } from '@/hooks/use-url-state'
@@ -169,6 +174,21 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'stream_interrupted', label: '流中断' },
   { value: 'unknown', label: '未知' },
 ]
+
+// 持久化读取时的白名单：与上面两组下拉的 value 一一对应，
+// 存储里出现已下线的取值时回落到「全部」而不是发出无效查询。
+const STATUS_VALUES = ['', 'success', 'error', 'interrupted'] as const
+const ERROR_TYPE_VALUES = [
+  '',
+  'quota_exhausted',
+  'account_throttled',
+  'auth_failed',
+  'transient',
+  'network_error',
+  'bad_request',
+  'stream_interrupted',
+  'unknown',
+] as const
 
 /** 单跳明细行 */
 function AttemptRow({ a }: { a: TraceAttempt }) {
@@ -575,22 +595,26 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
 }
 
 export function TraceLogPage() {
-  const [url, patchUrl, resetUrl] = useUrlState('traces', URL_DEFAULTS)
-  const [searchDraft, setSearchDraft] = useState(url.q)
-  const debouncedSearch = useDebounced(searchDraft)
-  const [detail, setDetail] = useState<TraceRecord | null>(null)
-  const [now, setNow] = useState(() => Date.now())
-
-  // 搜索词稳定后才写进 URL / 触发查询
-  useEffect(() => {
-    if (debouncedSearch !== url.q) patchUrl({ q: debouncedSearch, page: '0' })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearch])
-
-  const page = Number(url.page) || 0
-  const range: TimeRange = {
-    minutes: url.range === '' ? null : Number(url.range),
-  }
+  // 筛选条件持久化：刷新 / 切 Tab 回来仍保留上次的筛选
+  const [status, setStatus] = usePersistentState<string>(
+    PREF_KEYS.traceStatus,
+    '',
+    reviveOneOf(STATUS_VALUES),
+  )
+  const [errorType, setErrorType] = usePersistentState<string>(
+    PREF_KEYS.traceErrorType,
+    '',
+    reviveOneOf(ERROR_TYPE_VALUES),
+  )
+  const [keyId, setKeyId] = usePersistentState(PREF_KEYS.traceKeyId, '', reviveString)
+  const [group, setGroup] = usePersistentState(PREF_KEYS.traceGroup, '', reviveString)
+  const [onlyFailed, setOnlyFailed] = usePersistentState(
+    PREF_KEYS.traceOnlyFailed,
+    false,
+    reviveBoolean,
+  )
+  // 页码是临时导航状态，不持久化
+  const [page, setPage] = useState(0)
 
   const { data: keysData } = useClientKeys()
   const groupOptions = useGroupOptions()
@@ -609,6 +633,17 @@ export function TraceLogPage() {
     const ms = rangeToStartMs(range, now)
     return ms == null ? undefined : Math.floor(ms / 1000)
   }, [url.range, now])
+
+  // 筛选会持久化，给一个一键清空的出口，避免下次打开以为日志为空
+  const anyFilterActive = Boolean(status || errorType || keyId || group || onlyFailed)
+  const clearFilters = () => {
+    setStatus('')
+    setErrorType('')
+    setKeyId('')
+    setGroup('')
+    setOnlyFailed(false)
+    setPage(0)
+  }
 
   const query: TraceQuery = {
     status: url.status || undefined,
@@ -664,40 +699,26 @@ export function TraceLogPage() {
               }
               return refetch()
             }}
-            isRefreshing={isFetching}
-            resourceLabel="请求日志"
-          />
-        }
-      />
-
-      {/* 筛选栏：文本与分类条件优先，时间范围收在末尾。 */}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <input
-            type="text"
-            value={searchDraft}
-            onChange={(e) => setSearchDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                setSearchDraft('')
-                e.currentTarget.blur()
-              }
-            }}
-            placeholder="搜索模型 / 报错 / Trace ID"
-            aria-label="搜索日志"
-            className="console-num h-8 w-[min(15rem,52vw)] rounded-lg border border-border bg-card/60 pl-8 pr-7 text-[12.5px] backdrop-blur placeholder:font-sans placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
-          />
-          {searchDraft && (
-            <button
-              type="button"
-              onClick={() => setSearchDraft('')}
-              title="清除搜索"
-              className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            只看失败
+          </Button>
+          {anyFilterActive && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="text-muted-foreground"
+              onClick={clearFilters}
+              title="清除全部筛选条件"
             >
-              <X className="h-3 w-3" />
-            </button>
+              <FilterX className="h-3.5 w-3.5" />
+              清除筛选
+            </Button>
           )}
+          <GovernanceButton />
+          <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
+            <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+            刷新
+          </Button>
         </div>
         <Select
           value={url.status}

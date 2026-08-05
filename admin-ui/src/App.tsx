@@ -1,18 +1,30 @@
 import { useState, useEffect, lazy, Suspense } from "react";
 import { storage } from "@/lib/storage";
-import {
-  applyTheme,
-  applyThemeWithTransition,
-  resolveDarkMode,
-  type ThemeId,
-  type ThemeMode,
-  type ThemeSelection,
-} from "@/lib/theme";
+import { useTheme } from "@/hooks/use-theme";
+import type { ThemeMode } from "@/lib/theme";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, Server, LogOut, Moon, Sun, ScrollText, PackagePlus, Settings2 } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+} from "@/components/ui/dropdown-menu";
+import {
+  Activity,
+  Server,
+  LogOut,
+  Moon,
+  Sun,
+  ScrollText,
+  PackagePlus,
+  Settings2,
+  Check,
+  MonitorSmartphone,
+} from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
 import { tabFromHash } from "@/hooks/use-url-state";
@@ -150,10 +162,10 @@ interface AppHeaderProps {
   theme: ThemeSelection;
   isDarkMode: boolean;
   tab: Tab;
+  themeMode: ThemeMode;
   onLogout: () => void;
   onSwitchTab: (next: Tab) => void;
-  onSelectPalette: (palette: ThemeId) => void;
-  onSelectMode: (mode: ThemeMode) => void;
+  onSetThemeMode: (mode: ThemeMode) => void;
 }
 
 function App() {
@@ -168,10 +180,10 @@ function App() {
       theme={app.theme}
       isDarkMode={app.isDarkMode}
       tab={app.tab}
+      themeMode={app.themeMode}
       onLogout={app.handleLogout}
       onSwitchTab={app.switchTab}
-      onSelectPalette={app.selectPalette}
-      onSelectMode={app.selectMode}
+      onSetThemeMode={app.setThemeMode}
     />
   );
 }
@@ -179,12 +191,7 @@ function App() {
 function useAppShell() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [tab, setTab] = useState<Tab>(initialTab);
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== "undefined") {
-      return document.documentElement.classList.contains("dark");
-    }
-    return false;
-  });
+  const theme = useTheme();
 
   useEffect(() => {
     if (storage.getApiKey()) setIsLoggedIn(true);
@@ -231,14 +238,9 @@ function useAppShell() {
     storage.removeApiKey();
     setIsLoggedIn(false);
   };
-  const selectPalette = (palette: ThemeId) => {
-    setTheme((current) => ({ ...current, palette }));
-  };
-  const selectMode = (mode: ThemeMode) => {
-    setTheme((current) => ({ ...current, mode }));
-  };
 
   return {
+    darkMode: theme.isDark,
     handleLogin,
     handleLogout,
     isLoggedIn,
@@ -247,7 +249,8 @@ function useAppShell() {
     selectPalette,
     switchTab,
     tab,
-    theme,
+    themeMode: theme.mode,
+    setThemeMode: theme.setMode,
   };
 }
 
@@ -264,10 +267,10 @@ function LoggedInApp({
   theme,
   isDarkMode,
   onLogout,
+  onSetThemeMode,
   onSwitchTab,
-  onSelectPalette,
-  onSelectMode,
   tab,
+  themeMode,
 }: AppHeaderProps) {
   return (
     <ConfirmProvider>
@@ -275,10 +278,10 @@ function LoggedInApp({
         theme={theme}
         isDarkMode={isDarkMode}
         tab={tab}
+        themeMode={themeMode}
         onLogout={onLogout}
         onSwitchTab={onSwitchTab}
-        onSelectPalette={onSelectPalette}
-        onSelectMode={onSelectMode}
+        onSetThemeMode={onSetThemeMode}
       />
       <AppMain tab={tab} onLogout={onLogout} />
       <Toaster position="top-center" />
@@ -290,21 +293,20 @@ function AppHeader({
   theme,
   isDarkMode,
   onLogout,
+  onSetThemeMode,
   onSwitchTab,
-  onSelectPalette,
-  onSelectMode,
   tab,
+  themeMode,
 }: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-50 w-full glass">
       <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
         <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
         <HeaderActions
-          theme={theme}
-          isDarkMode={isDarkMode}
+          darkMode={darkMode}
+          themeMode={themeMode}
           onLogout={onLogout}
-          onSelectPalette={onSelectPalette}
-          onSelectMode={onSelectMode}
+          onSetThemeMode={onSetThemeMode}
         />
       </div>
       <MobileTabs tab={tab} onSwitchTab={onSwitchTab} />
@@ -360,14 +362,13 @@ function HeaderActions({
   theme,
   isDarkMode,
   onLogout,
-  onSelectPalette,
-  onSelectMode,
+  onSetThemeMode,
+  themeMode,
 }: {
-  theme: ThemeSelection;
-  isDarkMode: boolean;
+  darkMode: boolean;
+  themeMode: ThemeMode;
   onLogout: () => void;
-  onSelectPalette: (palette: ThemeId) => void;
-  onSelectMode: (mode: ThemeMode) => void;
+  onSetThemeMode: (mode: ThemeMode) => void;
 }) {
   const confirm = useConfirm();
 
@@ -391,16 +392,67 @@ function HeaderActions({
       </div>
       <span className="mx-1 hidden h-5 w-px bg-border/70 xl:inline-block" />
       <GithubButton />
-      <ThemePicker
-        theme={theme}
-        isDarkMode={isDarkMode}
-        onSelectPalette={onSelectPalette}
-        onSelectMode={onSelectMode}
+      <ThemeMenu
+        darkMode={darkMode}
+        themeMode={themeMode}
+        onSetThemeMode={onSetThemeMode}
       />
-      <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
+      <Button variant="ghost" size="icon" onClick={onLogout} title="退出登录">
         <LogOut className="h-4 w-4" />
       </Button>
     </div>
+  );
+}
+
+const THEME_OPTIONS: { value: ThemeMode; label: string; icon: React.ReactNode }[] = [
+  { value: "light", label: "浅色", icon: <Sun className="h-4 w-4" /> },
+  { value: "dark", label: "深色", icon: <Moon className="h-4 w-4" /> },
+  {
+    value: "system",
+    label: "跟随系统",
+    icon: <MonitorSmartphone className="h-4 w-4" />,
+  },
+];
+
+/**
+ * 主题切换：下拉里显式选择「浅色 / 深色 / 跟随系统」。
+ * 选择结果写入 localStorage，刷新后保持；跟随系统时会实时响应系统切换。
+ */
+function ThemeMenu({
+  darkMode,
+  onSetThemeMode,
+  themeMode,
+}: {
+  darkMode: boolean;
+  themeMode: ThemeMode;
+  onSetThemeMode: (mode: ThemeMode) => void;
+}) {
+  const current = THEME_OPTIONS.find((o) => o.value === themeMode);
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon" title={`主题：${current?.label ?? "浅色"}`}>
+          {themeMode === "system" ? (
+            <MonitorSmartphone className="h-4 w-4" />
+          ) : darkMode ? (
+            <Moon className="h-4 w-4" />
+          ) : (
+            <Sun className="h-4 w-4" />
+          )}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuLabel>主题</DropdownMenuLabel>
+        {THEME_OPTIONS.map((o) => (
+          <DropdownMenuItem key={o.value} onSelect={() => onSetThemeMode(o.value)}>
+            {o.icon}
+            <span className="flex-1">{o.label}</span>
+            {themeMode === o.value && <Check className="h-3.5 w-3.5" />}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

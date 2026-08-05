@@ -35,6 +35,7 @@ import {
   List,
   Search,
   X,
+  FilterX,
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
@@ -106,6 +107,18 @@ import { useFailureStats } from "@/hooks/use-traces";
 import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import {
+  usePersistentSet,
+  usePersistentState,
+} from "@/hooks/use-persistent-state";
+import { useTheme } from "@/hooks/use-theme";
+import {
+  PREF_KEYS,
+  reviveNonNegativeInt,
+  reviveOneOf,
+  reviveString,
+  reviveStringSet,
+} from "@/lib/preferences";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -168,6 +181,8 @@ const TIER_OPTIONS: { value: Tier; label: string }[] = [
   { value: "power", label: "POWER" },
   { value: "unknown", label: "未知/未查询" },
 ];
+// 持久化校验用：读 localStorage 时过滤掉已不存在的分级值
+const TIER_VALUES = TIER_OPTIONS.map((o) => o.value) as readonly Tier[];
 const TIER_LABELS: Record<Tier, string> = {
   free: "FREE",
   pro: "PRO",
@@ -178,6 +193,9 @@ const TIER_LABELS: Record<Tier, string> = {
 
 // 每页数量可选项；另有“全部”（pageSize = 0）由下拉单独追加
 const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
+/** 默认每页数量；0 视为“全部”（不分页） */
+const DEFAULT_PAGE_SIZE = 12;
+const CREDENTIAL_VIEWS = ["card", "list"] as const;
 
 /** 仅供本地开发预览卡片布局，不会随生产构建或任何 API 请求出现。 */
 const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
@@ -241,6 +259,7 @@ type SortField =
   | "lastUsedAt"
   | "id";
 type SortDir = "asc" | "desc";
+const SORT_DIRS = ["asc", "desc"] as const;
 const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
   { value: "priority", label: "优先级" },
   { value: "successCount", label: "成功次数" },
@@ -248,6 +267,10 @@ const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
   { value: "lastUsedAt", label: "最后使用" },
   { value: "id", label: "ID" },
 ];
+const SORT_FIELDS = [
+  "manual",
+  ...SORT_OPTIONS.map((o) => o.value),
+] as readonly SortField[];
 const SORT_LABELS: Record<SortField, string> = {
   manual: "手动顺序",
   priority: "优先级",
@@ -257,8 +280,56 @@ const SORT_LABELS: Record<SortField, string> = {
   id: "ID",
 };
 
-// 注：PR #56 的 StatusKey / STATUS_OPTIONS / credentialHasStatus 已随「隐藏状态」
-// 下拉一并移除，改由顶部状态账条（StatusStrip + credential-state.ts）承担同一职责。
+// 按状态隐藏：勾选即隐藏对应状态的凭据。状态含义与卡片徽章一致。
+type StatusKey =
+  | "current"
+  | "enabled"
+  | "disabled"
+  | "throttled"
+  | "quotaExceeded";
+const STATUS_OPTIONS: { value: StatusKey; label: string }[] = [
+  { value: "current", label: "当前优先" },
+  { value: "enabled", label: "已启用" },
+  { value: "disabled", label: "已禁用" },
+  { value: "throttled", label: "冷却中" },
+  { value: "quotaExceeded", label: "已超额" },
+];
+const STATUS_KEYS = STATUS_OPTIONS.map((o) => o.value) as readonly StatusKey[];
+
+/**
+ * 判断凭据是否命中某个隐藏状态。
+ *
+ * `enabled` 指“正常启用且无异常态”（非禁用 / 非冷却 / 非超额）；`current` 与
+ * 主状态正交（一个当前优先的凭据同时也可能是 enabled），勾选任一命中即隐藏。
+ * 超额判定优先用本地验活/缓存余额，回落到 disabledReason。
+ */
+function credentialHasStatus(
+  c: CredentialStatusItem,
+  key: StatusKey,
+  balance: BalanceResponse | undefined,
+): boolean {
+  const quotaByBalance = balance
+    ? balance.remaining <= 0 || balance.usagePercentage >= 100
+    : false;
+  const quotaExceeded =
+    (!c.disabled && quotaByBalance) ||
+    (c.disabled && c.disabledReason === "QuotaExceeded");
+  const throttled = !c.disabled && (c.throttledRemainingSecs ?? 0) > 0;
+  switch (key) {
+    case "current":
+      return c.isCurrent;
+    case "disabled":
+      return c.disabled;
+    case "throttled":
+      return throttled;
+    case "quotaExceeded":
+      return quotaExceeded;
+    case "enabled":
+      return !c.disabled && !throttled && !quotaExceeded;
+    default:
+      return false;
+  }
+}
 
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
@@ -311,27 +382,23 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const cancelVerifyRef = useRef(false);
   const [currentPage, setCurrentPage] = useState(1);
   // 展示形态（卡片 / 列表）与每页数量，均持久化到 localStorage
-  const [viewMode, setViewMode] = useState<CredentialView>(() =>
-    storage.getCredentialView(),
+  const [viewMode, setViewMode] = usePersistentState<CredentialView>(
+    PREF_KEYS.credentialView,
+    "card",
+    reviveOneOf(CREDENTIAL_VIEWS),
   );
-  const [pageSize, setPageSize] = useState<number>(() =>
-    storage.getCredentialPageSize(),
+  const [pageSize, setPageSize] = usePersistentState<number>(
+    PREF_KEYS.credentialPageSize,
+    DEFAULT_PAGE_SIZE,
+    reviveNonNegativeInt,
   );
-  const changeViewMode = (v: CredentialView) => {
-    setViewMode(v);
-    storage.setCredentialView(v);
-  };
+  const changeViewMode = (v: CredentialView) => setViewMode(v);
   const changePageSize = (n: number) => {
     setPageSize(n);
-    storage.setCredentialPageSize(n);
     setCurrentPage(1);
   };
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== "undefined") {
-      return document.documentElement.classList.contains("dark");
-    }
-    return false;
-  });
+  const theme = useTheme();
+  const darkMode = theme.isDark;
 
   const queryClient = useQueryClient();
   const { data, isLoading, error, refetch } = useCredentials();
@@ -351,38 +418,40 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     : (data?.credentials ?? []);
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
-  const [groupFilter, setGroupFilter] = useState<string>("");
+  const [groupFilter, setGroupFilter] = usePersistentState<string>(
+    PREF_KEYS.credentialGroup,
+    "",
+    reviveString,
+  );
   // 订阅分级筛选（多选）：空集合 = 全部分级；否则只显示集合内的分级
-  const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
+  const [tierFilter, setTierFilter] = usePersistentSet<Tier>(
+    PREF_KEYS.credentialTiers,
+    new Set(),
+    reviveStringSet(TIER_VALUES),
+  );
   // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
-  const [searchQuery, setSearchQuery] = useState("");
-  const searchInputRef = useRef<HTMLInputElement>(null);
-
-  // Cmd/Ctrl+K 聚焦搜索框；搜索框聚焦时按 Esc 可快速清空并失焦
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        if (searchQuery || document.activeElement === searchInputRef.current) {
-          setSearchQuery("");
-          searchInputRef.current?.blur();
-        }
-        return;
-      }
-
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [searchQuery]);
-
-  // 字段排序（来自 PR #56）：'manual' 保留服务端顺序与拖拽调优先级；
-  // 其余字段按方向排序并禁用拖拽。console-ui 没有同类能力，纯增量保留。
-  const [sortField, setSortField] = useState<SortField>("manual");
-  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [searchQuery, setSearchQuery] = usePersistentState<string>(
+    PREF_KEYS.credentialSearch,
+    "",
+    reviveString,
+  );
+  // 字段排序：'manual' 保留服务端顺序与拖拽调优先级；其余字段按方向排序并禁用拖拽
+  const [sortField, setSortField] = usePersistentState<SortField>(
+    PREF_KEYS.credentialSortField,
+    "manual",
+    reviveOneOf(SORT_FIELDS),
+  );
+  const [sortDir, setSortDir] = usePersistentState<SortDir>(
+    PREF_KEYS.credentialSortDir,
+    "asc",
+    reviveOneOf(SORT_DIRS),
+  );
+  // 按状态隐藏（多选）：集合内的状态对应的凭据不显示；空集合 = 不隐藏任何状态
+  const [hiddenStatuses, setHiddenStatuses] = usePersistentSet<StatusKey>(
+    PREF_KEYS.credentialHiddenStatuses,
+    new Set(),
+    reviveStringSet(STATUS_KEYS),
+  );
   // 选中排序字段：点已选字段则切换升/降序；换字段时用该字段的直观默认方向
   const applySort = (field: SortField) => {
     if (field === "manual") {
@@ -416,6 +485,21 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       else next.add(t);
       return next;
     });
+  };
+  // 是否有任何筛选/排序偏离默认值（决定是否显示「清除筛选」）
+  const anyFilterActive =
+    groupFilter !== "" ||
+    tierFilter.size > 0 ||
+    searchQuery !== "" ||
+    hiddenStatuses.size > 0 ||
+    sortField !== "manual";
+  const clearAllFilters = () => {
+    setGroupFilter("");
+    setTierFilter(new Set());
+    setSearchQuery("");
+    setHiddenStatuses(new Set());
+    setSortField("manual");
+    setSortDir("asc");
   };
 
   // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
@@ -696,10 +780,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     });
   }, [data?.credentials]);
 
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode);
-    document.documentElement.classList.toggle("dark");
-  };
+  const toggleDarkMode = () => theme.toggle();
 
   const handleRefresh = () => {
     refetch();
@@ -1543,8 +1624,30 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         {/* 工具栏 */}
         <div className="mb-5 flex flex-col gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            {/* 原先这里有「凭据列表」标题 + 总数徽章：标题与页面大标题「凭据管理」
-                说的是同一件事，总数已由状态标签条的「全部 N」给出，两者都删掉。 */}
+            <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
+            {data?.credentials && data.credentials.length > 0 && (
+              <Badge variant="secondary">
+                {filteredCredentials.length !== data.credentials.length
+                  ? `${filteredCredentials.length} / ${data.credentials.length}`
+                  : data.credentials.length}
+              </Badge>
+            )}
+            {/*
+              筛选条件会持久化到 localStorage，下次打开仍生效。为避免用户以为
+              「数据丢了」，只要有任一筛选生效就给一个一键清空的出口。
+            */}
+            {anyFilterActive && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2 text-[11px] text-muted-foreground"
+                onClick={clearAllFilters}
+                title="清除全部筛选条件（搜索、分组、分级、隐藏状态、排序）"
+              >
+                <FilterX className="h-3 w-3" />
+                清除筛选
+              </Button>
+            )}
             {groupFilter && (
               <Badge variant="outline" className="gap-1">
                 筛选：{groupFilter === "__none__" ? "未分组" : groupFilter}
