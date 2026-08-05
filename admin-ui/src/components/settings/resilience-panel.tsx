@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { ShieldAlert, ShieldCheck, HeartPulse, HeartCrack, RotateCcw } from 'lucide-react'
+import { ShieldAlert, ShieldCheck, HeartPulse, HeartCrack, RotateCcw, Gauge } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import {
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useAccountRpmLimitConfig, useSetAccountRpmLimitConfig,
   useRetryConfig, useSetRetryConfig,
   useSelfHealConfig, useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
@@ -14,10 +15,10 @@ import { type SelfHealConfigPatch } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
 /**
- * 风控与重试面板：账号级风控故障转移、失败重试次数、凭据自愈。
+ * 风控与重试面板：账号级风控故障转移、单账号 RPM 限流、失败重试次数、凭据自愈。
  *
- * 这三块原先分别挤在顶栏的两个下拉菜单里（重试次数还嵌在风控下拉的第三层），
- * 输入框只有 h-7、说明文字被压成一行。这里铺开成三张卡片。
+ * 这几块原先分别挤在顶栏的下拉菜单里（重试次数还嵌在风控下拉的第三层），
+ * 输入框只有 h-7、说明文字被压成一行。这里铺开成四张卡片。
  */
 const COOLDOWN_PRESETS = [
   { label: '5 分钟', secs: 5 * 60 },
@@ -51,10 +52,16 @@ const DEFAULT_RETRY_TOTAL = 4
 const MAX_SELF_HEAL_ROUNDS = 1000
 const DEFAULT_SELF_HEAL_ROUNDS = 5
 
+const RPM_LIMIT_PRESETS = [10, 30, 60, 120, 300]
+const MIN_RPM_LIMIT = 1
+const MAX_RPM_LIMIT = 100000
+const DEFAULT_RPM_LIMIT = 60
+
 export function ResiliencePanel() {
   return (
     <div className="space-y-3">
       <ThrottleCard />
+      <AccountRpmLimitCard />
       <RetryCard />
       <SelfHealCard />
     </div>
@@ -361,6 +368,110 @@ function NumberField({
         className="h-8 max-w-xs text-xs"
       />
     </div>
+  )
+}
+
+// ============ 单账号 RPM 主动限流 ============
+
+/**
+ * 单账号 RPM 主动限流：开关 + 每分钟上限。
+ *
+ * 开启后每个账号独立维护 60 秒滑动窗口，达到上限时该账号被临时排除出候选，
+ * 请求自动故障转移到下一个可用账号；全部超限时返回 429。
+ */
+function AccountRpmLimitCard() {
+  const { data: config, isLoading } = useAccountRpmLimitConfig()
+  const { mutate, isPending } = useSetAccountRpmLimitConfig()
+  const [limitInput, setLimitInput] = useState('')
+
+  const enabled = config?.enabled ?? false
+  const limit = config?.limit ?? DEFAULT_RPM_LIMIT
+  const busy = isLoading || isPending
+
+  const save = (patch: { enabled?: boolean; limit?: number }, msg: string) => {
+    mutate(patch, {
+      onSuccess: () => toast.success(msg),
+      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const submitLimit = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseInt(limitInput, 10)
+    if (invalidRange(n, MIN_RPM_LIMIT, MAX_RPM_LIMIT)) {
+      toast.error(`请输入 ${MIN_RPM_LIMIT}-${MAX_RPM_LIMIT} 之间的次数`)
+      return
+    }
+    save({ limit: n }, `单账号 RPM 上限已设为 ${n} 次/分钟`)
+    setLimitInput('')
+  }
+
+  return (
+    <Card>
+      <CardContent className="space-y-3 p-4">
+        <PanelHeading
+          icon={
+            <Gauge
+              className={enabled ? 'h-4 w-4 text-emerald-600' : 'h-4 w-4 text-muted-foreground'}
+            />
+          }
+          title="单账号 RPM 限流"
+          desc="每个账号独立维护 60 秒滑动窗口，达到上限即临时排除出候选，请求自动转移到下一个可用账号；全部超限时返回 429。"
+        />
+
+        <ToggleRow
+          checked={enabled}
+          disabled={busy}
+          title={isLoading ? '加载中…' : enabled ? `已启用 · ${limit} 次/分钟` : '已关闭'}
+          desc="按账号主动限速，避免触发上游风控"
+          onChange={(v) => save({ enabled: v }, v ? '已开启单账号限流' : '已关闭单账号限流')}
+        />
+
+        <div className={enabled ? '' : 'opacity-60'}>
+          <div className="mb-1.5 text-xs font-medium text-muted-foreground">
+            每分钟上限 · 单个账号
+          </div>
+          <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-5">
+            {RPM_LIMIT_PRESETS.map((n) => (
+              <Button
+                key={n}
+                size="sm"
+                variant={limit === n ? 'default' : 'outline'}
+                className="h-8 text-xs"
+                disabled={busy || !enabled}
+                onClick={() => limit !== n && save({ limit: n }, `单账号 RPM 上限已设为 ${n} 次/分钟`)}
+              >
+                {n}/分
+              </Button>
+            ))}
+          </div>
+
+          <form onSubmit={submitLimit} className="mt-2 flex items-center gap-2">
+            <span className="shrink-0 text-xs text-muted-foreground">自定义</span>
+            <Input
+              type="number"
+              min={MIN_RPM_LIMIT}
+              max={MAX_RPM_LIMIT}
+              placeholder={`当前 ${limit}（${MIN_RPM_LIMIT}-${MAX_RPM_LIMIT}）`}
+              value={limitInput}
+              onChange={(e) => setLimitInput(e.target.value)}
+              disabled={busy || !enabled}
+              className="h-8 text-xs"
+            />
+            <span className="shrink-0 text-xs text-muted-foreground">次/分</span>
+            <Button
+              type="submit"
+              size="sm"
+              variant="outline"
+              className="h-8 shrink-0 text-xs"
+              disabled={busy || !enabled || !limitInput.trim()}
+            >
+              保存
+            </Button>
+          </form>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
