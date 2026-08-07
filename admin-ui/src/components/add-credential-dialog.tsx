@@ -57,6 +57,35 @@ interface BatchRowResult {
   proxyUrl?: string
 }
 
+// Region 快速预设。与后端保持一致：
+// - Auth Region 决定 Token 刷新域名（prod.<authRegion>.auth.desktop.kiro.dev / oidc.<authRegion>.amazonaws.com）
+// - API Region 决定 API 请求域名（q.<apiRegion>.amazonaws.com）
+const REGION_PRESETS = {
+  us: { authRegion: 'us-east-1', apiRegion: 'us-east-1' },
+  eu: { authRegion: 'eu', apiRegion: 'eu-central-1' },
+} as const
+
+type RegionPresetKey = keyof typeof REGION_PRESETS
+// 'global' = 两者留空走全局配置；'custom' = 手动填了不匹配预设的值
+type RegionSelection = RegionPresetKey | 'global' | 'custom'
+
+const REGION_OPTIONS: { value: RegionPresetKey | 'global'; label: string }[] = [
+  { value: 'global', label: '默认（全局）' },
+  { value: 'us', label: 'US 美国区' },
+  { value: 'eu', label: 'EU 欧洲区' },
+]
+
+// 由当前两个输入框反推选中的预设，保证手动改值后高亮状态同步
+function matchRegionPreset(authRegion: string, apiRegion: string): RegionSelection {
+  const auth = authRegion.trim()
+  const api = apiRegion.trim()
+  if (!auth && !api) return 'global'
+  for (const [key, preset] of Object.entries(REGION_PRESETS)) {
+    if (auth === preset.authRegion && api === preset.apiRegion) return key as RegionPresetKey
+  }
+  return 'custom'
+}
+
 // 把批量文本框按行拆成去重后的凭据列表（忽略空行与 # 注释）
 function parseBatchLines(text: string): string[] {
   const seen = new Set<string>()
@@ -126,6 +155,24 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
   const useBatch = batchMode && batchSupported
 
   const batchLines = useMemo(() => parseBatchLines(batchText), [batchText])
+
+  // 当前选中的 Region 预设由输入框值反推，手动编辑后自动落到 custom
+  const regionSelection = useMemo(
+    () => matchRegionPreset(authRegion, apiRegion),
+    [authRegion, apiRegion],
+  )
+
+  // 快速选择：global 清空两者（走全局配置），us/eu 回填对应 Region
+  const applyRegionPreset = (value: RegionPresetKey | 'global') => {
+    if (value === 'global') {
+      setAuthRegion('')
+      setApiRegion('')
+      return
+    }
+    const preset = REGION_PRESETS[value]
+    setAuthRegion(preset.authRegion)
+    setApiRegion(preset.apiRegion)
+  }
 
   const resetForm = () => {
     setRefreshToken('')
@@ -497,6 +544,28 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
+              {/* 快速选择：一键回填 Auth / API Region */}
+              <div
+                className="grid grid-cols-3 rounded-md border p-1"
+                role="radiogroup"
+                aria-label="Region 快速选择"
+              >
+                {REGION_OPTIONS.map((opt) => (
+                  <Button
+                    key={opt.value}
+                    type="button"
+                    size="sm"
+                    variant={regionSelection === opt.value ? 'default' : 'ghost'}
+                    role="radio"
+                    aria-checked={regionSelection === opt.value}
+                    onClick={() => applyRegionPreset(opt.value)}
+                    disabled={isPending || importing}
+                    className="h-8"
+                  >
+                    {opt.label}
+                  </Button>
+                ))}
+              </div>
               <div className="grid grid-cols-2 gap-2">
                 <Input
                   id="authRegion"
@@ -516,7 +585,9 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                选「跟随全局配置」即沿用 config.json 的 region；预设里没有的区域可直接手输
+                {regionSelection === 'custom'
+                  ? '当前为自定义 Region。Auth Region 用于 Token 刷新，API Region 用于 API 请求'
+                  : '可用上方按钮快速切换，也可手动填写。均留空则使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求'}
               </p>
             </div>
 
