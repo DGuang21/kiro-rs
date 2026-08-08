@@ -541,44 +541,20 @@ pub(crate) async fn get_usage_limits(
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
-    // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
-    let kiro_version = USAGE_API_KIRO_VERSION;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
-
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     let attempts = usage_api_attempts(credentials, &candidates);
 
     let mut last_error: Option<String> = None;
-    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
-        let url = usage_limits_url(&host, *profile_arn);
-
-        let mut request = client
-            .get(&url)
-            .header("x-amz-user-agent", &amz_user_agent)
-            .header("user-agent", &user_agent)
-            .header("host", &host)
-            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close");
-
-        if let Some(token_type) = credentials.token_type_header() {
-            request = request.header("tokentype", token_type);
-        }
-
-        let response = request.send().await?;
+    for (idx, region) in candidates.iter().enumerate() {
+        let response = send_usage_limits_request(
+            &client,
+            credentials,
+            config,
+            token,
+            region,
+        )
+        .await?;
 
         let status = response.status();
         let rate_limit_error = (status.as_u16() == 429)
@@ -619,6 +595,81 @@ pub(crate) async fn get_usage_limits(
         "权限不足，无法获取使用额度: {}",
         last_error.unwrap_or_else(|| "无可用端点".to_string())
     );
+}
+
+/// 使用指定的单一区域探测 API Key，禁止 403 后跨区回退。
+///
+/// `Ok(true)` 表示该区域返回了合法的用量响应；`Ok(false)` 表示该区域明确以
+/// 401/403 拒绝该 Key。限流、网络错误和上游 5xx 不能用来判断区域，按错误返回。
+pub(crate) async fn probe_api_key_region(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    api_region: &str,
+) -> anyhow::Result<bool> {
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let response =
+        send_usage_limits_request(&client, credentials, config, token, api_region).await?;
+    let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
+
+    if status.is_success() {
+        let _: UsageLimitsResponse = response.json().await?;
+        return Ok(true);
+    }
+
+    let body_text = response.text().await.unwrap_or_default();
+    if let Some(error) = rate_limit_error {
+        return Err(error.into());
+    }
+    if matches!(status.as_u16(), 401 | 403) {
+        return Ok(false);
+    }
+
+    bail!(
+        "区域 {} 探测失败: {} {}",
+        api_region,
+        status,
+        body_text
+    );
+}
+
+async fn send_usage_limits_request(
+    client: &reqwest::Client,
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    api_region: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
+    // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
+    let kiro_version = USAGE_API_KIRO_VERSION;
+    let host = format!("q.{}.amazonaws.com", api_region);
+    let url = usage_limits_url(&host, credentials);
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let mut request = client
+        .get(&url)
+        .header("x-amz-user-agent", amz_user_agent)
+        .header("user-agent", user_agent)
+        .header("host", host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close");
+
+    if let Some(token_type) = credentials.token_type_header() {
+        request = request.header("tokentype", token_type);
+    }
+
+    Ok(request.send().await?)
 }
 
 /// 获取该凭据当前可用的模型列表
@@ -3161,6 +3212,21 @@ impl MultiTokenManager {
             .iter()
             .find(|entry| entry.id == id)
             .map(CredentialEntry::credentials_snapshot)
+    }
+
+    /// 检查 API Key 是否已经入库，供需要在外部请求前短路的导入流程使用。
+    pub fn contains_api_key(&self, api_key: &str) -> bool {
+        let api_key_hash = sha256_hex(api_key);
+        let entries = self.entries.lock();
+        entries.iter().any(|entry| {
+            entry
+                .credentials
+                .kiro_api_key
+                .as_deref()
+                .map(sha256_hex)
+                .as_deref()
+                == Some(api_key_hash.as_str())
+        })
     }
 
     /// 获取管理器状态快照（用于 Admin API）

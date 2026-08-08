@@ -28,7 +28,7 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
-    IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
+    IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError, probe_api_key_region,
 };
 use crate::model::config::Config;
 
@@ -147,6 +147,13 @@ struct CachedBalance {
     cached_at: f64,
     /// 缓存的余额数据
     data: BalanceResponse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushedKeyImportResult {
+    pub imported: bool,
+    pub zone: Option<crate::admin::upstream::KiroCeoZone>,
+    pub auto_detected: bool,
 }
 
 fn available_models_response(
@@ -3088,13 +3095,17 @@ impl AdminService {
 
     /// 把直推 webhook 携带的单个 Kiro API Key 入库。
     ///
-    /// 返回 `true` 表示新入库，`false` 表示该 Key 已存在。重复检测由
-    /// `MultiTokenManager` 基于 Key 哈希完成，因此进程重启后仍然有效。
+    /// 未声明区域时会严格请求 US / EU 端点各一次（不跨区回退），确认区域后再入库。
+    /// 重复检测由 `MultiTokenManager` 基于 Key 哈希完成，因此进程重启后仍然有效，
+    /// 且重复推送不会再次触发区域探测。
     pub async fn upstream_import_pushed_key(
         &self,
         cfg: &crate::admin::upstream::UpstreamConfig,
         key: &str,
-    ) -> anyhow::Result<bool> {
+        zone: Option<crate::admin::upstream::KiroCeoZone>,
+    ) -> anyhow::Result<PushedKeyImportResult> {
+        use crate::admin::upstream::KiroCeoZone;
+
         let key = key.trim();
         if key.is_empty() {
             anyhow::bail!("Webhook 推送缺少 key");
@@ -3103,28 +3114,82 @@ impl AdminService {
             anyhow::bail!("Webhook 推送的 key 格式无效");
         }
 
+        if self.token_manager.contains_api_key(key) {
+            return Ok(PushedKeyImportResult {
+                imported: false,
+                zone,
+                auto_detected: false,
+            });
+        }
+
         let proxy_urls = self.proxy_pool.assignable_urls();
         let proxy_url = if proxy_urls.is_empty() {
             None
         } else {
             Some(proxy_urls[fastrand::usize(0..proxy_urls.len())].clone())
         };
+        let auto_detected = zone.is_none();
+        let zone = match zone {
+            Some(zone) => zone,
+            None => {
+                let us_credentials = pushed_key_probe_credentials(
+                    key,
+                    proxy_url.clone(),
+                    KiroCeoZone::Us,
+                );
+                let eu_credentials = pushed_key_probe_credentials(
+                    key,
+                    proxy_url.clone(),
+                    KiroCeoZone::Eu,
+                );
+                let global_proxy = self.token_manager.proxy();
+                let us_proxy = us_credentials.effective_proxy(global_proxy.as_ref());
+                let eu_proxy = eu_credentials.effective_proxy(global_proxy.as_ref());
+                let config = self.token_manager.config();
+                let (us_result, eu_result) = tokio::join!(
+                    probe_api_key_region(
+                        &us_credentials,
+                        config,
+                        key,
+                        us_proxy.as_ref(),
+                        "us-east-1",
+                    ),
+                    probe_api_key_region(
+                        &eu_credentials,
+                        config,
+                        key,
+                        eu_proxy.as_ref(),
+                        "eu-central-1",
+                    ),
+                );
+                resolve_pushed_key_zone(us_result, eu_result)?
+            }
+        };
+        let (auth_region, api_region) = api_key_regions_for_zone(zone);
         let req = build_api_key_credential_request(
             key.to_string(),
             proxy_url,
             cfg.endpoint.clone(),
             cfg.groups.clone(),
             Some(cfg.name.clone()),
-            None,
-            None,
+            auth_region,
+            api_region,
         );
 
         match self.add_credential_inner(req, false).await {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(PushedKeyImportResult {
+                imported: true,
+                zone: Some(zone),
+                auto_detected,
+            }),
             Err(error) => {
                 let message = error.to_string();
                 if message.contains("kiroApiKey 重复") || message.contains("凭据已存在") {
-                    Ok(false)
+                    Ok(PushedKeyImportResult {
+                        imported: false,
+                        zone: Some(zone),
+                        auto_detected,
+                    })
                 } else {
                     Err(anyhow::anyhow!(message))
                 }
@@ -3887,12 +3952,69 @@ fn api_key_credential_regions(
     platform: crate::admin::upstream::UpstreamPlatform,
     zone: Option<crate::admin::upstream::KiroCeoZone>,
 ) -> (Option<String>, Option<String>) {
-    if platform == crate::admin::upstream::UpstreamPlatform::KiroCeo
-        && zone == Some(crate::admin::upstream::KiroCeoZone::Eu)
-    {
-        return (Some("eu".to_string()), Some("eu-central-1".to_string()));
+    if platform == crate::admin::upstream::UpstreamPlatform::KiroCeo {
+        return zone
+            .map(api_key_regions_for_zone)
+            .unwrap_or((None, None));
     }
     (None, None)
+}
+
+fn api_key_regions_for_zone(
+    zone: crate::admin::upstream::KiroCeoZone,
+) -> (Option<String>, Option<String>) {
+    use crate::admin::upstream::KiroCeoZone;
+
+    match zone {
+        KiroCeoZone::Us => (
+            Some("us-east-1".to_string()),
+            Some("us-east-1".to_string()),
+        ),
+        KiroCeoZone::Eu => (Some("eu".to_string()), Some("eu-central-1".to_string())),
+    }
+}
+
+fn pushed_key_probe_credentials(
+    key: &str,
+    proxy_url: Option<String>,
+    zone: crate::admin::upstream::KiroCeoZone,
+) -> KiroCredentials {
+    let (auth_region, api_region) = api_key_regions_for_zone(zone);
+    KiroCredentials {
+        auth_method: Some("api_key".to_string()),
+        auth_region,
+        api_region,
+        proxy_url,
+        kiro_api_key: Some(key.to_string()),
+        ..KiroCredentials::default()
+    }
+}
+
+fn resolve_pushed_key_zone(
+    us: anyhow::Result<bool>,
+    eu: anyhow::Result<bool>,
+) -> anyhow::Result<crate::admin::upstream::KiroCeoZone> {
+    use crate::admin::upstream::KiroCeoZone;
+
+    match (&us, &eu) {
+        (Ok(true), Ok(false) | Err(_)) => return Ok(KiroCeoZone::Us),
+        (Ok(false) | Err(_), Ok(true)) => return Ok(KiroCeoZone::Eu),
+        _ => {}
+    }
+
+    anyhow::bail!(
+        "无法唯一确认直推 Key 区域（US: {}，EU: {}）",
+        pushed_key_probe_result_label(&us),
+        pushed_key_probe_result_label(&eu),
+    )
+}
+
+fn pushed_key_probe_result_label(result: &anyhow::Result<bool>) -> String {
+    match result {
+        Ok(true) => "有效".to_string(),
+        Ok(false) => "无效".to_string(),
+        Err(error) => format!("探测失败: {error}"),
+    }
 }
 
 fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
@@ -4137,7 +4259,10 @@ mod tests {
 
         assert_eq!(
             api_key_credential_regions(UpstreamPlatform::KiroCeo, Some(KiroCeoZone::Us)),
-            (None, None)
+            (
+                Some("us-east-1".to_string()),
+                Some("us-east-1".to_string())
+            )
         );
         assert_eq!(
             api_key_credential_regions(UpstreamPlatform::Legacy, Some(KiroCeoZone::Eu)),
@@ -4145,8 +4270,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pushed_key_probe_must_identify_exactly_one_region() {
+        use crate::admin::upstream::KiroCeoZone;
+
+        assert_eq!(
+            resolve_pushed_key_zone(Ok(true), Ok(false)).unwrap(),
+            KiroCeoZone::Us
+        );
+        assert_eq!(
+            resolve_pushed_key_zone(Ok(false), Ok(true)).unwrap(),
+            KiroCeoZone::Eu
+        );
+        assert_eq!(
+            resolve_pushed_key_zone(Ok(true), Err(anyhow::anyhow!("EU timeout"))).unwrap(),
+            KiroCeoZone::Us
+        );
+        assert_eq!(
+            resolve_pushed_key_zone(Err(anyhow::anyhow!("US timeout")), Ok(true)).unwrap(),
+            KiroCeoZone::Eu
+        );
+        assert!(resolve_pushed_key_zone(Ok(true), Ok(true)).is_err());
+        assert!(resolve_pushed_key_zone(Ok(false), Ok(false)).is_err());
+        assert!(
+            resolve_pushed_key_zone(Ok(false), Err(anyhow::anyhow!("EU timeout"))).is_err()
+        );
+    }
+
+    #[test]
+    fn pushed_key_probe_credentials_pin_auth_and_api_regions() {
+        use crate::admin::upstream::KiroCeoZone;
+
+        let us = pushed_key_probe_credentials("ksk_us", None, KiroCeoZone::Us);
+        assert_eq!(us.auth_region.as_deref(), Some("us-east-1"));
+        assert_eq!(us.api_region.as_deref(), Some("us-east-1"));
+
+        let eu = pushed_key_probe_credentials("ksk_eu", None, KiroCeoZone::Eu);
+        assert_eq!(eu.auth_region.as_deref(), Some("eu"));
+        assert_eq!(eu.api_region.as_deref(), Some("eu-central-1"));
+    }
+
     #[tokio::test]
     async fn pushed_key_import_is_persistently_deduplicated() {
+        use crate::admin::upstream::KiroCeoZone;
+
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
         );
@@ -4168,18 +4335,21 @@ mod tests {
             )
             .unwrap();
 
-        assert!(
-            service
-                .upstream_import_pushed_key(&cfg, "ksk_live_once")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !service
-                .upstream_import_pushed_key(&cfg, "ksk_live_once")
-                .await
-                .unwrap()
-        );
+        let imported = service
+            .upstream_import_pushed_key(&cfg, "ksk_live_once", Some(KiroCeoZone::Us))
+            .await
+            .unwrap();
+        assert!(imported.imported);
+        assert_eq!(imported.zone, Some(KiroCeoZone::Us));
+        assert!(!imported.auto_detected);
+
+        let duplicate = service
+            .upstream_import_pushed_key(&cfg, "ksk_live_once", None)
+            .await
+            .unwrap();
+        assert!(!duplicate.imported);
+        assert_eq!(duplicate.zone, None);
+        assert!(!duplicate.auto_detected);
 
         let credentials = service.get_all_credentials().credentials;
         assert_eq!(manager.available_count(), 1);
@@ -4187,6 +4357,9 @@ mod tests {
         assert_eq!(credentials[0].endpoint, "cli");
         assert_eq!(credentials[0].groups, vec!["webhook"]);
         assert_eq!(credentials[0].source_channel.as_deref(), Some("Kiro push"));
+        let stored = manager.clone_credential(credentials[0].id).unwrap();
+        assert_eq!(stored.auth_region.as_deref(), Some("us-east-1"));
+        assert_eq!(stored.api_region.as_deref(), Some("us-east-1"));
     }
 
     #[test]
