@@ -107,8 +107,8 @@ pub enum KiroCeoZone {
 impl KiroCeoZone {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "us" => Some(Self::Us),
-            "eu" => Some(Self::Eu),
+            "us" | "us-east-1" => Some(Self::Us),
+            "eu" | "eu-central-1" => Some(Self::Eu),
             _ => None,
         }
     }

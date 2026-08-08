@@ -669,8 +669,8 @@ pub struct WebhookPayload {
     /// Kiro Market 的开号批次 id。原样回传给 `POST /api/me/purchase` 即可只拉该批次的 Key。
     #[serde(default)]
     pub order_id: Option<String>,
-    /// Kiro CEO 补货区域（us / eu）。
-    #[serde(default)]
+    /// 补货或直推 Key 区域（us / eu）。直推未提供时自动探测。
+    #[serde(default, alias = "region", alias = "key_region", alias = "keyRegion")]
     pub zone: Option<String>,
     /// Kiro Market：母号 id，仅记录
     #[serde(default)]
@@ -737,6 +737,10 @@ pub async fn receive_webhook(
         if !key.starts_with("ksk_") {
             return bad_request("key_pulled 事件的 key 格式无效");
         }
+        let key_zone = match pushed_key_zone(payload.zone.as_deref()) {
+            Ok(zone) => zone,
+            Err(error) => return bad_request(error),
+        };
 
         let masked_key = payload
             .key_masked
@@ -751,7 +755,10 @@ pub async fn receive_webhook(
         let pulled_at = payload.pulled_at;
         let state2 = state.clone();
         tokio::spawn(async move {
-            import_pushed_key(state2, cfg, key, masked_key, provider, pulled_at).await;
+            import_pushed_key(
+                state2, cfg, key, masked_key, provider, pulled_at, key_zone,
+            )
+            .await;
         });
         return Json(serde_json::json!({ "ok": true })).into_response();
     }
@@ -887,25 +894,34 @@ async fn import_pushed_key(
     masked_key: String,
     provider: String,
     pulled_at: Option<i64>,
+    zone: Option<KiroCeoZone>,
 ) {
     let source = pulled_at
         .map(|timestamp| format!("{} @ {}", provider, timestamp))
         .unwrap_or(provider);
-    match state.service.upstream_import_pushed_key(&cfg, &key).await {
-        Ok(true) => {
-            tracing::info!("上游 {} 直推 Key 已入库", cfg.name);
+    match state
+        .service
+        .upstream_import_pushed_key(&cfg, &key, zone)
+        .await
+    {
+        Ok(result) if result.imported => {
+            let region = pushed_key_region_description(result.zone, result.auto_detected);
+            tracing::info!("上游 {} 直推 Key 已按 {} 入库", cfg.name, region);
             state.upstream_events.push(make_event(
                 &cfg.id,
                 &cfg.name,
                 UpstreamEventKind::KeyPulled,
-                format!("收到 {} 直推 Key {}，已入库", source, masked_key),
+                format!(
+                    "收到 {} 直推 Key {}，已按 {} 入库",
+                    source, masked_key, region
+                ),
                 None,
                 Some(1),
                 Some(1),
                 true,
             ));
         }
-        Ok(false) => {
+        Ok(_) => {
             tracing::info!("上游 {} 直推了重复 Key，已忽略", cfg.name);
             state.upstream_events.push(make_event(
                 &cfg.id,
@@ -1031,6 +1047,27 @@ fn webhook_kiro_ceo_zone(
     }
 }
 
+fn pushed_key_zone(value: Option<&str>) -> Result<Option<KiroCeoZone>, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => KiroCeoZone::parse(value)
+            .map(Some)
+            .ok_or_else(|| format!("key_pulled 事件的区域无效: {value}")),
+    }
+}
+
+fn pushed_key_region_description(zone: Option<KiroCeoZone>, auto_detected: bool) -> String {
+    let Some(zone) = zone else {
+        return "原有区域".to_string();
+    };
+    let zone = zone.as_str().to_ascii_uppercase();
+    if auto_detected {
+        format!("{zone}（自动探测）")
+    } else {
+        zone
+    }
+}
+
 fn mask_pushed_key(key: &str) -> String {
     let prefix: String = key.chars().take(6).collect();
     format!("{}****", prefix)
@@ -1097,6 +1134,30 @@ mod tests {
         assert_eq!(payload.pulled_at, Some(1730300000000));
         assert_eq!(payload.key_masked.as_deref(), Some("ksk_ab****"));
         assert_eq!(payload.key.as_deref(), Some("ksk_live_xxxxxxxx"));
+    }
+
+    #[test]
+    fn parses_pushed_key_region_aliases_and_rejects_unknown_regions() {
+        for (field, value, expected) in [
+            ("zone", "us", KiroCeoZone::Us),
+            ("region", "eu-central-1", KiroCeoZone::Eu),
+            ("key_region", "us-east-1", KiroCeoZone::Us),
+            ("keyRegion", "eu", KiroCeoZone::Eu),
+        ] {
+            let payload: WebhookPayload = serde_json::from_value(serde_json::json!({
+                "event": "key_pulled",
+                "key": "ksk_live_xxxxxxxx",
+                field: value,
+            }))
+            .unwrap();
+            assert_eq!(
+                pushed_key_zone(payload.zone.as_deref()).unwrap(),
+                Some(expected)
+            );
+        }
+
+        assert_eq!(pushed_key_zone(None).unwrap(), None);
+        assert!(pushed_key_zone(Some("ap-southeast-1")).is_err());
     }
 
     #[test]
