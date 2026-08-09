@@ -1551,17 +1551,16 @@ async fn run_web_search_loop_inner(
         let final_usage = settlement.usage();
         settlement.finish("success", "success", None, None);
 
-        return if let Some(emitter) = emitter.as_deref_mut() {
-            emitter
-                .finish(
-                    content,
-                    &stop_reason,
-                    final_usage,
-                    &all_thinking,
-                    latest_metering.as_ref(),
-                )
-                .await;
-            StatusCode::OK.into_response()
+        return if stream_client {
+            render_sse(
+                &payload.model,
+                content,
+                &stop_reason,
+                final_input,
+                output_tokens,
+                &all_thinking,
+                latest_metering.as_ref(),
+            )
         } else {
             render_json(
                 &payload.model,
@@ -1636,6 +1635,47 @@ pub(crate) fn render_json(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// SSE response (streaming): splits the final content into a sequence of Anthropic content_block events
+pub(crate) fn render_sse(
+    model: &str,
+    content: Vec<Value>,
+    stop_reason: &str,
+    input_tokens: i32,
+    output_tokens: i32,
+    thinking: &str,
+    metering: Option<&MeteringEvent>,
+) -> Response {
+    let mut render_content = Vec::with_capacity(content.len() + 1);
+    if !thinking.is_empty() {
+        render_content.push(json!({
+            "type": "thinking",
+            "thinking": thinking,
+            "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+        }));
+    }
+    render_content.extend(content);
+    let events = build_sse_events(
+        model,
+        render_content,
+        stop_reason,
+        input_tokens,
+        output_tokens,
+        metering,
+    );
+    let stream = stream::iter(
+        events
+            .into_iter()
+            .map(|e| Ok::<Bytes, Infallible>(Bytes::from(e.to_sse_string()))),
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
 /// Renders the final content array into a sequence of SSE events
 #[cfg(test)]
 fn build_sse_events(
@@ -1671,8 +1711,79 @@ fn build_sse_events(
         }),
     ));
 
-    let (content_events, _) = build_sse_content_events(&content, 0);
-    events.extend(content_events);
+    for (index, block) in content.iter().enumerate() {
+        let index = index as i32;
+        let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match btype {
+            "thinking" => {
+                let thinking = block
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let signature = block
+                    .get("signature")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(super::stream::THINKING_SIGNATURE_PLACEHOLDER);
+                events.push(SseEvent::new("content_block_start", json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                })));
+                events.push(SseEvent::new("content_block_delta", json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": thinking}
+                })));
+                events.push(SseEvent::new("content_block_delta", json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "signature_delta", "signature": signature}
+                })));
+                events.push(SseEvent::new("content_block_stop", json!({
+                    "type": "content_block_stop", "index": index
+                })));
+            }
+            "text" => {
+                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                events.push(SseEvent::new("content_block_start", json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                })));
+                events.push(SseEvent::new("content_block_delta", json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "text_delta", "text": text}
+                })));
+                events.push(SseEvent::new("content_block_stop", json!({
+                    "type": "content_block_stop", "index": index
+                })));
+            }
+            "tool_use" => {
+                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                let partial = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                events.push(SseEvent::new("content_block_start", json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+                })));
+                events.push(SseEvent::new("content_block_delta", json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": partial}
+                })));
+                events.push(SseEvent::new("content_block_stop", json!({
+                    "type": "content_block_stop", "index": index
+                })));
+            }
+            "server_tool_use" | "web_search_tool_result" => {
+                events.push(SseEvent::new("content_block_start", json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": block
+                })));
+                events.push(SseEvent::new("content_block_stop", json!({
+                    "type": "content_block_stop", "index": index
+                })));
+            }
+            _ => {}
+        }
+    }
 
     let mut message_delta_usage = json!({ "output_tokens": token_usage.output_tokens });
     // 透传上游 meteringEvent 的 credit_* 字段（仅在拿到 meteringEvent 时）。

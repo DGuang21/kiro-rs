@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
-use super::types::{Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool};
+use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -266,6 +266,11 @@ fn openai_to_anthropic(
         .reasoning_effort
         .filter(|e| !e.trim().is_empty())
         .map(|effort| OutputConfig { effort });
+    // The shared handler only emits native reasoning when thinking is enabled.
+    let thinking = output_config.as_ref().map(|_| Thinking {
+        thinking_type: "adaptive".to_string(),
+        budget_tokens: 20_000,
+    });
 
     Ok(MessagesRequest {
         model: req.model,
@@ -279,7 +284,7 @@ fn openai_to_anthropic(
         },
         tools,
         tool_choice,
-        thinking: None,
+        thinking,
         output_config,
         metadata,
     })
