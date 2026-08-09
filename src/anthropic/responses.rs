@@ -56,6 +56,7 @@ use super::openai::{
 use super::types::{
     Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
 };
+use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -402,14 +403,10 @@ fn responses_to_anthropic(
         .and_then(|r| r.effort.clone())
         .filter(|e| !e.trim().is_empty())
         .map(|effort| OutputConfig { effort });
-    let thinking = req.reasoning.and_then(|reasoning| {
-        reasoning
-            .effort
-            .filter(|effort| !effort.trim().is_empty())
-            .map(|_| Thinking {
-                thinking_type: "enabled".to_string(),
-                budget_tokens: 20_000,
-            })
+    // The shared handler only emits native reasoning when thinking is enabled.
+    let thinking = output_config.as_ref().map(|_| Thinking {
+        thinking_type: "adaptive".to_string(),
+        budget_tokens: 20_000,
     });
 
     Ok((
