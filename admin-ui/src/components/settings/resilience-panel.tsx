@@ -259,6 +259,11 @@ function ThrottleCard() {
 
 /**
  * 实际重试次数 = min(分组内账号数 × 每凭据次数, 总上限)。
+ *
+ * 「每凭据」= 单个账号在一次请求内最多试几次，用尽后本次请求不再选它，
+ * 优先级选择器随之降到下一层。要真正降级，「总上限」需留余量：最坏情况需
+ * 最高优先级层账号数 × 每凭据次数 + 1。
+ *
  * 两个输入默认留空、placeholder 显示当前值；留空表示不改该项。
  */
 function RetryCard() {
@@ -306,7 +311,7 @@ function RetryCard() {
         <PanelHeading
           icon={<RotateCcw className="h-4 w-4 text-muted-foreground" />}
           title={`失败重试次数${isLoading ? '（加载中…）' : ` · 每凭据 ${curPer} / 上限 ${curTotal}`}`}
-          desc="实际重试次数 = min(分组内账号数 × 每凭据次数, 总上限)。留空表示不修改该项。"
+          desc="每凭据 = 单账号在一次请求内的尝试上限，用尽后换下一个账号（优先级随之降层）。实际重试次数 = min(分组内账号数 × 每凭据次数, 总上限)；总上限需留余量才能降到下一层。留空表示不修改该项。"
         />
 
         <form onSubmit={submit} className="space-y-2">
