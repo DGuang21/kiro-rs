@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2007,10 +2007,27 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[cfg(test)]
     fn select_next_credential(
         &self,
         model: Option<&str>,
         group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_excluding(model, group, &HashSet::new())
+    }
+
+    /// 与 [`Self::select_next_credential`] 相同，但额外排除 `skip` 中的凭据。
+    ///
+    /// `skip` 是**单次请求内**已用尽本请求重试配额的凭据集合，由调用方（provider 的
+    /// 重试循环）维护，不写入任何全局状态。这样"同一次请求内不再重复选中已失败的号"
+    /// 与"该号对其它并发请求依然可用"两件事互不干扰：瞬态 429/5xx 不应污染全局
+    /// 可用性（否则一次上游抖动会把所有号误禁用），但也不该让同一次请求在同一层里
+    /// 反复撞墙、耗尽预算却从未降级到下一优先级层。
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        skip: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
@@ -2019,6 +2036,9 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter_map(|e| {
+                if skip.contains(&e.id) {
+                    return None;
+                }
                 if !self.entry_available_for_request(e, model, group, now) {
                     return None;
                 }
@@ -2109,12 +2129,29 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[cfg(test)]
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, true)
+        self.acquire_context_impl(model, group, true, &HashSet::new())
+            .await
+            .map(|(context, _)| context)
+    }
+
+    /// 与 [`Self::acquire_context`] 相同，但排除本次请求内已用尽重试配额的凭据。
+    ///
+    /// 供 provider 的重试循环使用：`skip` 非空时，选择器会跳过这些凭据，使
+    /// `min(priority)` 自然落到下一优先级层，实现"高优先级层撞满配额后降级"。
+    /// `skip` 覆盖全部候选时返回 Err，调用方应结束重试并返回已记录的上游错误。
+    pub async fn acquire_context_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        skip: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_impl(model, group, true, skip)
             .await
             .map(|(context, _)| context)
     }
@@ -2128,6 +2165,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
         update_current: bool,
+        skip: &HashSet<u64>,
     ) -> anyhow::Result<(CallContext, bool)> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -2175,6 +2213,7 @@ impl MultiTokenManager {
                         .iter()
                         .find(|e| {
                             e.id == current_id
+                                && !skip.contains(&e.id)
                                 && self.entry_available_for_request(e, model, group, now)
                                 && Some(e.credentials.priority) == best_priority
                         })
@@ -2185,12 +2224,12 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
+                    let mut best = self.select_next_credential_excluding(model, group, skip);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                     // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
                     if best.is_none() && self.try_self_heal(model, group) {
-                        best = self.select_next_credential(model, group);
+                        best = self.select_next_credential_excluding(model, group, skip);
                     }
 
                     if let Some((new_id, new_creds)) = best {
@@ -2212,6 +2251,16 @@ impl MultiTokenManager {
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
                         let available = entries.iter().filter(|e| !e.disabled).count();
+                        if !skip.is_empty() {
+                            // 全局仍可能有未禁用的号，只是本次请求都已用尽各自配额。
+                            // 与"所有凭据均已禁用"区分，避免误导排障。
+                            anyhow::bail!(
+                                "本次请求内所有候选凭据均已用尽重试配额（未禁用: {}/{}，本次已排除 {} 个）",
+                                available,
+                                total,
+                                skip.len()
+                            );
+                        }
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                     // 注意：必须在 bail! 之前计算 available_count，
@@ -3818,7 +3867,9 @@ impl MultiTokenManager {
     pub async fn get_available_models_for_current(
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
-        let (context, is_balanced) = self.acquire_context_impl(None, None, false).await?;
+        let (context, is_balanced) = self
+            .acquire_context_impl(None, None, false, &HashSet::new())
+            .await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
         Ok((id, response, is_balanced))
@@ -6090,7 +6141,7 @@ mod tests {
         manager.report_success(1);
 
         let (context, is_balanced) = manager
-            .acquire_context_impl(None, None, false)
+            .acquire_context_impl(None, None, false, &HashSet::new())
             .await
             .unwrap();
 
@@ -7597,6 +7648,90 @@ mod tests {
                 "顶层耗尽后应降级到低优先级层 D"
             );
         }
+    }
+
+    /// priority-random：单次请求内排除顶层账号（瞬态错误用尽本请求配额）后，
+    /// 选择器必须降级到下一优先级层 —— 且不依赖任何全局禁用/冷却。
+    ///
+    /// 这是"优先级 0 的号 429 重试若干次后往优先级 5 走"的核心保障：瞬态错误
+    /// 刻意不禁用凭据（避免上游抖动锁死全部账号），因此降级只能靠本请求内的
+    /// 排除集合驱动。
+    #[test]
+    fn test_select_excluding_falls_back_to_next_tier_without_global_state() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-random".to_string();
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 0;
+        let mut d = grouped_cred("d", &[]);
+        d.priority = 5;
+        let manager = MultiTokenManager::new(config, vec![a, b, d], None, None, false).unwrap();
+
+        // 排除顶层其中一个：仍应留在顶层（另一个 priority=0 的号还没用尽配额）
+        let skip_one: HashSet<u64> = [1].into_iter().collect();
+        for _ in 0..50 {
+            assert_eq!(
+                manager
+                    .select_next_credential_excluding(None, None, &skip_one)
+                    .map(|(id, _)| id),
+                Some(2),
+                "顶层还有未用尽配额的账号时不应降级"
+            );
+        }
+
+        // 顶层两个都用尽本请求配额 → 降级到 priority=5 的 D(id3)
+        let skip_tier: HashSet<u64> = [1, 2].into_iter().collect();
+        assert_eq!(
+            manager
+                .select_next_credential_excluding(None, None, &skip_tier)
+                .map(|(id, _)| id),
+            Some(3),
+            "顶层在本次请求内全部用尽配额后应降级到优先级 5"
+        );
+
+        // 关键：排除只作用于本次请求，全局可用性未被污染
+        let snapshot = manager.snapshot();
+        assert!(
+            snapshot.entries.iter().all(|c| !c.disabled),
+            "本请求内的排除不得禁用任何凭据"
+        );
+        for _ in 0..50 {
+            let id = manager.select_next_credential(None, None).map(|(id, _)| id);
+            assert!(
+                matches!(id, Some(1) | Some(2)),
+                "不带排除集合时（其它并发请求）仍应选顶层账号，实际={:?}",
+                id
+            );
+        }
+    }
+
+    /// 单次请求内全部候选都被排除时，acquire 必须报"本请求配额用尽"而非
+    /// "所有凭据均已禁用" —— 后者会把排障引向错误方向。
+    #[tokio::test]
+    async fn test_acquire_context_excluding_reports_request_scoped_exhaustion() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority-random".to_string();
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        let manager = MultiTokenManager::new(config, vec![a], None, None, false).unwrap();
+
+        let skip: HashSet<u64> = [1].into_iter().collect();
+        // CallContext 未实现 Debug，无法用 expect_err
+        let message = match manager.acquire_context_excluding(None, None, &skip).await {
+            Ok(_) => panic!("全部候选被排除后应失败"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("用尽重试配额"),
+            "错误信息应指向本请求配额用尽，实际={}",
+            message
+        );
+        assert!(
+            !message.contains("所有凭据均已禁用"),
+            "不应误报为全局禁用，实际={}",
+            message
+        );
     }
 
     #[tokio::test]

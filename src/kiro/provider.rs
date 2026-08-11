@@ -357,16 +357,22 @@ impl KiroProvider {
         group: Option<&str>,
     ) -> anyhow::Result<McpCallResult> {
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials
-            * self.token_manager.get_max_retries_per_credential())
-        .min(self.token_manager.get_max_total_retries());
+        let max_retries_per_credential = self.token_manager.get_max_retries_per_credential();
+        let max_retries = (total_credentials * max_retries_per_credential)
+            .min(self.token_manager.get_max_total_retries());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut attempts_per_credential: HashMap<u64, usize> = HashMap::new();
+        let mut exhausted: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
-            let mut ctx = match self.token_manager.acquire_context(None, group).await {
+            let mut ctx = match self
+                .token_manager
+                .acquire_context_excluding(None, group, &exhausted)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
@@ -387,16 +393,9 @@ impl KiroProvider {
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
                         return Err(rate_limit);
                     }
-                    Self::emit_attempt(
-                        sink,
-                        attempt,
-                        0,
-                        "",
-                        None,
-                        outcome::UNKNOWN,
-                        Some(&e.to_string()),
-                        attempt_start,
-                    );
+                    if !exhausted.is_empty() && last_error.is_some() {
+                        break;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -438,6 +437,12 @@ impl KiroProvider {
                     // endpoint 解析失败：记为失败，换下一张凭据
                     self.token_manager
                         .report_failure_for_request(ctx.id, None, group);
+                    Self::note_credential_attempt(
+                        &mut attempts_per_credential,
+                        &mut exhausted,
+                        ctx.id,
+                        max_retries_per_credential,
+                    );
                     continue;
                 }
             };
@@ -507,6 +512,12 @@ impl KiroProvider {
                             .report_failure_for_request(ctx.id, None, group);
                     }
                     last_error = Some(e.into());
+                    Self::note_credential_attempt(
+                        &mut attempts_per_credential,
+                        &mut exhausted,
+                        ctx.id,
+                        max_retries_per_credential,
+                    );
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -626,11 +637,17 @@ impl KiroProvider {
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
+                Self::note_credential_attempt(
+                    &mut attempts_per_credential,
+                    &mut exhausted,
+                    ctx.id,
+                    max_retries_per_credential,
+                );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
             }
 
-            // 瞬态错误
+            // 瞬态错误：本凭据配额内原地重试，用尽后换号（不禁用凭据）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -639,27 +656,33 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::TRANSIENT,
-                    Some(&body),
-                    attempt_start,
-                );
+
+                let upstream_demands_wait = rate_limit_error
+                    .as_ref()
+                    .is_some_and(|error| !error.should_retry_locally());
+
                 last_error = if let Some(rate_limit) = rate_limit_error {
-                    if !rate_limit.should_retry_locally() {
-                        return Err(rate_limit.into());
-                    }
                     Some(rate_limit.into())
                 } else {
                     Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body))
                 };
+
+                if upstream_demands_wait {
+                    exhausted.insert(ctx.id);
+                    attempts_per_credential.insert(ctx.id, max_retries_per_credential);
+                    continue;
+                }
+
+                let switched = Self::note_credential_attempt(
+                    &mut attempts_per_credential,
+                    &mut exhausted,
+                    ctx.id,
+                    max_retries_per_credential,
+                );
+
                 if attempt + 1 < max_retries {
-                    // 429 限流用更长退避；408/5xx 仍用通用快速退避
-                    let delay = if status.as_u16() == 429 {
+                    // 429 限流用更长退避；408/5xx 与"已决定换号"仍用通用快速退避
+                    let delay = if status.as_u16() == 429 && !switched {
                         Self::retry_delay_throttle(attempt)
                     } else {
                         Self::retry_delay(attempt)
@@ -696,6 +719,12 @@ impl KiroProvider {
                 attempt_start,
             );
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            Self::note_credential_attempt(
+                &mut attempts_per_credential,
+                &mut exhausted,
+                ctx.id,
+                max_retries_per_credential,
+            );
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -709,8 +738,14 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 API 调用
     ///
     /// 重试策略（次数取自运行时配置，Admin API 可在线修改）：
-    /// - 每个凭据最多重试 `Config::max_retries_per_credential` 次（默认 3）
+    /// - 单个凭据在**本次请求内**最多尝试 `Config::max_retries_per_credential` 次
+    ///   （默认 3）；用尽后该凭据被移出本次请求的候选集合，选择器的 `min(priority)`
+    ///   自然落到下一优先级层，实现"高优先级层撞满配额后降级"。
+    ///   该排除只作用于本次请求，不改写全局可用性 —— 瞬态 429/5xx 仍不会禁用凭据。
     /// - 总重试次数 = min(分组内账号数 × 每凭据重试次数, `Config::max_total_retries`)（默认上限 4）
+    ///
+    /// 注意：要让流量真正降到下一优先级层，总上限必须留出余量。最坏情况下需要
+    /// `最高优先级层账号数 × 每凭据次数 + 1` 次预算，否则预算会在最高层内耗尽。
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -720,11 +755,14 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials
-            * self.token_manager.get_max_retries_per_credential())
-        .min(self.token_manager.get_max_total_retries());
+        let max_retries_per_credential = self.token_manager.get_max_retries_per_credential();
+        let max_retries = (total_credentials * max_retries_per_credential)
+            .min(self.token_manager.get_max_total_retries());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // 本次请求内每个凭据已消耗的尝试次数，以及已用尽配额被排除的凭据。
+        let mut attempts_per_credential: HashMap<u64, usize> = HashMap::new();
+        let mut exhausted: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -733,7 +771,11 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match self
+                .token_manager
+                .acquire_context_excluding(model.as_deref(), group, &exhausted)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
@@ -746,10 +788,11 @@ impl KiroProvider {
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
                         return Err(rate_limit);
                     }
-                    Self::emit_attempt(
-                        sink, attempt, 0, "", None, outcome::UNKNOWN,
-                        Some(&e.to_string()), attempt_start,
-                    );
+                    // 候选已被本次请求全部排除：继续循环只会重复同一个失败，
+                    // 直接结束并返回真正的上游错误（而非"无凭据可用"的次生错误）。
+                    if !exhausted.is_empty() && last_error.is_some() {
+                        break;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -783,6 +826,12 @@ impl KiroProvider {
                     last_error = Some(e);
                     self.token_manager
                         .report_failure_for_request(ctx.id, model.as_deref(), group);
+                    Self::note_credential_attempt(
+                        &mut attempts_per_credential,
+                        &mut exhausted,
+                        ctx.id,
+                        max_retries_per_credential,
+                    );
                     continue;
                 }
             };
@@ -832,20 +881,16 @@ impl KiroProvider {
                         sink, attempt, ctx.id, endpoint_name, None,
                         outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
                     );
-                    // 凭据专属代理故障时，重试同一凭据无意义，应跳过该凭据换下一个。
-                    // 没有专属代理时（直连或仅全局代理），切换凭据不解决问题，保持重试。
-                    let has_own_proxy = ctx.credentials.proxy_url.as_deref()
-                        .map_or(false, |u| !u.trim().is_empty());
-                    if has_own_proxy {
-                        tracing::warn!(
-                            "凭据 #{} 有专属代理且网络请求失败，跳过该凭据",
-                            ctx.id
-                        );
-                        self.token_manager
-                            .report_failure_for_request(ctx.id, model.as_deref(), group);
-                    }
-
+                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
+                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）。
+                    // 但同一凭据在本次请求内连续撞墙到配额上限后仍要换号重试。
                     last_error = Some(e.into());
+                    Self::note_credential_attempt(
+                        &mut attempts_per_credential,
+                        &mut exhausted,
+                        ctx.id,
+                        max_retries_per_credential,
+                    );
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -1000,6 +1045,15 @@ impl KiroProvider {
                     );
                 }
 
+                // 全局失败计数需要连续 3 次才禁用该凭据；本次请求内不必等到那时，
+                // 用尽本请求配额就换号，避免预算耗在同一个鉴权失败的号上。
+                Self::note_credential_attempt(
+                    &mut attempts_per_credential,
+                    &mut exhausted,
+                    ctx.id,
+                    max_retries_per_credential,
+                );
+
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -1098,8 +1152,10 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            // 429/408/5xx - 瞬态上游错误：本凭据配额内原地重试，用尽后换号（不禁用凭据）
+            // 不禁用是为了避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死；
+            // 用尽配额后换号是为了让高优先级层撞墙后能真正降级到下一层，而不是把预算
+            // 全部耗在同一层内。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -1112,10 +1168,15 @@ impl KiroProvider {
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::TRANSIENT, Some(&body), attempt_start,
                 );
+
+                // 上游给出明确 Retry-After：该账号在这段时间内不可能恢复，本次请求
+                // 内不再重试它，直接消耗完配额换号。仍有其它候选时继续故障转移，
+                // 没有候选时把带 Retry-After 的类型化错误交给客户端遵守。
+                let upstream_demands_wait = rate_limit_error
+                    .as_ref()
+                    .is_some_and(|error| !error.should_retry_locally());
+
                 last_error = if let Some(rate_limit) = rate_limit_error {
-                    if !rate_limit.should_retry_locally() {
-                        return Err(rate_limit.into());
-                    }
                     Some(rate_limit.into())
                 } else {
                     Some(anyhow::anyhow!(
@@ -1125,9 +1186,28 @@ impl KiroProvider {
                         body
                     ))
                 };
+
+                if upstream_demands_wait {
+                    exhausted.insert(ctx.id);
+                    attempts_per_credential.insert(ctx.id, max_retries_per_credential);
+                    tracing::info!(
+                        "凭据 #{} 上游要求等待，本次请求内跳过该号并尝试下一候选",
+                        ctx.id
+                    );
+                    continue;
+                }
+
+                let switched = Self::note_credential_attempt(
+                    &mut attempts_per_credential,
+                    &mut exhausted,
+                    ctx.id,
+                    max_retries_per_credential,
+                );
+
                 if attempt + 1 < max_retries {
-                    // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
-                    let delay = if status.as_u16() == 429 {
+                    // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避。
+                    // 已决定换号时无需为旧号的配额等待，用通用快速退避即可。
+                    let delay = if status.as_u16() == 429 && !switched {
                         Self::retry_delay_throttle(attempt)
                     } else {
                         Self::retry_delay(attempt)
@@ -1164,6 +1244,12 @@ impl KiroProvider {
                 status,
                 body
             ));
+            Self::note_credential_attempt(
+                &mut attempts_per_credential,
+                &mut exhausted,
+                ctx.id,
+                max_retries_per_credential,
+            );
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -1177,6 +1263,31 @@ impl KiroProvider {
                 max_retries
             )
         }))
+    }
+
+    /// 记录凭据在本次请求内消耗掉一次尝试，返回它是否已用尽配额。
+    ///
+    /// 用尽后写入 `exhausted`，后续 `acquire_context_excluding` 会跳过该凭据，
+    /// 使选择器降级到下一优先级层。仅作用于本次请求，不触碰全局可用性。
+    fn note_credential_attempt(
+        attempts: &mut HashMap<u64, usize>,
+        exhausted: &mut HashSet<u64>,
+        id: u64,
+        cap: usize,
+    ) -> bool {
+        let used = attempts.entry(id).or_insert(0);
+        *used += 1;
+        if *used >= cap {
+            exhausted.insert(id);
+            tracing::info!(
+                "凭据 #{} 已用尽本次请求的重试配额（{}/{}），本次请求内不再选中，降级到下一候选",
+                id,
+                used,
+                cap
+            );
+            return true;
+        }
+        false
     }
 
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）

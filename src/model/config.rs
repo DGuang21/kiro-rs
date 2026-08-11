@@ -235,10 +235,12 @@ pub struct Config {
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
 
-    /// 每个凭据的最大重试次数（默认 3）。
+    /// 每个凭据在单次请求内的最大尝试次数（默认 3）。
     ///
-    /// 单次请求内，某凭据失败后在该凭据上的重试上限。实际总重试次数为
-    /// `min(分组内账号数 × 本值, max_total_retries)`。
+    /// 某凭据在本次请求内累计失败达到本值后，会被移出**本次请求**的候选集合，
+    /// 使凭据选择器的 `min(priority)` 落到下一优先级层，实现"高优先级层撞满后
+    /// 降级"。该排除不写入全局状态：瞬态 429/5xx 依然不会禁用凭据，对其它并发
+    /// 请求仍然可用。实际总重试次数为 `min(分组内账号数 × 本值, max_total_retries)`。
     #[serde(default = "default_max_retries_per_credential")]
     pub max_retries_per_credential: usize,
 
@@ -246,6 +248,9 @@ pub struct Config {
     ///
     /// 与 `max_retries_per_credential` 共同决定实际重试预算，避免多账号故障转移
     /// 时无限重试放大限流。取值见 provider 的重试循环。
+    ///
+    /// 注意：要让流量真正降到下一优先级层，本值需留出余量 —— 最坏情况下需要
+    /// `最高优先级层账号数 × max_retries_per_credential + 1`，否则预算会在最高层内耗尽。
     #[serde(default = "default_max_total_retries")]
     pub max_total_retries: usize,
 
