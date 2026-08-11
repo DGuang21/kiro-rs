@@ -1386,6 +1386,9 @@ pub struct StreamContext {
     pub provider_token_usage: Option<TokenUsage>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 是否已经向客户端产生过非空白的可见文本。
+    /// thinking 块不计入；tool_result 续轮必须有可见文本或完整 tool_use 才算有效。
+    has_visible_text: bool,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1443,6 +1446,9 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    /// HTTP 200 响应体内携带的上游 error / exception。
+    /// 这类事件不能再被收尾成正常的 end_turn。
+    upstream_error: Option<String>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
 }
@@ -1480,6 +1486,25 @@ impl StreamContext {
         self.tool_json_error.as_ref().map(|err| err.message())
     }
 
+    /// 上游在成功 HTTP 响应体内返回的错误信息。
+    pub fn upstream_error_message(&self) -> Option<String> {
+        self.upstream_error.clone()
+    }
+
+    /// 本轮是否已经产生客户端可继续消费的 assistant 输出。
+    pub fn has_visible_continuation(&self) -> bool {
+        self.has_visible_text || self.state_manager.has_tool_use
+    }
+
+    /// 是否由上游明确给出了可接受的容量终止原因。
+    /// 调用方应在 `generate_final_events` 前读取，避免把本地 thinking-only 兜底误判为上游终止。
+    pub fn has_terminal_limit(&self) -> bool {
+        matches!(
+            self.state_manager.stop_reason.as_deref(),
+            Some("max_tokens" | "model_context_window_exceeded")
+        )
+    }
+
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -1496,6 +1521,7 @@ impl StreamContext {
             context_input_tokens: None,
             provider_token_usage: None,
             output_tokens: 0,
+            has_visible_text: false,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
@@ -1518,6 +1544,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            upstream_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
     }
@@ -1642,6 +1669,7 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.upstream_error = Some(format!("{}: {}", error_code, error_message));
                 Vec::new()
             }
             Event::Exception {
@@ -1651,6 +1679,8 @@ impl StreamContext {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                } else {
+                    self.upstream_error = Some(format!("{}: {}", exception_type, message));
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
@@ -2057,6 +2087,9 @@ impl StreamContext {
             return events;
         }
         let text: &str = &kept;
+        if !text.trim().is_empty() {
+            self.has_visible_text = true;
+        }
 
         // 🅱 维护跨流的代码围栏奇偶状态：所有真正作为「文本」吐出的内容都过这里，
         // 在此累进围栏状态，使后续 <invoke> 能判断自己是否落在代码块内。
@@ -2430,7 +2463,6 @@ impl StreamContext {
             Err(e) => {
                 tracing::error!("{}", e);
                 self.tool_json_error = Some(e);
-                self.state_manager.set_stop_reason("error");
                 return events;
             }
         };
@@ -2443,6 +2475,21 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // HTTP 状态虽然成功，但事件流明确返回了上游错误。不要再伪装成 end_turn。
+        if let Some(message) = &self.upstream_error {
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "upstream_error",
+                        "message": message
+                    }
+                }),
+            ));
+            return events;
+        }
 
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
         // 走同一文本路径，交由后续 thinking / invoke 缓冲一并 flush。
@@ -2549,7 +2596,22 @@ impl StreamContext {
         {
             tracing::error!("{}", e);
             self.tool_json_error = Some(e);
-            self.state_manager.set_stop_reason("error");
+        }
+
+        // 工具调用 JSON 错误是一次失败的流，不能先发 message_stop 再补 error，
+        // 也不能使用 Anthropic 协议不存在的 stop_reason="error"。
+        if let Some(err) = &self.tool_json_error {
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": err.error_type(),
+                        "message": err.message()
+                    }
+                }),
+            ));
+            return events;
         }
 
         // 工具调用 JSON 错误必须直接以异常终态结束，不能先发送正常的
@@ -2574,19 +2636,6 @@ impl StreamContext {
             self.metering.as_ref(),
         ));
 
-        events
-    }
-
-    /// 上游响应体读取失败时生成异常终态，不 flush 可能已被截断的缓冲内容。
-    pub fn generate_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
-        // Anthropic requires a signature_delta before a thinking block closes,
-        // including abnormal termination. Close it through the thinking-aware
-        // path first; the generic state manager then closes any other blocks.
-        let mut events = self.close_open_thinking_block();
-        events.extend(
-            self.state_manager
-                .generate_error_events(error_type, message),
-        );
         events
     }
 }
@@ -2708,6 +2757,21 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 转发内部 StreamContext 的上游事件错误。
+    pub fn upstream_error_message(&self) -> Option<String> {
+        self.inner.upstream_error_message()
+    }
+
+    /// 本轮是否产生了非空白文本或完整 tool_use。
+    pub fn has_visible_continuation(&self) -> bool {
+        self.inner.has_visible_continuation()
+    }
+
+    /// 是否由上游明确给出了 max_tokens / context-window 终止。
+    pub fn has_terminal_limit(&self) -> bool {
+        self.inner.has_terminal_limit()
     }
 }
 
@@ -2867,6 +2931,98 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(completed.name, "the_original_very_long_tool_name");
+    }
+
+    #[test]
+    fn upstream_error_finishes_with_error_without_message_stop() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "m",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::Error {
+            error_code: "InternalError".to_string(),
+            error_message: "upstream failed".to_string(),
+        });
+
+        let events = ctx.generate_final_events();
+        assert!(events.iter().any(|event| event.event == "error"));
+        assert!(events.iter().all(|event| event.event != "message_stop"));
+        assert!(events.iter().all(|event| event.event != "message_delta"));
+    }
+
+    #[test]
+    fn incomplete_tool_json_finishes_with_error_without_message_stop() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "m",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_tool_use(&tool_evt(
+            "toolu_1",
+            "read_file",
+            "{\"path\":\"/tmp",
+            false,
+        ));
+
+        let events = ctx.generate_final_events();
+        assert!(events.iter().any(|event| event.event == "error"));
+        assert!(events.iter().all(|event| event.event != "message_stop"));
+        assert!(events.iter().all(|event| event.event != "message_delta"));
+    }
+
+    #[test]
+    fn continuation_requires_visible_text_or_complete_tool_use() {
+        let mut empty = StreamContext::new_with_thinking(
+            "m",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = empty.generate_initial_events();
+        assert!(!empty.has_visible_continuation());
+
+        let mut thinking_only = StreamContext::new_with_thinking(
+            "m",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = thinking_only.generate_initial_events();
+        let _ = thinking_only.process_assistant_response("<thinking>work</thinking>");
+        let _ = thinking_only.generate_final_events();
+        assert!(!thinking_only.has_visible_continuation());
+
+        let mut text = StreamContext::new_with_thinking(
+            "m",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = text.generate_initial_events();
+        let _ = text.process_assistant_response("done");
+        let _ = text.generate_final_events();
+        assert!(text.has_visible_continuation());
+
+        let mut tool = StreamContext::new_with_thinking(
+            "m",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = tool.generate_initial_events();
+        let _ = tool.process_tool_use(&tool_evt("toolu_1", "read_file", "{}", true));
+        assert!(tool.has_visible_continuation());
     }
 
     /// 防回归：统一管道的两个去向（流式 emit_completed_tool_use 与非流式 to_anthropic_block）
