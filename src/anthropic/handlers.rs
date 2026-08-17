@@ -179,6 +179,9 @@ impl RequestTracer {
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
     pub fn mark_first_token(&self) {
+        if !self.is_stream {
+            return;
+        }
         let mut slot = self.first_token_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
@@ -229,14 +232,19 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
-    fn on_attempt(&self, attempt: TraceAttempt) {
-        self.attempts.lock().push(attempt);
+    fn on_attempt(&self, mut attempt: TraceAttempt) {
+        let mut attempts = self.attempts.lock();
+        // Each provider call numbers retries from zero. A web-search request can make
+        // several provider calls under one trace, so assign a request-wide sequence
+        // before persisting to the (trace_id, attempt) primary key.
+        attempt.attempt = attempts.len() as u32;
+        attempts.push(attempt);
     }
 }
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
-fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+pub(crate) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
     Some(canonical_attempt_outcome(&last))
 }
@@ -681,10 +689,19 @@ pub async fn post_messages(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -1590,10 +1607,19 @@ pub async fn post_messages_cc(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -1934,6 +1960,154 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracer_renumbers_attempts_across_provider_rounds_before_persisting() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "gpt-websearch-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 7,
+            key_source: TraceKeySource::ClientKey,
+            model: "gpt-5.6-luna".to_string(),
+            is_stream: false,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
+            attempt,
+            credential_id,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome.to_string(),
+            error_snippet: None,
+            duration_ms: 10,
+        };
+
+        // First provider round reports local attempts 0,1; the next round starts at 0 again.
+        tracer.on_attempt(attempt(0, 11, outcome::TRANSIENT));
+        tracer.on_attempt(attempt(1, 12, outcome::SUCCESS));
+        tracer.on_attempt(attempt(0, 13, outcome::SUCCESS));
+        tracer.finalize(
+            "success",
+            None,
+            None,
+            None,
+            TraceUsage {
+                input_tokens: 101,
+                output_tokens: 23,
+                cache_creation_tokens: 7,
+                cache_read_tokens: 89,
+                credits: 0.25,
+            },
+        );
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            model: Some("gpt-5.6-luna".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.final_credential_id, 13);
+        assert_eq!(record.total_attempts, 3);
+        assert_eq!(
+            record
+                .attempts
+                .iter()
+                .map(|a| a.attempt)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(record.input_tokens, 101);
+        assert_eq!(record.output_tokens, 23);
+        assert_eq!(record.cache_creation_tokens, 7);
+        assert_eq!(record.cache_read_tokens, 89);
+        assert_eq!(record.credits, 0.25);
+    }
+
+    #[test]
+    fn tracer_only_marks_first_token_for_streaming_requests() {
+        let mut tracer = RequestTracer {
+            store: None,
+            trace_id: "first-token-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "claude-sonnet-4".to_string(),
+            is_stream: false,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        tracer.mark_first_token();
+        assert!(tracer.first_token_at.lock().is_none());
+
+        tracer.is_stream = true;
+        tracer.mark_first_token();
+        let first = *tracer.first_token_at.lock();
+        assert!(first.is_some());
+
+        tracer.mark_first_token();
+        assert_eq!(*tracer.first_token_at.lock(), first);
+    }
+
+    #[test]
+    fn tracer_uses_terminal_mcp_attempt_for_failure_fields() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "mcp-failure-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "claude-sonnet-4".to_string(),
+            is_stream: true,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+        let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
+            attempt: 0,
+            credential_id,
+            endpoint: endpoint.to_string(),
+            http_status: Some(status),
+            outcome: attempt_outcome.to_string(),
+            error_snippet: None,
+            duration_ms: 10,
+        };
+
+        tracer.on_attempt(attempt(11, "ide", 200, outcome::SUCCESS));
+        tracer.on_attempt(attempt(29, "cli", 503, outcome::TRANSIENT));
+        tracer.finalize(
+            "error",
+            last_attempt_outcome(&tracer),
+            Some("MCP request failed"),
+            None,
+            TraceUsage::zero(),
+        );
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        let record = &records[0];
+        assert_eq!(record.final_credential_id, 29);
+        assert_eq!(record.error_type.as_deref(), Some(outcome::TRANSIENT));
+        assert_eq!(record.total_attempts, 2);
+        assert_eq!(record.attempts[0].endpoint, "ide");
+        assert_eq!(record.attempts[1].endpoint, "cli");
+    }
 
     #[test]
     fn account_suspended_attempt_is_preserved_as_request_error_type() {
