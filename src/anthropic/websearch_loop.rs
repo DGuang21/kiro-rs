@@ -27,6 +27,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::admin::trace_db::outcome;
 use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -34,7 +35,9 @@ use crate::kiro::provider::KiroProvider;
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
-use super::handlers::{UsageRecordHook, map_provider_error};
+use super::handlers::{
+    RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
+};
 use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
@@ -88,9 +91,9 @@ struct RoundOutcome {
     last_metering: Option<MeteringEvent>,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
-    /// True if the upstream stream ended due to a read error, so the decoded
-    /// content for this round is partial and must not be treated as a success.
-    stream_error: bool,
+    /// Upstream body-read error, if any. Content decoded before this error is
+    /// partial and must not be treated as a successful round.
+    stream_error: Option<String>,
     /// Tool names declared to the upstream this round (original + shortened),
     /// taken from `ConversionResult::known_tool_names`. Used by the shared
     /// `<invoke>` text-leak fault tolerance so a leaked `<invoke name=...>` is only
@@ -182,12 +185,6 @@ fn log_invalid_web_search_input(tu: &CompletedToolUse) {
     );
 }
 
-fn is_no_results_mcp_error(error: &anyhow::Error) -> bool {
-    error
-        .to_string()
-        .contains("MCP error: -32602 - Tool returned no results")
-}
-
 fn log_normalized_web_search_query(tu: &CompletedToolUse, query: &str) {
     tracing::info!(
         tool_use_id = %tu.id,
@@ -246,6 +243,7 @@ async fn decode_round(
     response: reqwest::Response,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
+    tracer: &RequestTracer,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -262,14 +260,17 @@ async fn decode_round(
     let mut credits = 0.0;
     let mut last_metering: Option<MeteringEvent> = None;
     let mut stop_reason_override: Option<String> = None;
-    let mut stream_error = false;
+    let mut stream_error = None;
 
     while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
-            Ok(c) => c,
+            Ok(c) => {
+                tracer.mark_first_token();
+                c
+            }
             Err(e) => {
                 tracing::error!("web_search loop failed to read the response stream: {}", e);
-                stream_error = true;
+                stream_error = Some(e.to_string());
                 break;
             }
         };
@@ -372,6 +373,8 @@ async fn decode_round(
 /// A failed round plus any usage that can still be attributed to its provider call.
 struct RoundFailure {
     response: Response,
+    error_type: &'static str,
+    error_message: String,
     credential_id: u64,
     token_usage: Option<TokenUsage>,
     credits: f64,
@@ -385,6 +388,7 @@ async fn run_round(
     provider: &Arc<KiroProvider>,
     payload: &MessagesRequest,
     fallback_input_tokens: i32,
+    tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
@@ -404,9 +408,12 @@ async fn run_round(
                     format!("unsupported tool mapping: {}", reason),
                 ),
             };
+            let error_message = msg.clone();
             return Err(RoundFailure {
                 response: (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg)))
                     .into_response(),
+                error_type: outcome::BAD_REQUEST,
+                error_message,
                 credential_id: 0,
                 token_usage: None,
                 credits: 0.0,
@@ -422,15 +429,15 @@ async fn run_round(
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(b) => b,
         Err(e) => {
+            let error_message = format!("failed to serialize request: {}", e);
             return Err(RoundFailure {
                 response: (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(
-                        "internal_error",
-                        format!("failed to serialize request: {}", e),
-                    )),
+                    Json(ErrorResponse::new("internal_error", error_message.clone())),
                 )
                     .into_response(),
+                error_type: outcome::UNKNOWN,
+                error_message,
                 credential_id: 0,
                 token_usage: None,
                 credits: 0.0,
@@ -438,11 +445,18 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    let call_result = match provider
+        .call_api_stream(&request_body, Some(tracer), group)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
+            let error_type = last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN);
+            let error_message = e.to_string();
             return Err(RoundFailure {
                 response: map_provider_error(e),
+                error_type,
+                error_message,
                 credential_id: 0,
                 token_usage: Some(TokenUsage {
                     uncached_input_tokens: fallback_input_tokens.max(0),
@@ -457,6 +471,7 @@ async fn run_round(
         call_result.response,
         &payload.model,
         &conversion.tool_name_map,
+        tracer,
     )
     .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
@@ -464,7 +479,7 @@ async fn run_round(
     outcome.known_tool_names = conversion.known_tool_names;
     // Carry the short->original tool name map so reclaimed <invoke> names get restored.
     outcome.tool_name_map = conversion.tool_name_map;
-    if outcome.stream_error {
+    if let Some(error_message) = outcome.stream_error.take() {
         // The stream is partial and cannot re-enter the search loop, but any final metadata
         // snapshot/credits observed before the cut still belong to this real provider call.
         let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
@@ -478,6 +493,8 @@ async fn run_round(
                 )),
             )
                 .into_response(),
+            error_type: outcome::STREAM_INTERRUPTED,
+            error_message,
             credential_id,
             token_usage: Some(token_usage),
             credits: outcome.credits,
@@ -749,9 +766,11 @@ fn record_aggregated_usage(
 
 /// Cancellation-safe, exactly-once accounting for the multi-round search loop.
 /// The snapshot is updated after every completed provider round, so cancelling
-/// a later MCP/provider await still records all usage already observed.
+/// a later MCP/provider await still records all usage and trace attempts already
+/// observed.
 struct WebSearchUsageSettlement {
     hook: UsageRecordHook,
+    tracer: Option<Arc<RequestTracer>>,
     credential_id: u64,
     usage: TokenUsage,
     credits: f64,
@@ -759,9 +778,22 @@ struct WebSearchUsageSettlement {
 }
 
 impl WebSearchUsageSettlement {
-    fn new(hook: UsageRecordHook) -> Self {
+    fn new(hook: UsageRecordHook, tracer: Arc<RequestTracer>) -> Self {
         Self {
             hook,
+            tracer: Some(tracer),
+            credential_id: 0,
+            usage: TokenUsage::default(),
+            credits: 0.0,
+            settled: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn without_trace(hook: UsageRecordHook) -> Self {
+        Self {
+            hook,
+            tracer: None,
             credential_id: 0,
             usage: TokenUsage::default(),
             credits: 0.0,
@@ -783,7 +815,13 @@ impl WebSearchUsageSettlement {
         self.usage.sanitized()
     }
 
-    fn finish(&mut self, status: &str) {
+    fn finish(
+        &mut self,
+        usage_status: &str,
+        trace_status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+    ) {
         if self.settled {
             return;
         }
@@ -792,8 +830,18 @@ impl WebSearchUsageSettlement {
             self.credential_id,
             self.usage,
             self.credits,
-            status,
+            usage_status,
         );
+        if let Some(tracer) = &self.tracer {
+            finalize_aggregated_trace(
+                tracer,
+                trace_status,
+                error_type,
+                error_message,
+                self.usage,
+                self.credits,
+            );
+        }
         self.settled = true;
     }
 }
@@ -801,7 +849,12 @@ impl WebSearchUsageSettlement {
 impl Drop for WebSearchUsageSettlement {
     fn drop(&mut self) {
         if !self.settled {
-            self.finish("error");
+            self.finish(
+                "error",
+                "interrupted",
+                Some(outcome::STREAM_INTERRUPTED),
+                Some("web_search loop was cancelled before completion"),
+            );
         }
     }
 }
@@ -1131,6 +1184,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 async fn execute_web_search(
     provider: &Arc<KiroProvider>,
     tool_use: &CompletedToolUse,
+    tracer: &RequestTracer,
     group: Option<&str>,
     final_round: bool,
     emitter: &mut Option<&mut WebSearchSseEmitter>,
@@ -1145,9 +1199,9 @@ async fn execute_web_search(
     let result = if let Some(query) = query {
         log_normalized_web_search_query(tool_use, &query);
         let (_, mcp_request) = websearch::create_mcp_request(&query);
-        match websearch::call_mcp_api(provider, &mcp_request, group).await {
+        match websearch::call_mcp_api(provider, &mcp_request, Some(tracer), group).await {
             Ok(response) => websearch::parse_search_results(&response),
-            Err(error) if is_no_results_mcp_error(&error) => {
+            Err(error) if websearch::is_no_results_mcp_error(&error) => {
                 tracing::warn!(
                     final_round,
                     "web_search MCP returned no results; continuing with an empty result"
@@ -1176,6 +1230,38 @@ async fn execute_web_search(
     Ok(result)
 }
 
+fn aggregated_trace_usage(usage: TokenUsage, credits: f64) -> TraceUsage {
+    let usage = usage.sanitized();
+    TraceUsage {
+        input_tokens: usage.uncached_input_tokens as u64,
+        output_tokens: usage.output_tokens as u64,
+        cache_creation_tokens: usage.cache_write_input_tokens as u64,
+        cache_read_tokens: usage.cache_read_input_tokens as u64,
+        credits: if credits.is_finite() && credits > 0.0 {
+            credits
+        } else {
+            0.0
+        },
+    }
+}
+
+fn finalize_aggregated_trace(
+    tracer: &RequestTracer,
+    status: &str,
+    error_type: Option<&str>,
+    error_message: Option<&str>,
+    usage: TokenUsage,
+    credits: f64,
+) {
+    tracer.finalize(
+        status,
+        error_type,
+        error_message,
+        None,
+        aggregated_trace_usage(usage, credits),
+    );
+}
+
 /// web_search loop entry point
 ///
 /// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
@@ -1183,6 +1269,7 @@ pub(super) async fn run_web_search_loop(
     provider: Arc<KiroProvider>,
     payload: MessagesRequest,
     hook: UsageRecordHook,
+    tracer: Arc<RequestTracer>,
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
@@ -1192,6 +1279,7 @@ pub(super) async fn run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             group,
             tool_compatibility_mode,
             None,
@@ -1220,6 +1308,7 @@ pub(super) async fn run_web_search_loop(
                 provider,
                 payload,
                 hook,
+                tracer,
                 group,
                 tool_compatibility_mode,
                 Some(&mut emitter),
@@ -1259,12 +1348,13 @@ async fn run_web_search_loop_inner(
     provider: Arc<KiroProvider>,
     mut payload: MessagesRequest,
     hook: UsageRecordHook,
+    tracer: Arc<RequestTracer>,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
     mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
-    let mut settlement = WebSearchUsageSettlement::new(hook);
+    let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
 
@@ -1281,6 +1371,7 @@ async fn run_web_search_loop_inner(
                 &provider,
                 &payload,
                 round_fallback_input_tokens,
+                tracer.as_ref(),
                 group.as_deref(),
                 tool_compatibility_mode,
             )
@@ -1297,7 +1388,12 @@ async fn run_web_search_loop_inner(
                             failure.credits,
                         );
                     }
-                    settlement.finish("error");
+                    settlement.finish(
+                        "error",
+                        "error",
+                        Some(failure.error_type),
+                        Some(&failure.error_message),
+                    );
                     return failure.response;
                 }
             };
@@ -1324,7 +1420,14 @@ async fn run_web_search_loop_inner(
                     continue;
                 }
                 EmptyToolResultDisposition::Fail => {
-                    settlement.finish("error");
+                    settlement.finish(
+                        "error",
+                        "error",
+                        Some(outcome::UNKNOWN),
+                        Some(
+                            "Upstream returned no assistant text or tool call after a tool result.",
+                        ),
+                    );
                     tracing::error!(
                         round = round_idx,
                         "upstream repeated an empty assistant turn after tool_result"
@@ -1359,12 +1462,26 @@ async fn run_web_search_loop_inner(
             let mut searched: Vec<Option<WebSearchResults>> =
                 Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
-                match execute_web_search(&provider, tu, group.as_deref(), false, &mut emitter).await
+                match execute_web_search(
+                    &provider,
+                    tu,
+                    tracer.as_ref(),
+                    group.as_deref(),
+                    false,
+                    &mut emitter,
+                )
+                .await
                 {
                     Ok(result) => searched.push(result),
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
-                        settlement.finish("error");
+                        let error_message = e.to_string();
+                        settlement.finish(
+                            "error",
+                            "error",
+                            last_attempt_outcome(tracer.as_ref()),
+                            Some(&error_message),
+                        );
                         return map_provider_error(e);
                     }
                 }
@@ -1389,12 +1506,26 @@ async fn run_web_search_loop_inner(
         let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
-                match execute_web_search(&provider, tu, group.as_deref(), true, &mut emitter).await
+                match execute_web_search(
+                    &provider,
+                    tu,
+                    tracer.as_ref(),
+                    group.as_deref(),
+                    true,
+                    &mut emitter,
+                )
+                .await
                 {
                     Ok(result) => searched.push(result),
                     Err(e) => {
                         tracing::warn!("web_search MCP call (final round) failed: {}", e);
-                        settlement.finish("error");
+                        let error_message = e.to_string();
+                        settlement.finish(
+                            "error",
+                            "error",
+                            last_attempt_outcome(tracer.as_ref()),
+                            Some(&error_message),
+                        );
                         return map_provider_error(e);
                     }
                 }
@@ -1421,7 +1552,7 @@ async fn run_web_search_loop_inner(
         );
 
         let final_usage = settlement.usage();
-        settlement.finish("success");
+        settlement.finish("success", "success", None, None);
 
         return if let Some(emitter) = emitter.as_deref_mut() {
             emitter
@@ -1447,7 +1578,12 @@ async fn run_web_search_loop_inner(
     }
 
     // Theoretically unreachable (the loop always returns)
-    settlement.finish("error");
+    settlement.finish(
+        "error",
+        "error",
+        Some(outcome::UNKNOWN),
+        Some("web_search loop exited unexpectedly"),
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse::new(
@@ -1720,10 +1856,10 @@ mod tests {
 
     #[test]
     fn no_results_mcp_error_is_nonfatal() {
-        assert!(is_no_results_mcp_error(&anyhow::anyhow!(
+        assert!(websearch::is_no_results_mcp_error(&anyhow::anyhow!(
             "MCP error: -32602 - Tool returned no results"
         )));
-        assert!(!is_no_results_mcp_error(&anyhow::anyhow!(
+        assert!(!websearch::is_no_results_mcp_error(&anyhow::anyhow!(
             "MCP error: -32602 - Invalid tool parameters provided"
         )));
     }
@@ -1926,7 +2062,7 @@ mod tests {
         };
         let (sender, receiver) = mpsc::channel::<Bytes>(1);
         let in_flight = async move {
-            let mut settlement = WebSearchUsageSettlement::new(hook);
+            let mut settlement = WebSearchUsageSettlement::without_trace(hook);
             settlement.add(
                 7,
                 TokenUsage {
@@ -2091,7 +2227,7 @@ mod tests {
             credits: 0.0,
             last_metering: None,
             stop_reason_override: None,
-            stream_error: false,
+            stream_error: None,
             known_tool_names: std::collections::HashSet::new(),
             tool_name_map: std::collections::HashMap::new(),
         }
@@ -2905,6 +3041,39 @@ mod tests {
         assert_eq!(total.output_tokens, 5 + fallback_usage.output_tokens);
         assert_eq!(total.cache_write_input_tokens, 4);
         assert_eq!(total.cache_read_input_tokens, 7);
+    }
+
+    #[test]
+    fn aggregated_trace_usage_matches_websearch_usage_and_sanitizes_values() {
+        let trace = aggregated_trace_usage(
+            TokenUsage {
+                uncached_input_tokens: 3,
+                output_tokens: 5,
+                cache_read_input_tokens: 7,
+                cache_write_input_tokens: 4,
+            },
+            0.125,
+        );
+        assert_eq!(trace.input_tokens, 3);
+        assert_eq!(trace.output_tokens, 5);
+        assert_eq!(trace.cache_creation_tokens, 4);
+        assert_eq!(trace.cache_read_tokens, 7);
+        assert_eq!(trace.credits, 0.125);
+
+        let sanitized = aggregated_trace_usage(
+            TokenUsage {
+                uncached_input_tokens: -1,
+                output_tokens: -2,
+                cache_read_input_tokens: -3,
+                cache_write_input_tokens: -4,
+            },
+            f64::NAN,
+        );
+        assert_eq!(sanitized.input_tokens, 0);
+        assert_eq!(sanitized.output_tokens, 0);
+        assert_eq!(sanitized.cache_creation_tokens, 0);
+        assert_eq!(sanitized.cache_read_tokens, 0);
+        assert_eq!(sanitized.credits, 0.0);
     }
 
     #[test]
