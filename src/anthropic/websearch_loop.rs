@@ -350,8 +350,16 @@ async fn decode_round(
         }
     }
 
-    // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
+    // 剥离混入文本的 XML 泄漏（与非流式同口径）。
     let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
+    let (legacy_thinking, text) = super::stream::extract_thinking_from_complete_text(&text);
+    let mut thinking = super::stream::strip_thinking_xml_tags(&thinking);
+    if let Some(legacy_thinking) = legacy_thinking {
+        if !thinking.is_empty() {
+            thinking.push_str("\n\n");
+        }
+        thinking.push_str(&legacy_thinking);
+    }
 
     RoundOutcome {
         text,
@@ -1933,6 +1941,17 @@ mod tests {
             name: "web_search".to_string(),
             input,
         }
+    }
+
+    #[test]
+    fn buffered_round_text_extractor_removes_multiple_thinking_blocks_and_orphan_tag() {
+        let raw = "</thinking>intro<thinking>round one</thinking>middle\
+                   <thinking>round two</thinking>outro";
+        let (thinking, text) = super::super::stream::extract_thinking_from_complete_text(raw);
+
+        assert_eq!(thinking.as_deref(), Some("round one\n\nround two"));
+        assert_eq!(text, "intromiddleoutro");
+        assert!(!text.contains("thinking"));
     }
 
     #[test]

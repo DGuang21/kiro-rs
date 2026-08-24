@@ -1693,35 +1693,32 @@ fn build_non_stream_content(
     native_redacted_thinking: Vec<String>,
 ) -> Vec<serde_json::Value> {
     let mut content = Vec::new();
+    let native_thinking = super::stream::strip_thinking_xml_tags(&native_thinking);
     let has_native_thinking = !native_thinking.is_empty();
 
     if thinking_enabled {
-        if has_native_thinking {
+        let (legacy_thinking, remaining_text) =
+            super::stream::extract_thinking_from_complete_text(&text_content);
+        let mut combined_thinking = native_thinking;
+        if let Some(legacy_thinking) = legacy_thinking {
+            if !combined_thinking.is_empty() {
+                combined_thinking.push_str("\n\n");
+            }
+            combined_thinking.push_str(&legacy_thinking);
+        }
+
+        if !combined_thinking.is_empty() {
             content.push(json!({
                 "type": "thinking",
-                "thinking": native_thinking.clone(),
-                "signature": native_thinking_signature
-                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
+                "thinking": combined_thinking,
+                "signature": if has_native_thinking {
+                    native_thinking_signature.unwrap_or_else(|| {
+                        super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()
+                    })
+                } else {
+                    super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()
+                },
             }));
-        } else {
-            // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
-            let (thinking, remaining_text) =
-                super::stream::extract_thinking_from_complete_text(&text_content);
-
-            if let Some(thinking_text) = thinking {
-                content.push(json!({
-                    "type": "thinking",
-                    "thinking": thinking_text,
-                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-                }));
-            }
-
-            if !remaining_text.is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": remaining_text
-                }));
-            }
         }
 
         for redacted in native_redacted_thinking {
@@ -1731,10 +1728,10 @@ fn build_non_stream_content(
             }));
         }
 
-        if has_native_thinking && !text_content.is_empty() {
+        if !remaining_text.is_empty() {
             content.push(json!({
                 "type": "text",
-                "text": text_content
+                "text": remaining_text
             }));
         }
     } else if !text_content.is_empty() {
@@ -2708,6 +2705,29 @@ mod tests {
         );
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_merges_native_and_multiple_legacy_thinking_without_xml_leaks() {
+        let content = build_non_stream_content(
+            true,
+            "</thinking>first text<thinking>legacy one</thinking>second text\
+             <thinking>legacy two</thinking>final text"
+                .to_string(),
+            "<thinking>native</thinking>".to_string(),
+            Some("real-signature".to_string()),
+            Vec::new(),
+        );
+
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "native\n\nlegacy one\n\nlegacy two");
+        let visible: String = content
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        assert_eq!(visible, "first textsecond textfinal text");
+        assert!(!visible.contains("thinking"));
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signat
 
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
+const THINKING_START_TAG: &str = "<thinking>";
+const THINKING_END_TAG: &str = "</thinking>";
 
 /// 跨 chunk 过滤字面 `<tool_use ...>...</tool_use>` XML 泄漏（见
 /// [`crate::kiro::model::events::strip_tool_use_xml_leaks`] 的语义）。
@@ -118,6 +120,69 @@ impl ToolUseXmlLeakFilter {
     }
 }
 
+/// Removes legacy thinking XML that occasionally leaks inside native
+/// `reasoningContentEvent.text` chunks. Native reasoning is already carried by
+/// the Anthropic thinking channel, so these delimiters are transport artifacts.
+#[derive(Debug, Default)]
+struct ThinkingXmlTagFilter {
+    buffer: String,
+}
+
+impl ThinkingXmlTagFilter {
+    fn filter(&mut self, content: &str) -> String {
+        self.buffer.push_str(content);
+        let mut out = String::with_capacity(self.buffer.len());
+        let mut rest = self.buffer.as_str();
+
+        loop {
+            let start = rest.find(THINKING_START_TAG);
+            let end = rest.find(THINKING_END_TAG);
+            let next = match (start, end) {
+                (Some(start), Some(end)) => Some((
+                    start.min(end),
+                    if start <= end {
+                        THINKING_START_TAG.len()
+                    } else {
+                        THINKING_END_TAG.len()
+                    },
+                )),
+                (Some(start), None) => Some((start, THINKING_START_TAG.len())),
+                (None, Some(end)) => Some((end, THINKING_END_TAG.len())),
+                (None, None) => None,
+            };
+
+            if let Some((pos, tag_len)) = next {
+                out.push_str(&rest[..pos]);
+                rest = &rest[pos + tag_len..];
+                continue;
+            }
+
+            let keep = longest_prefix_suffix(rest, THINKING_START_TAG)
+                .max(longest_prefix_suffix(rest, THINKING_END_TAG));
+            let emit_len = rest.len().saturating_sub(keep);
+            out.push_str(&rest[..emit_len]);
+            self.buffer = rest[emit_len..].to_string();
+            return out;
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        let remaining = std::mem::take(&mut self.buffer);
+        if THINKING_START_TAG.starts_with(&remaining) || THINKING_END_TAG.starts_with(&remaining) {
+            return String::new();
+        }
+        strip_thinking_xml_tags(&remaining)
+    }
+}
+
+/// One-shot counterpart used by buffered/non-streaming paths.
+pub(crate) fn strip_thinking_xml_tags(text: &str) -> String {
+    let stripped = text
+        .replace(THINKING_START_TAG, "")
+        .replace(THINKING_END_TAG, "");
+    strip_unquoted_partial_thinking_tag_suffix(&stripped)
+}
+
 /// `s` 是否可能是 `<tool_use` 真标签的开头（用于开标签尚未闭合时的跨 chunk 判定）。
 fn is_potential_tool_use_tag_start(s: &str) -> bool {
     TOOL_USE_XML_PREFIX.starts_with(s)
@@ -135,6 +200,44 @@ fn longest_prefix_suffix(s: &str, needle: &str) -> usize {
         }
     }
     0
+}
+
+/// Bytes to retain while scanning ordinary assistant text for a thinking tag
+/// split at a chunk boundary. Keep the preceding delimiter too, because the
+/// completed tag detector needs it to distinguish quoted examples from real XML.
+fn partial_thinking_tag_suffix_len(s: &str) -> usize {
+    let tag_len = longest_prefix_suffix(s, THINKING_START_TAG)
+        .max(longest_prefix_suffix(s, THINKING_END_TAG));
+    if tag_len == 0 {
+        return 0;
+    }
+    let tag_start = s.len() - tag_len;
+    if tag_start > 0 && is_quote_char(s, tag_start - 1) {
+        tag_len + 1
+    } else {
+        tag_len
+    }
+}
+
+fn strip_unquoted_partial_thinking_tag_suffix(text: &str) -> String {
+    let start_len = longest_prefix_suffix(text, THINKING_START_TAG);
+    let end_len = longest_prefix_suffix(text, THINKING_END_TAG);
+    let tag_len = start_len.max(end_len);
+    if tag_len == 0 {
+        return text.to_string();
+    }
+    let tag_start = text.len() - tag_len;
+    let quoted = tag_start > 0
+        && if end_len >= start_len {
+            is_thinking_end_quote_char(text, tag_start - 1)
+        } else {
+            is_quote_char(text, tag_start - 1)
+        };
+    if quoted {
+        text.to_string()
+    } else {
+        text[..tag_start].to_string()
+    }
 }
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -175,10 +278,6 @@ fn is_quote_char(buffer: &str, pos: usize) -> bool {
         .map(|c| QUOTE_CHARS.contains(c))
         .unwrap_or(false)
 }
-
-/// thinking 结束标签。结束标签后的分隔格式由上游决定，可能是任意空白，
-/// 也可能直接紧跟正文。
-const THINKING_END_TAG: &str = "</thinking>";
 
 /// 结束标签只把真正的引用定界符视为“被引用”。
 ///
@@ -263,17 +362,16 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
 ///
 /// 与 `find_real_thinking_end_tag` 类似，跳过被引用字符包裹的开始标签。
 fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
-    const TAG: &str = "<thinking>";
     let mut search_start = 0;
 
-    while let Some(pos) = buffer[search_start..].find(TAG) {
+    while let Some(pos) = buffer[search_start..].find(THINKING_START_TAG) {
         let absolute_pos = search_start + pos;
 
         // 检查前面是否有引用字符
         let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
 
         // 检查后面是否有引用字符
-        let after_pos = absolute_pos + TAG.len();
+        let after_pos = absolute_pos + THINKING_START_TAG.len();
         let has_quote_after = is_quote_char(buffer, after_pos);
 
         // 如果不被引用字符包裹，则是真正的开始标签
@@ -708,40 +806,60 @@ fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
 /// - `(Some(thinking_content), remaining_text)` — 检测到有效 thinking 块
 /// - `(None, original_text)` — 未检测到，原样返回
 pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>, String) {
-    let start_pos = match find_real_thinking_start_tag(text) {
-        Some(pos) => pos,
-        None => return (None, text.to_string()),
-    };
-
-    let before = &text[..start_pos];
-    let after_open = &text[start_pos + "<thinking>".len()..];
-
-    // 查找结束标签：正文可能直接跟在标签后，也可能由任意空白分隔。
-    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        let after_tag = end_pos + THINKING_END_TAG.len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + THINKING_END_TAG.len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
-    };
-
-    // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
-
-    // 组装剩余文本：跳过纯空白的 before 部分
+    let mut cursor = 0;
+    let mut thinking_parts = Vec::new();
     let mut remaining = String::new();
-    if !before.trim().is_empty() {
-        remaining.push_str(before);
-    }
-    remaining.push_str(text_after);
 
-    if thinking_content.is_empty() {
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let start = find_real_thinking_start_tag(rest);
+        let orphan_end = find_real_thinking_end_tag(rest);
+
+        if let Some(end_pos) = orphan_end
+            && start.is_none_or(|start_pos| end_pos < start_pos)
+        {
+            remaining.push_str(&rest[..end_pos]);
+            cursor += end_pos + THINKING_END_TAG.len();
+            continue;
+        }
+
+        let Some(start_pos) = start else {
+            remaining.push_str(rest);
+            break;
+        };
+        if !rest[..start_pos].trim().is_empty() {
+            remaining.push_str(&rest[..start_pos]);
+        }
+
+        let after_open_pos = start_pos + THINKING_START_TAG.len();
+        let after_open = &rest[after_open_pos..];
+        let Some(end_pos) = find_real_thinking_end_tag(after_open) else {
+            // A truncated final thinking block is still hidden reasoning. Keeping it in
+            // visible text would reproduce the exact XML leak this extractor prevents.
+            let thinking = after_open.strip_prefix('\n').unwrap_or(after_open);
+            if !thinking.is_empty() {
+                thinking_parts.push(thinking.to_string());
+            }
+            break;
+        };
+
+        let thinking = after_open[..end_pos]
+            .strip_prefix('\n')
+            .unwrap_or(&after_open[..end_pos]);
+        if !thinking.is_empty() {
+            thinking_parts.push(thinking.to_string());
+        }
+        cursor += after_open_pos + end_pos + THINKING_END_TAG.len();
+        while text[cursor..].starts_with(char::is_whitespace) {
+            cursor += text[cursor..].chars().next().unwrap().len_utf8();
+        }
+    }
+
+    let remaining = strip_unquoted_partial_thinking_tag_suffix(&remaining);
+    if thinking_parts.is_empty() {
         (None, remaining)
     } else {
-        (Some(thinking_content.to_string()), remaining)
+        (Some(thinking_parts.join("\n\n")), remaining)
     }
 }
 
@@ -1398,12 +1516,16 @@ pub struct StreamContext {
     pub invoke_sniff_buffer: String,
     /// 是否在 thinking 块内
     pub in_thinking_block: bool,
-    /// thinking 块是否已提取完成
+    /// Whether at least one thinking block has already been recognized. This
+    /// only controls conservative buffering before the first block; it must not
+    /// prevent later thinking blocks in the same provider stream.
     pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
     /// 上游原生 reasoningContentEvent 下发的 thinking 签名
     pending_thinking_signature: Option<String>,
+    /// Native reasoning may still contain legacy XML delimiters split across events.
+    native_reasoning_tag_filter: ThinkingXmlTagFilter,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
@@ -1524,6 +1646,7 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             pending_thinking_signature: None,
+            native_reasoning_tag_filter: ThinkingXmlTagFilter::default(),
             text_block_index: None,
             strip_thinking_leading_newline: false,
             strip_text_leading_whitespace_after_thinking: false,
@@ -1692,6 +1815,7 @@ impl StreamContext {
         let content = content.as_str();
 
         let mut events = Vec::new();
+        events.extend(self.flush_native_reasoning_tag_filter());
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
         }
@@ -1719,9 +1843,37 @@ impl StreamContext {
         self.thinking_buffer.push_str(content);
 
         loop {
-            if !self.in_thinking_block && !self.thinking_extracted {
+            if !self.in_thinking_block {
+                if self.strip_text_leading_whitespace_after_thinking {
+                    self.thinking_buffer = self.thinking_buffer.trim_start().to_string();
+                    if self.thinking_buffer.is_empty() {
+                        break;
+                    }
+                    self.strip_text_leading_whitespace_after_thinking = false;
+                }
+
                 // 查找 <thinking> 开始标签（跳过被反引号包裹的）
-                if let Some(start_pos) = find_real_thinking_start_tag(&self.thinking_buffer) {
+                let start_pos = find_real_thinking_start_tag(&self.thinking_buffer);
+                let orphan_end = find_real_thinking_end_tag(&self.thinking_buffer);
+
+                // A closing tag outside a thinking block is transport residue. Strip it
+                // before looking for the next real opening tag so it never reaches text.
+                if let Some(end_pos) = orphan_end
+                    && start_pos.is_none_or(|start_pos| end_pos < start_pos)
+                {
+                    let before_end = self.thinking_buffer[..end_pos].to_string();
+                    if !before_end.trim().is_empty() {
+                        events.extend(self.create_text_delta_events(&before_end));
+                    }
+                    self.thinking_buffer = self.thinking_buffer[end_pos + THINKING_END_TAG.len()..]
+                        .trim_start()
+                        .to_string();
+                    self.strip_text_leading_whitespace_after_thinking =
+                        self.thinking_buffer.is_empty();
+                    continue;
+                }
+
+                if let Some(start_pos) = start_pos {
                     // 发送 <thinking> 之前的内容作为 text_delta
                     // 注意：如果前面只是空白字符（如 adaptive 模式返回的 \n\n），则跳过，
                     // 避免在 thinking 块之前产生无意义的 text 块导致客户端解析失败
@@ -1729,12 +1881,13 @@ impl StreamContext {
                     if !before_thinking.is_empty() && !before_thinking.trim().is_empty() {
                         events.extend(self.create_text_delta_events(&before_thinking));
                     }
+                    events.extend(self.close_open_text_block());
 
                     // 进入 thinking 块
                     self.in_thinking_block = true;
                     self.strip_thinking_leading_newline = true;
                     self.thinking_buffer =
-                        self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
+                        self.thinking_buffer[start_pos + THINKING_START_TAG.len()..].to_string();
 
                     // 创建 thinking 块的 content_block_start 事件
                     let thinking_index = self.state_manager.next_block_index();
@@ -1755,10 +1908,12 @@ impl StreamContext {
                 } else {
                     // 没有找到 <thinking>，检查是否可能是部分标签
                     // 保留可能是部分标签的内容
-                    let target_len = self
-                        .thinking_buffer
-                        .len()
-                        .saturating_sub("<thinking>".len());
+                    let keep = if self.thinking_extracted {
+                        partial_thinking_tag_suffix_len(&self.thinking_buffer)
+                    } else {
+                        THINKING_START_TAG.len()
+                    };
+                    let target_len = self.thinking_buffer.len().saturating_sub(keep);
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -1802,7 +1957,6 @@ impl StreamContext {
                     // 结束 thinking 块
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
-
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
@@ -1819,8 +1973,7 @@ impl StreamContext {
 
                     // 结束标签后允许任意空白或直接正文；分隔空白不属于 text。
                     // 若当前 chunk 到这里结束，后续 chunk 的前导空白也要继续剥离。
-                    let remaining = self.thinking_buffer
-                        [end_pos + THINKING_END_TAG.len()..]
+                    let remaining = self.thinking_buffer[end_pos + THINKING_END_TAG.len()..]
                         .trim_start()
                         .to_string();
                     self.strip_text_leading_whitespace_after_thinking = remaining.is_empty();
@@ -1847,21 +2000,6 @@ impl StreamContext {
                     }
                     break;
                 }
-            } else {
-                // thinking 已提取完成，剩余内容作为 text_delta
-                if self.strip_text_leading_whitespace_after_thinking {
-                    self.thinking_buffer = self.thinking_buffer.trim_start().to_string();
-                    if self.thinking_buffer.is_empty() {
-                        break;
-                    }
-                    self.strip_text_leading_whitespace_after_thinking = false;
-                }
-                if !self.thinking_buffer.is_empty() {
-                    let remaining = self.thinking_buffer.clone();
-                    self.thinking_buffer.clear();
-                    events.extend(self.create_text_delta_events(&remaining));
-                }
-                break;
             }
         }
 
@@ -2200,6 +2338,22 @@ impl StreamContext {
         events
     }
 
+    fn flush_native_reasoning_tag_filter(&mut self) -> Vec<SseEvent> {
+        let tail = self.native_reasoning_tag_filter.finish();
+        if tail.is_empty() {
+            return Vec::new();
+        }
+        self.output_tokens += estimate_tokens(&tail);
+        if !self.thinking_enabled {
+            return self.create_text_delta_events(&tail);
+        }
+        let mut events = self.ensure_thinking_block();
+        if let Some(idx) = self.thinking_block_index {
+            events.push(self.create_thinking_delta_event(idx, &tail));
+        }
+        events
+    }
+
     fn close_open_thinking_block(&mut self) -> Vec<SseEvent> {
         let Some(idx) = self.thinking_block_index else {
             return Vec::new();
@@ -2227,11 +2381,13 @@ impl StreamContext {
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
         if !self.thinking_enabled {
-            if let Some(text) = reasoning.text.as_deref()
-                && !text.is_empty()
-            {
-                self.output_tokens += estimate_tokens(text);
-                return self.create_text_delta_events(text);
+            if let Some(text) = reasoning.text.as_deref() {
+                let text = self.native_reasoning_tag_filter.filter(text);
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                self.output_tokens += estimate_tokens(&text);
+                return self.create_text_delta_events(&text);
             }
             return Vec::new();
         }
@@ -2244,19 +2400,21 @@ impl StreamContext {
             self.pending_thinking_signature = Some(signature.to_string());
         }
 
-        if let Some(text) = reasoning.text.as_deref()
-            && !text.is_empty()
-        {
-            self.output_tokens += estimate_tokens(text);
-            events.extend(self.ensure_thinking_block());
-            if let Some(idx) = self.thinking_block_index {
-                events.push(self.create_thinking_delta_event(idx, text));
+        if let Some(text) = reasoning.text.as_deref() {
+            let text = self.native_reasoning_tag_filter.filter(text);
+            if !text.is_empty() {
+                self.output_tokens += estimate_tokens(&text);
+                events.extend(self.ensure_thinking_block());
+                if let Some(idx) = self.thinking_block_index {
+                    events.push(self.create_thinking_delta_event(idx, &text));
+                }
             }
         }
 
         if let Some(redacted) = reasoning.redacted_content.as_deref()
             && !redacted.is_empty()
         {
+            events.extend(self.flush_native_reasoning_tag_filter());
             self.output_tokens += 8;
             events.extend(self.create_redacted_thinking_events(redacted));
         }
@@ -2392,6 +2550,7 @@ impl StreamContext {
         let mut events = Vec::new();
 
         self.state_manager.set_has_tool_use(true);
+        events.extend(self.flush_native_reasoning_tag_filter());
 
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
@@ -2414,7 +2573,6 @@ impl StreamContext {
 
                 // 结束 thinking 块
                 self.in_thinking_block = false;
-                self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
@@ -2430,25 +2588,39 @@ impl StreamContext {
                 }
 
                 // 把结束标签后的内容当作普通文本（通常为空或空白）
-                let after_pos = end_pos + "</thinking>".len();
+                let after_pos = end_pos + THINKING_END_TAG.len();
                 let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                 self.thinking_buffer.clear();
                 if !remaining.is_empty() {
                     events.extend(self.create_text_delta_events(&remaining));
                 }
+            } else {
+                // A tool event is a hard boundary: no later assistant chunk can finish a
+                // split closing tag that preceded it. Flush only real thinking content.
+                let thinking_content =
+                    strip_unquoted_partial_thinking_tag_suffix(&self.thinking_buffer);
+                self.thinking_buffer.clear();
+                if !thinking_content.is_empty()
+                    && let Some(thinking_index) = self.thinking_block_index
+                {
+                    events.push(
+                        self.create_thinking_delta_event(thinking_index, &thinking_content),
+                    );
+                }
+                self.in_thinking_block = false;
+                events.extend(self.close_open_thinking_block());
             }
         }
 
         // thinking 模式下，process_content_with_thinking 可能会为了探测 `<thinking>` 而暂存一小段尾部文本。
         // 如果此时直接开始 tool_use，状态机会自动关闭 text block，导致这段"待输出文本"看起来被 tool_use 吞掉。
-        // 约束：只在尚未进入 thinking block、且 thinking 尚未被提取时，将缓冲区当作普通文本 flush。
-        if self.thinking_enabled
-            && !self.in_thinking_block
-            && !self.thinking_extracted
-            && !self.thinking_buffer.is_empty()
-        {
+        // 尚未进入 thinking block 时，将等待跨 chunk 标签的缓冲文本 flush。
+        if self.thinking_enabled && !self.in_thinking_block && !self.thinking_buffer.is_empty() {
             let buffered = std::mem::take(&mut self.thinking_buffer);
-            events.extend(self.create_text_delta_events(&buffered));
+            let buffered = strip_unquoted_partial_thinking_tag_suffix(&buffered);
+            if !buffered.is_empty() {
+                events.extend(self.create_text_delta_events(&buffered));
+            }
         }
 
         // 通过累积器缓冲工具参数 JSON 分片：只有收到 stop=true 且解析成功时才
@@ -2490,6 +2662,8 @@ impl StreamContext {
             ));
             return events;
         }
+
+        events.extend(self.flush_native_reasoning_tag_filter());
 
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
         // 走同一文本路径，交由后续 thinking / invoke 缓冲一并 flush。
@@ -2535,20 +2709,22 @@ impl StreamContext {
                     }
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
-                    let after_pos = end_pos + "</thinking>".len();
+                    let after_pos = end_pos + THINKING_END_TAG.len();
                     let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                     self.thinking_buffer.clear();
                     self.in_thinking_block = false;
-                    self.thinking_extracted = true;
                     if !remaining.is_empty() {
                         events.extend(self.create_text_delta_events(&remaining));
                     }
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
+                    let thinking_content =
+                        strip_unquoted_partial_thinking_tag_suffix(&self.thinking_buffer);
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
-                        );
+                        events.push(self.create_thinking_delta_event(
+                            thinking_index,
+                            &thinking_content,
+                        ));
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -2566,8 +2742,11 @@ impl StreamContext {
                 }
             } else {
                 // 否则发送剩余内容作为 text_delta
-                let buffer_content = self.thinking_buffer.clone();
-                events.extend(self.create_text_delta_events(&buffer_content));
+                let buffer_content =
+                    strip_unquoted_partial_thinking_tag_suffix(&self.thinking_buffer);
+                if !buffer_content.is_empty() {
+                    events.extend(self.create_text_delta_events(&buffer_content));
+                }
             }
             self.thinking_buffer.clear();
         }
@@ -3938,6 +4117,43 @@ mod tests {
             full_text
         );
         assert_eq!(full_text, "你好");
+    }
+
+    #[test]
+    fn test_multiple_thinking_blocks_and_orphan_end_tag_never_leak_to_text() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        for chunk in [
+            "<thinking>first plan</thi",
+            "nking>First answer. </thi",
+            "nking>\n\n<thin",
+            "king>second plan</thinking>Second answer.",
+        ] {
+            all.extend(ctx.process_assistant_response(chunk));
+        }
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        let text = collect_text_content(&all);
+        assert_eq!(thinking, "first plansecond plan");
+        assert_eq!(text, "First answer. Second answer.");
+        assert!(!text.contains("thinking"), "XML leaked into text: {text:?}");
+
+        let thinking_starts = all
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "thinking"
+            })
+            .count();
+        assert_eq!(thinking_starts, 2);
     }
 
     /// 辅助函数：从事件列表中提取所有 thinking_delta 的拼接内容
@@ -5391,6 +5607,228 @@ mod tests {
                 && e.data["delta"]["type"] == "signature_delta"
                 && e.data["delta"]["signature"] == "real-signature"
         }));
+    }
+
+    #[test]
+    fn test_native_reasoning_filters_split_legacy_thinking_tags() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        for text in ["<thin", "king>native reasoning</thi", "nking>"] {
+            all.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: Some(text.to_string()),
+                    signature: None,
+                    redacted_content: None,
+                },
+            )));
+        }
+        all.extend(ctx.process_assistant_response("final answer"));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all), "native reasoning");
+        assert_eq!(collect_text_content(&all), "final answer");
+        assert!(all.iter().all(|event| {
+            let delta = &event.data["delta"];
+            !delta["thinking"]
+                .as_str()
+                .is_some_and(|text| text.contains("thinking>"))
+                && !delta["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("thinking>"))
+        }));
+    }
+
+    #[test]
+    fn test_native_reasoning_filters_split_tags_when_thinking_disabled() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        for text in ["<thin", "king>visible fallback</thi", "nking>"] {
+            all.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: Some(text.to_string()),
+                    signature: None,
+                    redacted_content: None,
+                },
+            )));
+        }
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all), "visible fallback");
+        assert_eq!(collect_thinking_content(&all), "");
+    }
+
+    #[test]
+    fn test_twelve_native_thinking_rounds_with_split_tags_and_tool_calls() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        for round in 0..12 {
+            for text in [
+                format!("plan-{round}."),
+                "</thi".to_string(),
+                format!("nking>continued-{round}|"),
+            ] {
+                all.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                    crate::kiro::model::events::ReasoningContentEvent {
+                        text: Some(text),
+                        signature: None,
+                        redacted_content: None,
+                    },
+                )));
+            }
+            all.extend(ctx.process_tool_use(&tool_evt(
+                &format!("toolu_{round}"),
+                "read_file",
+                &format!("{{\"path\":\"/tmp/{round}\"}}"),
+                true,
+            )));
+            all.extend(ctx.process_assistant_response(&format!("answer-{round}|")));
+        }
+        all.extend(ctx.generate_final_events());
+
+        let expected_thinking: String = (0..12)
+            .map(|round| format!("plan-{round}.continued-{round}|"))
+            .collect();
+        let expected_text: String = (0..12).map(|round| format!("answer-{round}|")).collect();
+        assert_eq!(collect_thinking_content(&all), expected_thinking);
+        assert_eq!(collect_text_content(&all), expected_text);
+        assert_eq!(collect_tool_uses(&all).len(), 12);
+        assert!(all.iter().all(|event| {
+            let delta = &event.data["delta"];
+            !delta["thinking"]
+                .as_str()
+                .is_some_and(|text| text.contains("thinking>"))
+                && !delta["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("thinking>"))
+        }));
+    }
+
+    #[test]
+    fn test_twelve_thinking_rounds_mixed_with_tool_calls_keep_channels_separate() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        for round in 0..12 {
+            for chunk in [
+                "<thin".to_string(),
+                format!("king>plan-{round}</thi"),
+                format!("nking>answer-{round}|"),
+            ] {
+                all.extend(ctx.process_assistant_response(&chunk));
+            }
+            if round % 3 == 2 {
+                all.extend(ctx.process_tool_use(&tool_evt(
+                    &format!("toolu_{round}"),
+                    "read_file",
+                    &format!("{{\"path\":\"/tmp/{round}\"}}"),
+                    true,
+                )));
+            }
+        }
+        all.extend(ctx.generate_final_events());
+
+        let expected_thinking: String = (0..12).map(|round| format!("plan-{round}")).collect();
+        let expected_text: String = (0..12).map(|round| format!("answer-{round}|")).collect();
+        assert_eq!(collect_thinking_content(&all), expected_thinking);
+        assert_eq!(collect_text_content(&all), expected_text);
+        assert_eq!(collect_tool_uses(&all).len(), 4);
+        assert!(all.iter().all(|event| {
+            !event.data["delta"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("thinking>"))
+        }));
+    }
+
+    #[test]
+    fn test_truncated_orphan_thinking_tag_is_dropped_at_boundaries() {
+        let mut final_ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut final_events = final_ctx.generate_initial_events();
+        final_events.extend(final_ctx.process_assistant_response(
+            "<thinking>plan</thinking>answer</thin",
+        ));
+        final_events.extend(final_ctx.generate_final_events());
+        assert_eq!(collect_text_content(&final_events), "answer");
+
+        let mut tool_ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut tool_events = tool_ctx.generate_initial_events();
+        tool_events.extend(tool_ctx.process_assistant_response(
+            "<thinking>plan</thinking>answer</thin",
+        ));
+        tool_events.extend(tool_ctx.process_tool_use(&tool_evt(
+            "toolu_1",
+            "read_file",
+            "{\"path\":\"/tmp/example\"}",
+            true,
+        )));
+        tool_events.extend(tool_ctx.generate_final_events());
+        assert_eq!(collect_text_content(&tool_events), "answer");
+        assert_eq!(collect_tool_uses(&tool_events).len(), 1);
+    }
+
+    #[test]
+    fn test_truncated_closing_tag_inside_thinking_is_dropped_before_tool_call() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_assistant_response("<thinking>plan before tool</thin"));
+        all.extend(ctx.process_tool_use(&tool_evt(
+            "toolu_1",
+            "read_file",
+            "{\"path\":\"/tmp/example\"}",
+            true,
+        )));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all), "plan before tool");
+        assert_eq!(collect_tool_uses(&all).len(), 1);
+        let (_, thinking_idx) = block_start_position(&all, "thinking");
+        let thinking_stop = block_stop_position(&all, thinking_idx);
+        let (tool_start, _) = block_start_position(&all, "tool_use");
+        assert!(thinking_stop < tool_start);
     }
 
     #[test]
