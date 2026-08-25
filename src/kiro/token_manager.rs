@@ -512,6 +512,22 @@ fn available_models_url(host: &str, profile_arn: Option<&str>) -> String {
     )
 }
 
+fn set_user_preference_body(
+    credentials: &KiroCredentials,
+    overage_status: &str,
+) -> serde_json::Value {
+    if let Some(profile_arn) = credentials.effective_profile_arn() {
+        serde_json::json!({
+            "overageConfiguration": { "overageStatus": overage_status },
+            "profileArn": profile_arn,
+        })
+    } else {
+        serde_json::json!({
+            "overageConfiguration": { "overageStatus": overage_status },
+        })
+    }
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -827,16 +843,7 @@ pub(crate) async fn set_user_preference(
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     // 构建 body：仅发送真实 profileArn，跳过 BuilderID 占位符
-    let body = if let Some(profile_arn) = credentials.effective_profile_arn() {
-        serde_json::json!({
-            "overageConfiguration": { "overageStatus": overage_status },
-            "profileArn": profile_arn,
-        })
-    } else {
-        serde_json::json!({
-            "overageConfiguration": { "overageStatus": overage_status },
-        })
-    };
+    let body = set_user_preference_body(credentials, overage_status);
 
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
@@ -3704,7 +3711,7 @@ impl MultiTokenManager {
         };
 
         // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3712,6 +3719,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 解析失败不阻断请求，保留无 ARN 的 BuilderID 兼容路径。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 设置用户偏好前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -6199,6 +6216,38 @@ mod tests {
         assert_eq!(
             available_models_url(host, None),
             "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+        );
+    }
+
+    #[test]
+    fn test_set_user_preference_body_carries_real_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            set_user_preference_body(&credentials, "ENABLED"),
+            serde_json::json!({
+                "overageConfiguration": { "overageStatus": "ENABLED" },
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123",
+            })
+        );
+
+        // BuilderID 占位符仍不应作为 Enterprise profileArn 外发。
+        let builder_credentials = KiroCredentials {
+            profile_arn: Some(
+                crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_user_preference_body(&builder_credentials, "DISABLED"),
+            serde_json::json!({
+                "overageConfiguration": { "overageStatus": "DISABLED" },
+            })
         );
     }
 
