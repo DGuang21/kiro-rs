@@ -275,7 +275,7 @@ export function ClientKeysPage() {
           </CardContent>
         </Card>
       ) : (
-        <Card>
+        <Card className="overflow-hidden">
           <CardContent className="overflow-x-auto p-0">
             <table className="w-full min-w-[1040px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
