@@ -1695,9 +1695,11 @@ impl AdminService {
             .collect();
 
         let models_for_config = custom_models.clone();
-        self.update_config_file(move |c| {
-            c.custom_models = models_for_config;
-        });
+        self.token_manager
+            .update_config_file(move |c| {
+                c.custom_models = models_for_config;
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
 
         // 热更新内存注册表
         crate::model::custom_models::init(custom_models);
