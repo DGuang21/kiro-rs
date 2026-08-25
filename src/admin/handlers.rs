@@ -935,6 +935,8 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        total_credits: k.total_credits,
+        max_credits: k.max_credits,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -966,6 +968,18 @@ pub async fn create_client_key(
         )
             .into_response();
     }
+    // 校验积分上限（若提供）：必须是非负有限值
+    if let Some(v) = payload.max_credits {
+        if !v.is_finite() || v < 0.0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "maxCredits 必须是非负数",
+                )),
+            )
+                .into_response();
+        }
+    }
     let entry = state.client_keys.create(
         name.to_string(),
         payload
@@ -977,6 +991,10 @@ pub async fn create_client_key(
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
     );
+    // 创建后若指定了上限则应用
+    if let Some(v) = payload.max_credits {
+        state.client_keys.set_max_credits(entry.id, Some(v));
+    }
     Json(CreateClientKeyResponse {
         id: entry.id,
         key: entry.key,
@@ -984,6 +1002,43 @@ pub async fn create_client_key(
         created_at: entry.created_at,
     })
     .into_response()
+}
+
+/// POST /api/admin/client-keys/:id/max-credits
+/// 设置或清除单个 Key 的积分使用上限。body: { "maxCredits": <number|null> }
+pub async fn set_client_key_max_credits(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<super::types::SetClientKeyMaxCreditsRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    if let Some(v) = payload.max_credits {
+        if !v.is_finite() || v < 0.0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "maxCredits 必须是非负数",
+                )),
+            )
+                .into_response();
+        }
+    }
+    if state.client_keys.set_max_credits(id, payload.max_credits) {
+        let msg = match payload.max_credits {
+            Some(v) => format!("Key #{} 积分上限已设为 {:.2}", id, v),
+            None => format!("Key #{} 已取消积分上限", id),
+        };
+        Json(SuccessResponse::new(msg)).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response()
+    }
 }
 
 /// DELETE /api/admin/client-keys/:id
@@ -1329,6 +1384,49 @@ pub async fn stats_by_credential(
                 "inputTokens": d.input_tokens,
                 "outputTokens": d.output_tokens,
                 "errors": d.errors,
+            })
+        })
+        .collect();
+    Json(enriched).into_response()
+}
+
+/// GET /api/admin/stats/by-key?range=24h|7d|30d&group=...
+/// 按入口 Key 横向汇总时间窗内用量，附加 Key 名称方便前端展示。
+pub async fn stats_by_key(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let window = match parse_stats_window(&params) {
+        Ok(w) => w,
+        Err(message) => return stats_bad_request(message),
+    };
+    let group = parse_group_filter(&params);
+    let cred_ids = group_to_cred_ids(&state, group.as_deref());
+    let data = state.usage_aggregator.query_by_key(window, cred_ids.as_ref());
+    // Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
+    let key_name_map: HashMap<u64, String> = state
+        .client_keys
+        .list()
+        .into_iter()
+        .map(|k| (k.id, k.name))
+        .collect();
+    let enriched: Vec<serde_json::Value> = data
+        .into_iter()
+        .map(|d| {
+            let name = key_name_map
+                .get(&d.key_id)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", d.key_id));
+            serde_json::json!({
+                "keyId": d.key_id,
+                "name": name,
+                "calls": d.calls,
+                "inputTokens": d.input_tokens,
+                "outputTokens": d.output_tokens,
+                "cacheCreationTokens": d.cache_creation_tokens,
+                "cacheReadTokens": d.cache_read_tokens,
+                "errors": d.errors,
+                "credits": d.credits,
             })
         })
         .collect();

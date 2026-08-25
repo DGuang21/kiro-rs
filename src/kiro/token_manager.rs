@@ -470,17 +470,62 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
+fn profile_arn_query(profile_arn: Option<&str>) -> String {
+    match profile_arn {
+        Some(arn) => format!("&profileArn={}", urlencoding::encode(arn)),
+        None => String::new(),
+    }
+}
+
+/// 用量类接口的 403 回退候选：每个区域端点先带真实 profileArn 试，再退回不带。
+///
+/// Enterprise / IdC 账号缺 profileArn 会被上游拒（`403 User is not authorized
+/// to make this call.`）；BuilderID 占位符已由 `effective_profile_arn` 过滤，
+/// 这类账号只有「不带」一种形态，行为与加此参数前一致。
+fn usage_api_attempts<'a>(
+    credentials: &'a KiroCredentials,
+    candidates: &[&'static str],
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let mut attempts = Vec::with_capacity(candidates.len() * 2);
+    for region in candidates {
+        if let Some(arn) = credentials.effective_profile_arn() {
+            attempts.push((*region, Some(arn)));
+        }
+        attempts.push((*region, None));
+    }
+    attempts
+}
+
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        host,
+        profile_arn_query(profile_arn)
     )
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
-    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+fn available_models_url(host: &str, profile_arn: Option<&str>) -> String {
+    format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
+        host,
+        profile_arn_query(profile_arn)
+    )
+}
+
+fn set_user_preference_body(
+    credentials: &KiroCredentials,
+    overage_status: &str,
+) -> serde_json::Value {
+    if let Some(profile_arn) = credentials.effective_profile_arn() {
+        serde_json::json!({
+            "overageConfiguration": { "overageStatus": overage_status },
+            "profileArn": profile_arn,
+        })
+    } else {
+        serde_json::json!({
+            "overageConfiguration": { "overageStatus": overage_status },
+        })
+    }
 }
 
 /// 获取使用额度信息
@@ -512,10 +557,12 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
+
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = usage_limits_url(&host, credentials);
+        let url = usage_limits_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -546,12 +593,12 @@ pub(crate) async fn get_usage_limits(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
+                "getUsageLimits 在 {} 返回 403（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -605,10 +652,12 @@ pub(crate) async fn get_available_models(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
+
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = available_models_url(&host, credentials);
+        let url = available_models_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -639,12 +688,12 @@ pub(crate) async fn get_available_models(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403，尝试备用端点 {}",
+                "ListAvailableModels 在 {} 返回 403（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -794,16 +843,7 @@ pub(crate) async fn set_user_preference(
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     // 构建 body：仅发送真实 profileArn，跳过 BuilderID 占位符
-    let body = if let Some(profile_arn) = credentials.effective_profile_arn() {
-        serde_json::json!({
-            "overageConfiguration": { "overageStatus": overage_status },
-            "profileArn": profile_arn,
-        })
-    } else {
-        serde_json::json!({
-            "overageConfiguration": { "overageStatus": overage_status },
-        })
-    };
+    let body = set_user_preference_body(credentials, overage_status);
 
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
@@ -1574,7 +1614,17 @@ impl MultiTokenManager {
         let generation = self.model_cache_generation(id);
         let epoch = self.model_cache_epoch.load(Ordering::Relaxed);
         let _permit = self.model_refresh_semaphore.acquire().await?;
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, mut credentials) = self.prepare_request_token(id).await?;
+
+        // 同 get_usage_limits_for：先解析回填真实 profileArn。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 查询模型列表前解析 profileArn 失败: {}", id, error)
+            }
+        }
+
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let response =
@@ -3377,7 +3427,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3385,6 +3435,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 失败不阻断查询，由 get_usage_limits 内部按候选表回退。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 查询用量前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -3629,7 +3689,7 @@ impl MultiTokenManager {
         };
 
         // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3637,6 +3697,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 解析失败不阻断请求，保留无 ARN 的 BuilderID 兼容路径。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 设置用户偏好前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -6064,7 +6134,9 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+    fn test_usage_rest_urls_carry_resolved_profile_arn() {
+        // Enterprise / IdC：真实 ARN 必须以 URL 编码形式出现在查询串里，
+        // 否则上游返回 403 "User is not authorized to make this call."
         let credentials = KiroCredentials {
             profile_arn: Some(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
@@ -6072,14 +6144,93 @@ mod tests {
             ..Default::default()
         };
         let host = "q.us-east-1.amazonaws.com";
+        let encoded =
+            "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
 
+        let arn = credentials.effective_profile_arn();
         assert_eq!(
-            usage_limits_url(host, &credentials),
+            usage_limits_url(host, arn),
+            format!(
+                "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn={}",
+                encoded
+            )
+        );
+        assert_eq!(
+            available_models_url(host, arn),
+            format!(
+                "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn={}",
+                encoded
+            )
+        );
+
+        // 每个区域端点先试带 ARN，403 时回退到不带
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![
+                ("us-east-1", arn),
+                ("us-east-1", None),
+                ("eu-central-1", arn),
+                ("eu-central-1", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_usage_rest_urls_omit_builder_id_placeholder() {
+        // BuilderID 占位符不发送：这些账号沿用不带 profileArn 的老式请求
+        use crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN;
+
+        let credentials = KiroCredentials {
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+        let host = "q.us-east-1.amazonaws.com";
+
+        // 占位符被过滤，只剩「不带 ARN」一种形态：与加此参数前的行为一致
+        assert_eq!(credentials.effective_profile_arn(), None);
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![("us-east-1", None), ("eu-central-1", None)]
+        );
+        assert_eq!(
+            usage_limits_url(host, None),
             "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
         );
         assert_eq!(
-            available_models_url(host, &credentials),
+            available_models_url(host, None),
             "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+        );
+    }
+
+    #[test]
+    fn test_set_user_preference_body_carries_real_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            set_user_preference_body(&credentials, "ENABLED"),
+            serde_json::json!({
+                "overageConfiguration": { "overageStatus": "ENABLED" },
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123",
+            })
+        );
+
+        // BuilderID 占位符仍不应作为 Enterprise profileArn 外发。
+        let builder_credentials = KiroCredentials {
+            profile_arn: Some(
+                crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_user_preference_body(&builder_credentials, "DISABLED"),
+            serde_json::json!({
+                "overageConfiguration": { "overageStatus": "DISABLED" },
+            })
         );
     }
 

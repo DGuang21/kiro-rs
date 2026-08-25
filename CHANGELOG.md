@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+主题：**客户端 Key 的用量可观测与配额治理**。新增「按入口 Key 的用量分布」视图，并支持为单个 Key 设置**最高使用积分（credit）上限**，达到上限后自动拒绝其请求。新增数据字段均 `serde(default)`，旧 `client_api_keys.json` 无需改动。
+
+### ✨ 新增 — 按入口 Key 用量分布
+
+- 新增 `GET /api/admin/stats/by-key`：按入口 Key 横向汇总所选时间窗内的调用次数、输入/输出/缓存 Token、异常数与 credit 计费量，附加 Key 名称。
+- 聚合层新增 `UsageAggregator::query_by_key`，复用既有的每桶 `by_key` 预聚合；启用**分组筛选**时按凭据白名单走 `by_key_credential` 求和，与「按上游凭据分布」的过滤口径一致。
+- 概览页新增「按入口 Key 分布」面板：柱状图（Top 12）+ 明细表（异常数飘红、附 credit 列）。该面板为横向对比，**不随上方「统计筛选」的单 Key 选择变化**，前端已加说明文案避免困惑。
+
+### ✨ 新增 — 单个 Key 最高使用积分上限
+
+- `ClientKey` 新增 `maxCredits` 字段（`None`/省略 = 不限制）。上限基于**累计 `totalCredits`** 判定，「重置统计」清零后即可重新计费。
+- 鉴权层新增 `verify_and_touch_ex`，返回 `Ok` / `OverLimit` / `NotFound` 三态；命中但已达上限的请求返回 **HTTP 429 `rate_limit_error`**（提示已用/上限），且**不累加调用次数**。
+- 新增 `POST /api/admin/client-keys/{id}/max-credits`（body `{ "maxCredits": <number|null> }`，`null` 取消限制）；创建 Key 时亦可通过 `maxCredits` 直接指定。入参强制为**非负有限数**；`0` 表示零预算（立即拒绝）。
+- Key 管理页新增「积分 / 上限」列：接近上限（≥80%）转琥珀、达到/超过转红；创建与编辑对话框均可设置或清除上限。
+
+### ⚠️ 行为说明 — 上限为「软配额」
+
+积分为**累计**判定，且 credit 由上游 `meteringEvent.usage` 在**请求结束时**才入账。因此上限是软约束：在某个 Key 逼近上限时，**并发进行中的多个请求会在各自入账前都通过上限检查**，实际用量可能超出上限，超出幅度取决于并发数与单次请求的 credit 量。此设计避免请求执行中途被打断；若需要更硬的约束，应叠加外部限流。被拒的 429 请求为提前返回，不写入用量日志与链路追踪。
+
 ## [0.7.6] - 2026-08-13
 
 主题：**修复 GPT-5.6 推理参数、OpenAI 会话缓存与 Token 用量统计，同时校正 Claude Code 会话隔离和 Opus 5 上下文窗口识别**。本版聚焦协议转换与计量准确性，不新增配置项或迁移步骤。

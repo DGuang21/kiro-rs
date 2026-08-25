@@ -889,6 +889,11 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    /// 累计 credit 使用量（用于与上限比较）
+    pub total_credits: f64,
+    /// 积分使用上限（None 表示不限制）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
@@ -913,6 +918,9 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 积分使用上限（可选；None / 省略表示不限制）
+    #[serde(default)]
+    pub max_credits: Option<f64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -933,6 +941,15 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+}
+
+/// 设置客户端 Key 的积分使用上限
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetClientKeyMaxCreditsRequest {
+    /// 积分上限；null 或省略表示取消限制
+    #[serde(default)]
+    pub max_credits: Option<f64>,
 }
 
 // ============ IdC 设备授权登录 ============

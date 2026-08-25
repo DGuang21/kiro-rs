@@ -452,6 +452,10 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 累计 credit 使用量 */
+  totalCredits: number
+  /** 积分使用上限（未设置时为 undefined，表示不限制） */
+  maxCredits?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
@@ -467,6 +471,8 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  /** 积分使用上限（可选，不传表示不限制） */
+  maxCredits?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -541,6 +547,18 @@ export interface CredentialDistribution {
   inputTokens: number
   outputTokens: number
   errors: number
+}
+
+export interface KeyDistribution {
+  keyId: number
+  name: string
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  errors: number
+  credits: number
 }
 
 // ============ 请求链路追踪 ============
