@@ -26,6 +26,13 @@
     --input: 220 13% 88%;
     --ring: 211 100% 50%;
     --radius: 0.875rem;
+
+    /* 状态色轨 —— 三个页面共用的一套异常语言。
+       amber 与 orange 分开是有信息量的：冷却会自己恢复，超额不会。 */
+    --rail-ok: 160 84% 39%;
+    --rail-warn: 38 92% 50%;
+    --rail-cool: 25 95% 53%;
+    --rail-dead: 4 100% 59%;
   }
 
   .dark {
@@ -49,6 +56,11 @@
     --border: 220 14% 22%;
     --input: 220 14% 22%;
     --ring: 211 100% 60%;
+
+    --rail-ok: 160 84% 45%;
+    --rail-warn: 38 92% 55%;
+    --rail-cool: 25 95% 58%;
+    --rail-dead: 4 90% 62%;
   }
 }
 
@@ -137,6 +149,26 @@
     box-shadow: inset 0 -1px 0 0 hsl(var(--border) / 0.7);
   }
 
+  /* 可用模型铭牌逐行入场：与图表同一条 Apple 缓动曲线 */
+  .spec-row-in {
+    animation: spec-row-in 320ms cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  @keyframes spec-row-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spec-row-in {
+      animation: none;
+    }
+  }
+
   /* 趋势图 range 切换时的开屏动画：fade + slight slide-up */
   .chart-range-fade {
     animation: chart-range-fade 280ms cubic-bezier(0.32, 0.72, 0, 1) both;
@@ -153,6 +185,139 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .chart-range-fade {
+      animation: none;
+    }
+  }
+}
+
+/* ============================================================
+   Console 密度层
+   ------------------------------------------------------------
+   卡片是"看"的（rounded-2xl / h-10 / 舒适间距），表格是"做"的。
+   两种密度并存，不互相覆盖：本层只作用于 .console-* 作用域内，
+   避免与现有组件的 padding / radius 打架。
+   ============================================================ */
+@layer components {
+  .console-scope {
+    /* 数据列专用字族：ID / token / credit / 耗时 / 时间戳 靠它纵向对齐。
+       运维表格能否快速扫读，前提就是数字对齐。 */
+    --font-console: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo",
+      "Cascadia Mono", monospace;
+  }
+
+  /* 数值 / 标识符单元格 */
+  .console-num {
+    font-family: var(--font-console);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  /* 密集表格骨架 */
+  .console-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    text-align: left;
+    font-size: 12.5px;
+    line-height: 1.35;
+  }
+  .console-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    height: 30px;
+    padding: 0 10px;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: hsl(var(--muted-foreground));
+    background: hsl(var(--card));
+    box-shadow: inset 0 -1px 0 0 hsl(var(--border) / 0.8);
+    white-space: nowrap;
+  }
+  .console-table tbody td {
+    height: 34px;
+    padding: 0 10px;
+    box-shadow: inset 0 -1px 0 0 hsl(var(--border) / 0.4);
+    white-space: nowrap;
+  }
+  .console-table tbody tr:hover td {
+    background: hsl(var(--accent) / 0.45);
+  }
+  /* 键盘游标行（j/k 导航）—— 比 hover 更实心，两者可叠加 */
+  .console-table tbody tr[data-cursor="true"] td {
+    background: hsl(var(--accent) / 0.75);
+  }
+  .console-table tbody tr[data-selected="true"] td {
+    background: hsl(var(--primary) / 0.09);
+  }
+  .console-table tbody tr[data-selected="true"]:hover td {
+    background: hsl(var(--primary) / 0.14);
+  }
+
+  /* 3px 左侧状态色轨：异常在三个页面里都是同一个信号 */
+  .console-rail {
+    box-shadow: inset 3px 0 0 0 var(--rail, transparent);
+  }
+  .rail-ok {
+    --rail: hsl(var(--rail-ok));
+  }
+  .rail-warn {
+    --rail: hsl(var(--rail-warn));
+  }
+  .rail-cool {
+    --rail: hsl(var(--rail-cool));
+  }
+  .rail-dead {
+    --rail: hsl(var(--rail-dead));
+  }
+
+  /* 行内操作：静默时不占视觉，hover / 焦点内才显形。
+     用 opacity 而非 display，避免 hover 时列宽跳动。 */
+  .console-row-actions {
+    opacity: 0;
+    transition: opacity 120ms ease-out;
+  }
+  tr:hover .console-row-actions,
+  tr:focus-within .console-row-actions,
+  tr[data-cursor="true"] .console-row-actions {
+    opacity: 1;
+  }
+
+  /* 吸底批量栏 */
+  .console-bulkbar {
+    animation: console-bulkbar-in 200ms cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  @keyframes console-bulkbar-in {
+    from {
+      opacity: 0;
+      transform: translateY(12px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* 右侧抽屉 */
+  .console-drawer {
+    animation: console-drawer-in 240ms cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  @keyframes console-drawer-in {
+    from {
+      transform: translateX(16px);
+      opacity: 0;
+    }
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .console-bulkbar,
+    .console-drawer {
       animation: none;
     }
   }

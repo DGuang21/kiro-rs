@@ -22,7 +22,8 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
+        CreateClientKeyResponse, ModelTestRequest,
+        CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
@@ -30,6 +31,7 @@ use super::{
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
+        SetCustomModelsRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -42,6 +44,24 @@ type CredSessionPath = (u64, String);
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/config/credential-metadata-schema
+pub async fn get_credential_metadata_schema(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_credential_metadata_schema())
+}
+
+/// PUT /api/admin/config/credential-metadata-schema
+pub async fn set_credential_metadata_schema(
+    State(state): State<AdminState>,
+    Json(payload): Json<CredentialMetadataSchemaConfig>,
+) -> impl IntoResponse {
+    match state.service.set_credential_metadata_schema(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/credentials/export
@@ -695,9 +715,7 @@ pub async fn complete_social_login(
 /// GET /api/admin/config/global-proxy
 /// 获取当前全局代理配置
 pub async fn get_global_proxy(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(GlobalProxyResponse {
-        proxy_url: state.service.get_global_proxy(),
-    })
+    Json(state.service.get_global_proxy())
 }
 
 /// PUT /api/admin/config/global-proxy
@@ -706,8 +724,29 @@ pub async fn set_global_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<SetGlobalProxyRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_global_proxy(payload.proxy_url) {
+    match state
+        .service
+        .set_global_proxy(payload.proxy_url, payload.proxy_username, payload.proxy_password)
+    {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/custom-models
+/// 获取所有自定义模型配置
+pub async fn get_custom_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_custom_models())
+}
+
+/// PUT /api/admin/config/custom-models
+/// 批量替换自定义模型配置（运行时热更新 + 持久化 config.json）
+pub async fn set_custom_models(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCustomModelsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_custom_models(payload) {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -1396,7 +1435,8 @@ pub async fn stats_by_key(
 
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
-/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
+/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed /
+///            startTime / endTime（Unix 秒）/ q（关键字）/ limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
@@ -1434,6 +1474,13 @@ pub async fn list_traces(
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false),
         credential_ids,
+        // startTime / endTime 为 Unix 秒，与 traces.ts_epoch 同单位
+        start_ts: params.get("startTime").and_then(|s| s.parse::<i64>().ok()),
+        end_ts: params.get("endTime").and_then(|s| s.parse::<i64>().ok()),
+        keyword: params
+            .get("q")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         limit: params
             .get("limit")
             .and_then(|s| s.parse::<usize>().ok())

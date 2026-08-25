@@ -4,8 +4,9 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, SlidersHorizontal } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
+import { tabFromHash } from "@/hooks/use-url-state";
 
 function GithubIcon({ className }: { className?: string }) {
   return (
@@ -43,8 +44,19 @@ const GroupsPage = lazy(() =>
     default: m.GroupsPage,
   })),
 );
+const SettingsPage = lazy(() =>
+  import("@/components/settings-page").then((m) => ({
+    default: m.SettingsPage,
+  })),
+);
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "traces";
+type Tab =
+  | "overview"
+  | "credentials"
+  | "keys"
+  | "groups"
+  | "traces"
+  | "settings";
 
 const TABS: {
   key: Tab;
@@ -82,16 +94,25 @@ const TABS: {
     mobileLabel: "日志",
     icon: <ScrollText className="h-3.5 w-3.5" />,
   },
+  {
+    key: "settings",
+    label: "设置",
+    mobileLabel: "设置",
+    icon: <SlidersHorizontal className="h-3.5 w-3.5" />,
+  },
 ];
 
 function readTabFromHash(): Tab {
-  const h = window.location.hash.replace(/^#\/?/, "");
+  // 走共享解析：hash 里现在可能带筛选查询串（#/traces?status=error），
+  // 直接全等比较会认不出 Tab。
+  const h = tabFromHash();
   if (
     h === "credentials" ||
     h === "keys" ||
     h === "groups" ||
     h === "overview" ||
-    h === "traces"
+    h === "traces" ||
+    h === "settings"
   )
     return h;
   return "overview";
@@ -378,6 +399,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "keys" && <ClientKeysPage />}
         {tab === "groups" && <GroupsPage />}
         {tab === "traces" && <TraceLogPage />}
+        {tab === "settings" && <SettingsPage />}
       </Suspense>
     </main>
   );

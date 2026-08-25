@@ -1090,6 +1090,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 最近一次查询到的 Kiro 订阅等级；凭据禁用后也应保留展示。
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1116,6 +1118,8 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据扩展元数据
+    pub metadata: crate::kiro::model::credentials::CredentialMetadata,
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
@@ -1409,7 +1413,7 @@ impl MultiTokenManager {
         let initial_id = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
             .map(|e| e.id)
             .unwrap_or(0);
 
@@ -1553,7 +1557,7 @@ impl MultiTokenManager {
         self.model_refresh_locks.lock().remove(&id);
     }
 
-    fn invalidate_all_model_caches(&self) {
+    pub fn invalidate_all_model_caches(&self) {
         self.model_cache_epoch.fetch_add(1, Ordering::Relaxed);
         self.model_cache.lock().clear();
     }
@@ -1948,17 +1952,22 @@ impl MultiTokenManager {
                 // 平局时按优先级排序（数字越小优先级越高）
                 let (entry, _) = available.iter().min_by_key(|(e, support)| {
                     let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.success_count, e.credentials.priority)
+                    (
+                        discovery_rank,
+                        e.success_count,
+                        e.credentials.priority,
+                        e.id,
+                    )
                 })?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let (entry, _) = available.iter().min_by_key(|(e, support)| {
-                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.credentials.priority)
-                })?;
+                // priority 模式（默认）：严格选择数字最小的有效凭据。
+                // 同优先级按 ID 升序固定顺序，保证后端调度与前端预览一致。
+                let (entry, _) = available
+                    .iter()
+                    .min_by_key(|(e, _)| (e.credentials.priority, e.id))?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -2010,71 +2019,38 @@ impl MultiTokenManager {
             let (id, credentials, is_balanced) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
+                // 两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
+                // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
+                let mut best = self.select_next_credential(model, group);
+
+                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
+                // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
+                if best.is_none() && self.try_self_heal(model, group) {
+                    best = self.select_next_credential(model, group);
+                }
+
+                let (id, credentials) = if let Some((new_id, new_creds)) = best {
+                    if update_current {
+                        let mut current_id = self.current_id.lock();
+                        *current_id = new_id;
+                    }
+                    (new_id, new_creds)
                 } else {
                     let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    let now = Instant::now();
-                    let confirmed_available = entries.iter().any(|e| {
-                        !e.disabled
-                            && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                            && !self.rpm_exceeded(e, now)
-                            && credential_matches_request(&e.credentials, model, group)
-                            && self.cached_model_support(e.id, model)
-                                == CachedModelSupport::Confirmed
-                    });
-                    entries
-                        .iter()
-                        .find(|e| {
-                            let model_support = self.cached_model_support(e.id, model);
-                            e.id == current_id
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && !self.rpm_exceeded(e, now)
-                                && credential_matches_request(&e.credentials, model, group)
-                                && model_support != CachedModelSupport::Unsupported
-                                && (!confirmed_available
-                                    || model_support == CachedModelSupport::Confirmed)
-                        })
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                let (id, credentials) = if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
-                    // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
-                    if best.is_none() && self.try_self_heal(model, group) {
-                        best = self.select_next_credential(model, group);
+                    // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
+                    // 让调用方知道这是限流而不是凭据耗尽。
+                    if let Some(retry_after) =
+                        self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                    {
+                        return Err(
+                            UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
+                        );
                     }
-
-                    if let Some((new_id, new_creds)) = best {
-                        if update_current {
-                            let mut current_id = self.current_id.lock();
-                            *current_id = new_id;
-                        }
-                        (new_id, new_creds)
-                    } else {
-                        let entries = self.entries.lock();
-                        if let Some(retry_after) =
-                            self.rpm_retry_after_secs(&entries, model, group, Instant::now())
-                        {
-                            return Err(
-                                UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
-                            );
-                        }
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
-                    }
+                    // 注意：必须在 bail! 之前计算 available_count，
+                    // 因为 available_count() 会尝试获取 entries 锁，
+                    // 而此时我们已经持有该锁，会导致死锁
+                    let available = entries.iter().filter(|e| !e.disabled).count();
+                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                 };
 
                 (id, credentials, is_balanced)
@@ -2143,7 +2119,7 @@ impl MultiTokenManager {
         if let Some(best) = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             if best.id != *current_id {
                 tracing::info!(
@@ -2631,7 +2607,7 @@ impl MultiTokenManager {
                     .filter(|entry| {
                         self.entry_available_for_request(entry, model, group, Instant::now())
                     })
-                    .min_by_key(|e| e.credentials.priority)
+                    .min_by_key(|e| (e.credentials.priority, e.id))
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -2706,7 +2682,7 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -2874,7 +2850,7 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -2940,7 +2916,7 @@ impl MultiTokenManager {
                 let has_available = if let Some(next) = entries
                     .iter()
                     .filter(|e| !e.disabled)
-                    .min_by_key(|e| e.credentials.priority)
+                    .min_by_key(|e| (e.credentials.priority, e.id))
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -2996,7 +2972,7 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3028,7 +3004,7 @@ impl MultiTokenManager {
         if let Some(next) = entries
             .iter()
             .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             *current_id = next.id;
             tracing::info!(
@@ -3128,6 +3104,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -3142,6 +3119,7 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    metadata: e.credentials.metadata.clone(),
                     created_at: e.credentials.created_at.clone(),
                 })
                 .collect(),
@@ -3867,6 +3845,7 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.metadata = new_cred.metadata;
         // 记录添加时间：保留导入时携带的原值（如 KAM 迁移），否则以当前时间入库。
         // 此处为所有添加路径（单条添加 / 批量导入 / 登录回调）的唯一收口。
         if validated_cred.created_at.is_none() {
@@ -3939,6 +3918,7 @@ impl MultiTokenManager {
         proxy_password: Option<Option<String>>,
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
+        metadata: Option<crate::kiro::model::credentials::CredentialMetadata>,
     ) -> anyhow::Result<()> {
         let invalidate_models =
             proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
@@ -3971,6 +3951,9 @@ impl MultiTokenManager {
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            if let Some(v) = metadata {
+                entry.credentials.metadata = v;
             }
         }
         if invalidate_models {
@@ -6719,6 +6702,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -6728,8 +6712,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_update_credential_preserves_extensible_metadata() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let metadata = crate::kiro::model::credentials::CredentialMetadata {
+            kind: crate::kiro::model::credentials::CredentialType::Boom,
+            sale_status: crate::kiro::model::credentials::CredentialSaleStatus::ForSale,
+            extra: std::collections::BTreeMap::from([(
+                "supplier".to_string(),
+                serde_json::Value::String("vendor-a".to_string()),
+            )]),
+        };
+
+        manager
+            .update_credential(1, None, None, None, None, None, None, Some(metadata))
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.entries[0].metadata.kind,
+            crate::kiro::model::credentials::CredentialType::Boom
+        );
+        assert_eq!(
+            snapshot.entries[0].metadata.sale_status,
+            crate::kiro::model::credentials::CredentialSaleStatus::ForSale
+        );
+        assert_eq!(
+            snapshot.entries[0].metadata.extra.get("supplier"),
+            Some(&serde_json::Value::String("vendor-a".to_string()))
+        );
+    }
+
     #[tokio::test]
-    async fn test_model_routing_prefers_confirmed_cache_over_unknown_current() {
+    async fn test_priority_routing_prefers_priority_over_unknown_model_cache() {
         let mut confirmed = grouped_cred("confirmed", &[]);
         confirmed.priority = 10;
         let manager = MultiTokenManager::new(
@@ -6746,7 +6768,7 @@ mod tests {
             .acquire_context(Some("minimax-m2.5"), None)
             .await
             .unwrap();
-        assert_eq!(context.id, 2);
+        assert_eq!(context.id, 1);
     }
 
     #[tokio::test]
@@ -6879,6 +6901,113 @@ mod tests {
         assert!(manager.select_next_credential(None, Some("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
         assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_ignores_stale_current_id() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        assert!(manager.switch_to_next());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 1);
+        assert_eq!(manager.snapshot().current_id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_selects_smallest_priority_in_request_group() {
+        let mut other_group = grouped_cred("other", &["g2"]);
+        other_group.priority = 0;
+        let mut later_in_group = grouped_cred("later", &["g1"]);
+        later_in_group.priority = 20;
+        let mut first_in_group = grouped_cred("first", &["g1"]);
+        first_in_group.priority = 10;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![other_group, later_in_group, first_in_group],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let context = manager.acquire_context(None, Some("g1")).await.unwrap();
+        assert_eq!(context.id, 3);
+        assert_eq!(manager.snapshot().current_id, 3);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_falls_through_at_rpm_limit_and_switches_back() {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 1;
+
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        let first_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(first_context.id, 1);
+
+        let fallback_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback_context.id, 2);
+
+        {
+            let mut entries = manager.entries.lock();
+            let expired = Instant::now() - StdDuration::from_secs(RPM_WINDOW_SECS + 1);
+            for timestamp in entries[0].rpm_window.iter_mut() {
+                *timestamp = expired;
+            }
+        }
+
+        let recovered_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered_context.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_switches_back_after_higher_priority_is_enabled() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        let fallback_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback_context.id, 2);
+
+        manager.set_disabled(1, false).unwrap();
+        let recovered_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered_context.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_uses_id_to_break_equal_priority_ties() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.switch_to_next());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 1);
     }
 
     #[tokio::test]

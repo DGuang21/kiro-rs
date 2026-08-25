@@ -541,7 +541,7 @@ fn aggregate_available_models_with_custom(
 }
 
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
-    aggregate_available_models_with_custom(upstream_models, crate::model::custom_models::all())
+    aggregate_available_models_with_custom(upstream_models, &crate::model::custom_models::all())
 }
 
 /// GET /v1/models
