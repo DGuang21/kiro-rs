@@ -722,8 +722,8 @@ pub struct GlobalProxyResponse {
     pub proxy_url: Option<String>,
     /// 代理认证用户名
     pub proxy_username: Option<String>,
-    /// 代理认证密码
-    pub proxy_password: Option<String>,
+    /// 是否已配置代理认证密码；不回显密码本身。
+    pub proxy_password_set: bool,
 }
 
 /// 设置全局代理请求
@@ -735,9 +735,10 @@ pub struct SetGlobalProxyRequest {
     /// 代理认证用户名（仅 proxy_url 不为 null 时有效）
     #[serde(default)]
     pub proxy_username: Option<String>,
-    /// 代理认证密码（仅 proxy_url 不为 null 时有效）
+    /// 代理认证密码（仅 proxy_url 不为 null 时有效）。省略表示保留现有密码，
+    /// 显式 null 表示清除密码。
     #[serde(default)]
-    pub proxy_password: Option<String>,
+    pub proxy_password: Option<Option<String>>,
 }
 
 // ============ 在线更新配置 ============

@@ -312,12 +312,13 @@ export interface AssignRoundRobinResponse {
 export interface GlobalProxyResponse {
   proxyUrl: string | null
   proxyUsername: string | null
-  proxyPassword: string | null
+  proxyPasswordSet: boolean
 }
 
 export interface SetGlobalProxyRequest {
   proxyUrl: string | null
   proxyUsername?: string | null
+  /** Omit to preserve the existing password; send null to clear it. */
   proxyPassword?: string | null
 }
 

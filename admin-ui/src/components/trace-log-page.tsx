@@ -602,7 +602,13 @@ export function TraceLogPage() {
   const debouncedSearch = useDebounced(searchDraft)
   const searchRef = useRef<HTMLInputElement>(null)
   const [detail, setDetail] = useState<TraceRecord | null>(null)
+  const [now, setNow] = useState(() => Date.now())
   useSlashFocus(searchRef)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   // 搜索词稳定后才写进 URL / 触发查询
   useEffect(() => {
@@ -627,13 +633,11 @@ export function TraceLogPage() {
     ...groupOptions.map((g) => ({ value: g, label: g })),
   ]
 
-  // 时间窗口按分钟数换算成起始秒。用 range 字符串做依赖，避免每次渲染都产生新的
-  // startTime 把 react-query 的 queryKey 打散（那会导致 30s 自动刷新变成每渲染必刷）。
+  // 时间窗口按分钟数换算成起始秒；随自动刷新时钟滑动，始终表示“最近 N 分钟”。
   const startTime = useMemo(() => {
-    const ms = rangeToStartMs(range)
+    const ms = rangeToStartMs(range, now)
     return ms == null ? undefined : Math.floor(ms / 1000)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url.range])
+  }, [url.range, now])
 
   const query: TraceQuery = {
     status: url.status || undefined,

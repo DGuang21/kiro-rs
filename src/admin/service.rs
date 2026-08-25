@@ -1595,7 +1595,7 @@ impl AdminService {
         GlobalProxyResponse {
             proxy_url: proxy.as_ref().map(|p| p.url.clone()),
             proxy_username: proxy.as_ref().and_then(|p| p.username.clone()),
-            proxy_password: proxy.as_ref().and_then(|p| p.password.clone()),
+            proxy_password_set: proxy.as_ref().and_then(|p| p.password.as_ref()).is_some(),
         }
     }
 
@@ -1604,23 +1604,35 @@ impl AdminService {
         &self,
         url: Option<String>,
         username: Option<String>,
-        password: Option<String>,
+        password: Option<Option<String>>,
     ) -> Result<(), AdminServiceError> {
         if let Some(ref u) = url {
-            let valid_prefix = u.starts_with("http://")
-                || u.starts_with("https://")
-                || u.starts_with("socks5://")
-                || u.starts_with("socks4://");
+            let normalized = u.to_ascii_lowercase();
+            let valid_prefix = [
+                "http://",
+                "https://",
+                "socks4://",
+                "socks4a://",
+                "socks5://",
+                "socks5h://",
+            ]
+            .iter()
+            .any(|scheme| normalized.starts_with(scheme));
             if !valid_prefix {
                 return Err(AdminServiceError::InvalidCredential(
-                    "代理 URL 格式无效，需以 http://、https://、socks5:// 或 socks4:// 开头"
+                    "代理 URL 格式无效，需以 http://、https://、socks4://、socks4a://、socks5:// 或 socks5h:// 开头"
                         .to_string(),
                 ));
             }
         }
 
         let username_for_save = username.clone().filter(|s| !s.is_empty());
-        let password_for_save = password.clone().filter(|s| !s.is_empty());
+        let current_password = self.token_manager.proxy().and_then(|proxy| proxy.password);
+        let password_for_save = match (url.as_ref(), password) {
+            (None, _) => None,
+            (Some(_), None) => current_password,
+            (Some(_), Some(value)) => value.filter(|s| !s.is_empty()),
+        };
 
         let proxy = url.as_deref().map(|u| {
             let mut cfg = ProxyConfig::new(u);
@@ -1628,15 +1640,16 @@ impl AdminService {
             cfg.password = password_for_save.clone();
             cfg
         });
-        self.token_manager.set_global_proxy(proxy);
-
-        // 从磁盘加载最新 config 再写，避免覆盖其他字段的并发修改
+        // 从磁盘加载最新 config 再写；持久化成功后才切换运行时代理，避免半更新。
         let url_for_save = url;
-        self.update_config_file(move |c| {
-            c.proxy_url = url_for_save;
-            c.proxy_username = username_for_save;
-            c.proxy_password = password_for_save;
-        });
+        self.token_manager
+            .update_config_file(move |c| {
+                c.proxy_url = url_for_save;
+                c.proxy_username = username_for_save;
+                c.proxy_password = password_for_save;
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        self.token_manager.set_global_proxy(proxy);
         Ok(())
     }
 
@@ -1664,18 +1677,45 @@ impl AdminService {
     ) -> Result<CustomModelsConfigResponse, AdminServiceError> {
         // 校验必填字段
         for (i, m) in req.models.iter().enumerate() {
-            if m.id.trim().is_empty() {
+            let id = m.id.trim();
+            let backend_id = m.backend_id.trim();
+            if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
                 return Err(AdminServiceError::InvalidCredential(format!(
-                    "第 {} 条模型的 id 不能为空",
-                    i + 1
+                    "第 {} 条模型的 id 必须是 1-128 个非控制字符",
+                    i + 1,
                 )));
             }
-            if m.backend_id.trim().is_empty() {
+            if backend_id.is_empty() || backend_id.len() > 256 || backend_id.chars().any(char::is_control) {
                 return Err(AdminServiceError::InvalidCredential(format!(
-                    "第 {} 条模型（{}）的 backend_id 不能为空",
-                    i + 1,
-                    m.id
+                    "第 {} 条模型（{}）的 backend_id 必须是 1-256 个非控制字符",
+                    i + 1, id,
                 )));
+            }
+            if let Some(value) = m.context_window {
+                if !(1..=10_000_000).contains(&value) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "第 {} 条模型的 contextWindow 必须在 1 到 10000000 之间",
+                        i + 1
+                    )));
+                }
+            }
+            if let Some(value) = m.max_tokens {
+                if !(1..=1_000_000).contains(&value) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "第 {} 条模型的 maxTokens 必须在 1 到 1000000 之间",
+                        i + 1
+                    )));
+                }
+            }
+        }
+
+        let mut seen_ids = HashSet::new();
+        for model in &req.models {
+            let key = model.id.trim().to_ascii_lowercase();
+            if !seen_ids.insert(key) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "自定义模型 id 不能重复（不区分大小写）".to_string(),
+                ));
             }
         }
 
@@ -1684,8 +1724,8 @@ impl AdminService {
             .models
             .into_iter()
             .map(|m| crate::model::config::CustomModel {
-                id: m.id,
-                backend_id: m.backend_id,
+                id: m.id.trim().to_string(),
+                backend_id: m.backend_id.trim().to_string(),
                 display_name: m.display_name,
                 context_window: m.context_window,
                 max_tokens: m.max_tokens,
@@ -3670,6 +3710,23 @@ mod tests {
         assert_eq!(region.title, "区域");
         assert_eq!(region.description.as_deref(), Some("凭据所属区域"));
         assert_eq!(region.value, serde_json::json!("us-east-1"));
+    }
+
+    #[tokio::test]
+    async fn global_proxy_response_redacts_password() {
+        let proxy = ProxyConfig::new("socks5h://127.0.0.1:1080").with_auth("user", "secret");
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), Some(proxy), None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+
+        let response = service.get_global_proxy();
+        let json = serde_json::to_value(response).unwrap();
+
+        assert_eq!(json["proxyPasswordSet"], true);
+        assert!(json.get("proxyPassword").is_none());
+        assert!(!json.to_string().contains("secret"));
     }
 
     #[tokio::test]

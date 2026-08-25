@@ -17,7 +17,14 @@ import { reportSaveError } from '@/components/settings/report-error'
  * 代理地址填错会让**所有**上游请求立刻失败，所以要求显式「应用」按钮，
  * 并对 URL 做基本协议校验。
  */
-const PROXY_SCHEMES = ['http://', 'https://', 'socks5://', 'socks5h://']
+const PROXY_SCHEMES = [
+  'http://',
+  'https://',
+  'socks4://',
+  'socks4a://',
+  'socks5://',
+  'socks5h://',
+]
 
 export function NetworkSection() {
   const { data, isLoading } = useGlobalProxy()
@@ -28,7 +35,7 @@ export function NetworkSection() {
 
   const currentUrl = data?.proxyUrl ?? null
   const currentUsername = data?.proxyUsername ?? null
-  const currentPassword = data?.proxyPassword ?? null
+  const currentPasswordSet = data?.proxyPasswordSet ?? false
 
   const [draftUrl, setDraftUrl] = useState('')
   const [draftUsername, setDraftUsername] = useState('')
@@ -37,8 +44,8 @@ export function NetworkSection() {
   useEffect(() => {
     setDraftUrl(currentUrl ?? '')
     setDraftUsername(currentUsername ?? '')
-    setDraftPassword(currentPassword ?? '')
-  }, [currentUrl, currentUsername, currentPassword])
+    setDraftPassword('')
+  }, [currentUrl, currentUsername, currentPasswordSet])
 
   const buildPayload = () => {
     const url = draftUrl.trim() || null
@@ -46,7 +53,7 @@ export function NetworkSection() {
     return {
       proxyUrl: url,
       proxyUsername: draftUsername.trim() || null,
-      proxyPassword: draftPassword || null,
+      ...(draftPassword ? { proxyPassword: draftPassword } : {}),
     }
   }
 
@@ -74,7 +81,7 @@ export function NetworkSection() {
 
   const hint = currentUrl
     ? `当前生效：${maskProxyUrl(currentUrl)}${currentUsername ? ` (${currentUsername})` : ''}`
-    : '未配置，直连上游。支持 http / https / socks5，可填写认证凭据'
+    : '未配置，直连上游。支持 HTTP / HTTPS / SOCKS，可填写认证凭据'
 
   return (
     <SettingGroup
@@ -91,7 +98,7 @@ export function NetworkSection() {
               if (e.key === 'Escape') {
                 setDraftUrl(currentUrl ?? '')
                 setDraftUsername(currentUsername ?? '')
-                setDraftPassword(currentPassword ?? '')
+                setDraftPassword('')
               }
             }}
             placeholder="socks5://host:1080"
@@ -145,7 +152,7 @@ export function NetworkSection() {
           </SettingRow>
           <SettingRow
             label="认证密码"
-            hint="选填，与用户名配合使用"
+            hint={currentPasswordSet ? '已配置密码；留空保存时保留现有密码' : '选填，与用户名配合使用'}
             pending={isPending}
             saved={saved}
           >
@@ -154,14 +161,32 @@ export function NetworkSection() {
               value={draftPassword}
               onChange={(e) => setDraftPassword(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Escape') setDraftPassword(currentPassword ?? '')
+                if (e.key === 'Escape') setDraftPassword('')
               }}
-              placeholder="留空则不认证"
+              placeholder={currentPasswordSet ? '已配置，留空则保留' : '留空则不认证'}
               disabled={isLoading || isPending}
               spellCheck={false}
               autoComplete="new-password"
               className="console-num h-8 w-[min(16rem,50vw)] text-[12.5px]"
             />
+            {currentPasswordSet && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setDraftPassword('')
+                  saver.save('proxy', {
+                    proxyUrl: currentUrl,
+                    proxyUsername: currentUsername,
+                    proxyPassword: null,
+                  })
+                }}
+                disabled={isLoading || isPending}
+                title="清除已保存的代理密码"
+              >
+                清除密码
+              </Button>
+            )}
           </SettingRow>
         </>
       )}
