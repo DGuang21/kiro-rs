@@ -23,6 +23,7 @@ import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage, formatCredits } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { PageHeader } from '@/components/console/page-header'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -247,17 +248,17 @@ export function ClientKeysPage() {
 
   return (
     <div>
-      <div className="mb-6 flex items-end justify-between gap-4">
-        <div>
-          <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。
-          </p>
-        </div>
-        <Button onClick={() => setCreateOpen(true)} size="sm">
-          <Plus className="h-3.5 w-3.5" />新建 Key
-        </Button>
-      </div>
+      <PageHeader
+        className="mb-4"
+        icon={<KeyRound className="h-4 w-4" />}
+        title="客户端 Key"
+        description="分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。"
+        actions={
+          <Button onClick={() => setCreateOpen(true)} size="sm">
+            <Plus className="h-3.5 w-3.5" />新建 Key
+          </Button>
+        }
+      />
 
       {isLoading ? (
         <Card>

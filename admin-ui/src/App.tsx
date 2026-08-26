@@ -2,7 +2,7 @@ import { useState, useEffect, lazy, Suspense } from "react";
 import { storage } from "@/lib/storage";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
-import { ConfirmProvider } from "@/components/ui/confirm-dialog";
+import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, SlidersHorizontal } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
@@ -296,6 +296,18 @@ function HeaderActions({
   onLogout: () => void;
   onToggleDarkMode: () => void;
 }) {
+  const confirm = useConfirm();
+
+  const handleLogout = async () => {
+    const confirmed = await confirm({
+      title: "退出登录？",
+      description: "退出后需要重新输入管理面板密钥才能继续使用。",
+      confirmText: "退出登录",
+      destructive: true,
+    });
+    if (confirmed) onLogout();
+  };
+
   return (
     <div className="flex shrink-0 items-center gap-1">
       <div className="xl:hidden">
@@ -309,7 +321,7 @@ function HeaderActions({
       <Button variant="ghost" size="icon" onClick={onToggleDarkMode} title="切换主题">
         {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
       </Button>
-      <Button variant="ghost" size="icon" onClick={onLogout} title="退出登录">
+      <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
         <LogOut className="h-4 w-4" />
       </Button>
     </div>
@@ -345,7 +357,7 @@ function MobileTabs({
   tab: Tab;
 }) {
   return (
-    <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-6 items-center gap-0.5 overflow-hidden px-2 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -371,7 +383,7 @@ function TabButton({
   tab: (typeof TABS)[number];
 }) {
   const className = mobile
-    ? "h-8 min-w-[4.25rem] flex-1 overflow-hidden rounded-full px-2 text-[11px] min-[360px]:min-w-[4.75rem] min-[390px]:px-3 min-[390px]:text-xs md:min-w-0 md:flex-none md:px-3"
+    ? "h-8 w-full min-w-0 overflow-hidden rounded-full px-0.5 text-[10px] min-[360px]:px-1 min-[360px]:text-[11px] min-[390px]:px-1.5 min-[390px]:text-xs md:w-auto md:min-w-0 md:px-3"
     : "h-7 rounded-full px-3 text-xs";
   const label = mobile ? tab.mobileLabel : tab.label;
 

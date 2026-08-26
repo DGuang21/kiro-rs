@@ -245,10 +245,6 @@
   .console-table tbody tr:hover td {
     background: hsl(var(--accent) / 0.45);
   }
-  /* 键盘游标行（j/k 导航）—— 比 hover 更实心，两者可叠加 */
-  .console-table tbody tr[data-cursor="true"] td {
-    background: hsl(var(--accent) / 0.75);
-  }
   .console-table tbody tr[data-selected="true"] td {
     background: hsl(var(--primary) / 0.09);
   }
@@ -280,8 +276,7 @@
     transition: opacity 120ms ease-out;
   }
   tr:hover .console-row-actions,
-  tr:focus-within .console-row-actions,
-  tr[data-cursor="true"] .console-row-actions {
+  tr:focus-within .console-row-actions {
     opacity: 1;
   }
 

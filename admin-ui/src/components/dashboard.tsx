@@ -144,6 +144,7 @@ import {
 import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
 import { StatusStrip } from "@/components/console/status-strip";
 import { BulkBar } from "@/components/console/bulk-bar";
+import { PageHeader } from "@/components/console/page-header";
 import {
   countByState,
   matchesStateFilter,
@@ -354,7 +355,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // 快捷键支持：按下 '/' 或 'Cmd/Ctrl+K' 聚焦搜索框；'Esc' 快速清空并失焦
+  // Cmd/Ctrl+K 聚焦搜索框；搜索框聚焦时按 Esc 可快速清空并失焦
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -363,17 +364,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           searchInputRef.current?.blur();
         }
         return;
-      }
-
-      if (
-        e.key === "/" &&
-        !["INPUT", "TEXTAREA", "SELECT"].includes(
-          (e.target as HTMLElement)?.tagName,
-        ) &&
-        !(e.target as HTMLElement)?.isContentEditable
-      ) {
-        e.preventDefault();
-        searchInputRef.current?.focus();
       }
 
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -1484,17 +1474,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         ref={gridRef}
         className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
       >
-        {/* 大标题 */}
-        <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px]">
-              凭据管理
-            </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              管理 Kiro 的所有访问凭据、负载均衡与登录信息
-            </p>
-          </div>
-        </div>
+        <PageHeader
+          className="mb-4"
+          icon={<Server className="h-4 w-4" />}
+          title="凭据管理"
+          description="管理 Kiro 的所有访问凭据、负载均衡与登录信息"
+        />
 
         {/* 状态标签条已下移到紧贴列表处（见下方 <StatusStrip />）：
             它是列表的表头兼筛选器，放在标题下方会与它筛选的列表隔开两行工具栏。 */}
@@ -1560,15 +1545,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             {/* 筛选器 — 左（移动端两列网格并排，桌面端内联） */}
             <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
               {/* 模糊搜索：来源渠道（备注）/ 邮箱；移动端整行、桌面端 210px */}
-              <div className="relative col-span-2 sm:col-span-1 sm:w-[210px]">
+              <div className="relative col-span-2 sm:col-span-1 sm:w-[230px]">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground opacity-80" />
                 <input
                   ref={searchInputRef}
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="搜索来源渠道 / 备注 / 邮箱"
-                  className="h-8 w-full rounded-full border border-border bg-card/60 pl-8 pr-7 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
+                  placeholder="搜索来源 / 备注 / 邮箱"
+                  className="h-8 w-full rounded-full border border-border bg-card/60 pl-8 pr-9 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
                 />
                 {searchQuery ? (
                   <button
@@ -1579,11 +1564,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
-                ) : (
-                  <kbd className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 hidden select-none rounded border border-border/70 bg-muted/60 px-1.5 font-mono text-[10px] font-medium text-muted-foreground opacity-60 sm:inline-block">
-                    /
-                  </kbd>
-                )}
+                ) : null}
               </div>
               <Select
                 value={groupFilter || "all"}

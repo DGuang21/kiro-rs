@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   ScrollText,
-  RefreshCw,
   ChevronRight,
   ChevronLeft,
   AlertTriangle,
@@ -26,6 +25,8 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
+import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
+import { PageHeader } from '@/components/console/page-header'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { useUrlState } from '@/hooks/use-url-state'
@@ -452,29 +453,6 @@ function useDebounced<T>(value: T, delay = 300): T {
   return debounced
 }
 
-/** `/` 聚焦搜索框 —— 手不离键盘就能开始筛 */
-function useSlashFocus(ref: React.RefObject<HTMLInputElement | null>) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
-      const t = e.target as HTMLElement | null
-      if (
-        t &&
-        (t.tagName === 'INPUT' ||
-          t.tagName === 'TEXTAREA' ||
-          t.isContentEditable)
-      ) {
-        return
-      }
-      e.preventDefault()
-      ref.current?.focus()
-      ref.current?.select()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [ref])
-}
-
 /** 表格列定义。默认 8 列，其余进列控制菜单 —— 12 列全摆开必然横向滚动。 */
 function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
   return useMemo(
@@ -600,15 +578,8 @@ export function TraceLogPage() {
   const [url, patchUrl, resetUrl] = useUrlState('traces', URL_DEFAULTS)
   const [searchDraft, setSearchDraft] = useState(url.q)
   const debouncedSearch = useDebounced(searchDraft)
-  const searchRef = useRef<HTMLInputElement>(null)
   const [detail, setDetail] = useState<TraceRecord | null>(null)
   const [now, setNow] = useState(() => Date.now())
-  useSlashFocus(searchRef)
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
-    return () => window.clearInterval(timer)
-  }, [])
 
   // 搜索词稳定后才写进 URL / 触发查询
   useEffect(() => {
@@ -660,49 +631,50 @@ export function TraceLogPage() {
   ).length
 
   return (
-    <div className="console-scope space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <ScrollText className="h-4 w-4 text-muted-foreground" />
-        <h2 className="text-lg font-semibold tracking-tight">请求日志</h2>
-        <span className="console-num text-[13px] text-muted-foreground">
-          {total} 条
-        </span>
-        {filterCount > 0 && (
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => {
-              resetUrl()
-              setSearchDraft('')
+    <div className="console-scope space-y-4">
+      <PageHeader
+        icon={<ScrollText className="h-4 w-4" />}
+        title="请求日志"
+        meta={
+          <>
+            <span className="console-num text-[13px] text-muted-foreground">
+              {total} 条
+            </span>
+            {filterCount > 0 && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  resetUrl()
+                  setSearchDraft('')
+                }}
+                className="h-7 px-2 text-xs"
+              >
+                清除 {filterCount} 个筛选
+              </Button>
+            )}
+          </>
+        }
+        actions={
+          <AutoRefreshControl
+            onRefresh={() => {
+              // 相对时间窗口需要在每次刷新时重新取“现在”；即使同一秒内点击，也直接 refetch。
+              if (range.minutes != null) {
+                setNow(Date.now())
+              }
+              return refetch()
             }}
-            className="h-7 px-2 text-xs"
-          >
-            清除 {filterCount} 个筛选
-          </Button>
-        )}
-        <span className="ml-auto text-[11px] text-muted-foreground">
-          <kbd className="rounded border border-border/70 px-1">/</kbd> 搜索 ·{' '}
-          <kbd className="rounded border border-border/70 px-1">j</kbd>
-          <kbd className="ml-0.5 rounded border border-border/70 px-1">k</kbd> 移动 ·{' '}
-          <kbd className="rounded border border-border/70 px-1">Enter</kbd> 详情
-        </span>
-      </div>
+            isRefreshing={isFetching}
+            resourceLabel="请求日志"
+          />
+        }
+      />
 
-      {/* 筛选栏：时间范围在最前，因为排查的第一句话通常是"刚才那几分钟" */}
+      {/* 筛选栏：文本与分类条件优先，时间范围收在末尾。 */}
       <div className="flex flex-wrap items-center gap-2">
-        <TimeRangePicker
-          value={range}
-          onChange={(next) =>
-            patchUrl({
-              range: next.minutes == null ? '' : String(next.minutes),
-              page: '0',
-            })
-          }
-        />
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
-            ref={searchRef}
             type="text"
             value={searchDraft}
             onChange={(e) => setSearchDraft(e.target.value)}
@@ -747,15 +719,15 @@ export function TraceLogPage() {
           onChange={(v) => patchUrl({ group: v, page: '0' })}
           options={groupSelectOptions}
         />
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => refetch()}
-          disabled={isFetching}
-          title="立即刷新（每 30 秒自动刷新）"
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-        </Button>
+        <TimeRangePicker
+          value={range}
+          onChange={(next) =>
+            patchUrl({
+              range: next.minutes == null ? '' : String(next.minutes),
+              page: '0',
+            })
+          }
+        />
       </div>
 
       <ConsoleTable
@@ -811,8 +783,7 @@ export function TraceLogPage() {
  * 详情抽屉，替掉原先的行展开。
  *
  * 行展开会把 34px 的行顶到几百 px，下方所有行位置突变、滚动位置跟着跳 —— 想对比
- * 相邻两条记录时格外难受。抽屉让表格布局始终稳定，左边列表和右边详情能同时看，
- * j/k 还能继续在列表里走。
+ * 相邻两条记录时格外难受。抽屉让表格布局始终稳定，左边列表和右边详情能同时看。
  */
 function TraceDetailDrawer({
   rec,
