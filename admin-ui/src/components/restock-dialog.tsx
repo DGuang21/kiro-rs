@@ -145,7 +145,7 @@ export function RestockDialog({ open, onOpenChange }: RestockDialogProps) {
             <label className="text-sm font-medium">选择上游</label>
             {list.length === 0 ? (
               <div className="rounded-xl border border-dashed p-3 text-sm text-muted-foreground">
-                暂无上游，请先到「补货上游」Tab 添加。
+                暂无上游，请先到设置里的「补货上游」添加。
               </div>
             ) : (
               <Select value={upstreamId} onValueChange={setUpstreamId} disabled={purchasing}>

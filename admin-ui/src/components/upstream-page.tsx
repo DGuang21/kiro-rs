@@ -141,7 +141,7 @@ const WEEKDAY_LABELS = ['日', '一', '二', '三', '四', '五', '六']
  * 基础能力：上游 CRUD（URL + usr-key）、查询余额/库存、手动提号入库、
  * 配置自动提号（低消：收到 new_keys_available 自动提）、注册/测试 Webhook、事件日志。
  */
-export function UpstreamPage() {
+export function UpstreamPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { data: upstreams, isLoading, isFetching, refetch } = useUpstreams()
   const { data: eventsData, refetch: refetchEvents } = useUpstreamEvents()
   const events = eventsData?.events ?? []
@@ -397,10 +397,17 @@ export function UpstreamPage() {
       {/* 标题 */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px] flex items-center gap-2">
-            <PackagePlus className="h-6 w-6" />
-            补货上游
-          </h1>
+          {embedded ? (
+            <h2 className="flex items-center gap-2 text-lg font-semibold leading-tight tracking-tight">
+              <PackagePlus className="h-4 w-4" />
+              补货上游
+            </h2>
+          ) : (
+            <h1 className="flex items-center gap-2 text-2xl font-semibold leading-tight tracking-tight sm:text-[28px]">
+              <PackagePlus className="h-6 w-6" />
+              补货上游
+            </h1>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
