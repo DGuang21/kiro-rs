@@ -27,7 +27,7 @@ import type { GroupItem } from '@/types/api'
  * - 删除默认拒绝有引用的，二次确认才允许 force 级联清理
  * - 列表展示每个分组当前被多少个凭据 / Key 引用，删除前清楚知道影响
  */
-export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
+export function GroupsPage() {
   const { data, isLoading, isFetching, refetch } = useGroups()
   const createGroup = useCreateGroup()
   const updateGroup = useUpdateGroup()
@@ -135,29 +135,23 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          {!embedded && (
-            <h2 className="text-lg font-semibold flex items-center gap-2">
-              <FolderTree className="h-4 w-4" />
-              分组管理
-            </h2>
-          )}
-          <p className={`text-sm text-muted-foreground ${embedded ? '' : 'mt-1'}`}>
-            分组是凭据 / 客户端 Key 共享的独立实体；改名 / 删除会级联同步。
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
-            <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-            刷新
-          </Button>
-          <Button size="sm" onClick={openCreate}>
-            <Plus className="h-3.5 w-3.5" />
-            新建分组
-          </Button>
-        </div>
-      </div>
+      <PageHeader
+        icon={<FolderTree className="h-4 w-4" />}
+        title="分组管理"
+        description="分组是凭据 / 客户端 Key 共享的独立实体；改名 / 删除会级联同步。"
+        actions={
+          <>
+            <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
+              <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+              刷新
+            </Button>
+            <Button size="sm" onClick={openCreate}>
+              <Plus className="h-3.5 w-3.5" />
+              新建分组
+            </Button>
+          </>
+        }
+      />
 
       {isLoading ? (
         <Card><CardContent className="py-8 text-sm text-center text-muted-foreground">加载中…</CardContent></Card>

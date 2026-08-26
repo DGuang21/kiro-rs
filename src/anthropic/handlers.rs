@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
@@ -236,9 +235,9 @@ impl RequestTracer {
 impl TraceSink for RequestTracer {
     fn on_attempt(&self, mut attempt: TraceAttempt) {
         let mut attempts = self.attempts.lock();
-        // 一次客户端请求可能因为“空 tool_result 续轮”重新调用 provider。
-        // provider 内部的 attempt 会从 0 重新计数，这里统一改成整条 trace 内单调递增，
-        // 避免 trace_attempts 的 (trace_id, attempt) 主键相互覆盖。
+        // Each provider call numbers retries from zero. A web-search request can make
+        // several provider calls under one trace, so assign a request-wide sequence
+        // before persisting to the (trace_id, attempt) primary key.
         attempt.attempt = attempts.len() as u32;
         attempts.push(attempt);
     }
@@ -900,9 +899,7 @@ async fn handle_stream_request(
             return map_provider_error(e);
         }
     };
-    let response = call_result.response;
     let credential_id = call_result.credential_id;
-    let concurrency_guard = call_result.concurrency_guard;
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
@@ -917,12 +914,16 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流，并让并发 guard 随流存活到流结束/客户端断开
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
-    let stream = GuardedStream {
-        inner: Box::pin(stream),
-        _guard: concurrency_guard,
-    };
+    // 创建 SSE 流
+    let stream = create_sse_stream(
+        call_result.response,
+        ctx,
+        initial_events,
+        hook,
+        credential_id,
+        tracer,
+        call_result.concurrency_guard,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -972,26 +973,6 @@ fn create_error_sse(error_type: &str, message: impl Into<String>) -> Bytes {
     )
 }
 
-/// 包装 SSE 响应流并持有并发计数 guard。
-///
-/// SSE 流被 axum 惰性拉取（客户端消费多久，流就存活多久）。把
-/// [`RequestGuard`](crate::kiro::token_manager::RequestGuard) 随流一起持有，
-/// 流播完或客户端断开导致本结构被 Drop 时，对应凭据的在途并发才 -1，
-/// 从而让"当前并发"覆盖整个流式响应生命周期。
-struct GuardedStream {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>,
-    _guard: Option<crate::kiro::token_manager::RequestGuard>,
-}
-
-impl Stream for GuardedStream {
-    type Item = Result<Bytes, Infallible>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // GuardedStream 自身 Unpin（inner 是 Pin<Box<..>>，_guard 仅含 Arc + u64）。
-        self.get_mut().inner.as_mut().poll_next(cx)
-    }
-}
-
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -1000,6 +981,7 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    concurrency_guard: Option<crate::kiro::token_manager::RequestGuard>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -1010,7 +992,13 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
-    let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
+    let settlement = StreamSettlement::new(
+        hook,
+        credential_id,
+        tracer,
+        &ctx,
+        concurrency_guard,
+    );
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
@@ -1058,9 +1046,13 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // transport error 不能再走正常 message_delta/message_stop 收尾，
-                            // 否则客户端会把半截或空响应误判为成功 end_turn。
-                            record_stream_usage(&hook, &ctx, credential_id, "error");
+                            // 流已开始后无法修改 HTTP 状态码。关闭已打开的内容块并发送
+                            // Anthropic error 终态，不能用正常 message_stop 掩盖上游断流。
+                            let final_events = ctx.generate_error_events(
+                                "upstream_error",
+                                "Upstream response stream was interrupted",
+                            );
+                            settlement.update(&ctx, sent_bytes);
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             settlement.finish(
                                 "error",
@@ -1069,24 +1061,22 @@ fn create_sse_stream(
                                 Some(&e.to_string()),
                                 Some(sent_bytes),
                             );
-                            let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_error_sse(
-                                "upstream_stream_error",
-                                "Upstream response stream was interrupted.",
-                            ))];
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
                         }
                         None => {
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
-                            let stream_error = ctx
-                                .tool_json_error_message()
-                                .or_else(|| ctx.upstream_error_message());
-                            if let Some(message) = stream_error {
-                                // 实时流已回 200，只能用 SSE error 终止；generate_final_events
-                                // 已保证不会再附带正常 message_stop。
-                                record_stream_usage(&hook, &ctx, credential_id, "error");
-                                tracer.finalize(
+                            settlement.update(&ctx, sent_bytes);
+                            if let Some(message) = ctx.tool_json_error_message() {
+                                // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
+                                // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
+                                settlement.finish(
+                                    "error",
                                     "error",
                                     Some(outcome::BAD_REQUEST),
                                     Some(&message),
@@ -1130,6 +1120,7 @@ struct StreamSettlement {
     usage: TraceUsage,
     sent_bytes: u64,
     settled: bool,
+    _concurrency_guard: Option<crate::kiro::token_manager::RequestGuard>,
 }
 
 impl StreamSettlement {
@@ -1138,6 +1129,7 @@ impl StreamSettlement {
         credential_id: u64,
         tracer: std::sync::Arc<RequestTracer>,
         ctx: &StreamContext,
+        concurrency_guard: Option<crate::kiro::token_manager::RequestGuard>,
     ) -> Self {
         Self {
             hook,
@@ -1146,6 +1138,7 @@ impl StreamSettlement {
             usage: stream_trace_usage(ctx),
             sent_bytes: 0,
             settled: false,
+            _concurrency_guard: concurrency_guard,
         }
     }
 
@@ -1312,7 +1305,6 @@ async fn handle_non_stream_request(
 ) -> Response {
     let mut retries = 0;
     let (body_bytes, credential_id, _concurrency_guard) = loop {
-        // 调用 Kiro API（支持多凭据故障转移）
         let call_result = match provider
             .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
             .await
@@ -1332,19 +1324,14 @@ async fn handle_non_stream_request(
         };
         let credential_id = call_result.credential_id;
         let concurrency_guard = call_result.concurrency_guard;
-
         let body_bytes = match call_result.response.bytes().await {
             Ok(bytes) => bytes,
-            Err(e)
-                if retry_empty_continuation
-                    && retries < MAX_EMPTY_TOOL_RESULT_RETRIES =>
-            {
+            Err(_e) if retry_empty_continuation && retries < MAX_EMPTY_TOOL_RESULT_RETRIES => {
                 retries += 1;
                 tracing::warn!(
                     retry = retries,
                     "tool_result non-stream continuation was interrupted; retrying"
                 );
-                drop(concurrency_guard);
                 continue;
             }
             Err(e) => {
@@ -1370,15 +1357,13 @@ async fn handle_non_stream_request(
 
         match inspect_non_stream_continuation(&body_bytes, &tool_name_map) {
             Ok(NonStreamContinuation::Empty)
-                if retry_empty_continuation
-                    && retries < MAX_EMPTY_TOOL_RESULT_RETRIES =>
+                if retry_empty_continuation && retries < MAX_EMPTY_TOOL_RESULT_RETRIES =>
             {
                 retries += 1;
                 tracing::warn!(
                     retry = retries,
                     "upstream returned an empty non-stream assistant turn after tool_result; retrying"
                 );
-                drop(concurrency_guard);
                 continue;
             }
             Ok(NonStreamContinuation::Empty) if retry_empty_continuation => {
@@ -2073,7 +2058,6 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e);
         }
     };
-    // 缓冲流自身持有并发 guard；空续轮重试时会切换到新请求的 guard。
     let stream = create_buffered_sse_stream(
         call_result,
         provider,
@@ -2117,6 +2101,7 @@ struct BufferedSseState {
     ping_interval: tokio::time::Interval,
     pending: VecDeque<Bytes>,
     finished: bool,
+    settled: bool,
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
@@ -2169,28 +2154,49 @@ impl BufferedSseState {
         }
     }
 
-    fn queue_error(&mut self, error_type: &str, public_message: &str, trace_message: &str) {
+    fn settle_error(&mut self, error_type: &str, trace_status: &str, trace_message: &str) {
+        if self.settled {
+            return;
+        }
         let (i, o, cc, cr, credits) = self.final_usage();
         self.hook
             .record(self.credential_id, i, o, cc, cr, credits, "error");
         self.tracer.finalize(
-            "error",
+            trace_status,
             Some(error_type),
             Some(trace_message),
             Some(self.received_bytes),
             self.trace_usage(),
         );
+        self.settled = true;
+    }
+
+    fn queue_error(
+        &mut self,
+        error_type: &str,
+        public_message: &str,
+        trace_message: &str,
+    ) {
+        let trace_status = if error_type == outcome::STREAM_INTERRUPTED {
+            "interrupted"
+        } else {
+            "error"
+        };
+        self.settle_error(error_type, trace_status, trace_message);
         self.pending
             .push_back(create_error_sse(error_type, public_message));
         self.finished = true;
     }
 
     fn queue_success(&mut self, events: Vec<SseEvent>) {
-        let (i, o, cc, cr, credits) = self.final_usage();
-        self.hook
-            .record(self.credential_id, i, o, cc, cr, credits, "success");
-        self.tracer
-            .finalize("success", None, None, None, self.trace_usage());
+        if !self.settled {
+            let (i, o, cc, cr, credits) = self.final_usage();
+            self.hook
+                .record(self.credential_id, i, o, cc, cr, credits, "success");
+            self.tracer
+                .finalize("success", None, None, None, self.trace_usage());
+            self.settled = true;
+        }
         self.pending.extend(
             events
                 .into_iter()
@@ -2202,10 +2208,7 @@ impl BufferedSseState {
     async fn retry_upstream(&mut self) -> Result<(), anyhow::Error> {
         self.retries += 1;
         self.discarded_credits += self.ctx.final_usage().4;
-        // 先释放上一条流的并发占用，再获取重试请求的 guard。
         self.concurrency_guard.take();
-        // Reset the discarded response before awaiting the retry. If acquiring the retry fails,
-        // queue_error must not count the discarded response's credits a second time.
         self.ctx = self.new_context();
         self.decoder = EventStreamDecoder::new();
         let call_result = self
@@ -2220,6 +2223,18 @@ impl BufferedSseState {
         self.credential_id = call_result.credential_id;
         self.concurrency_guard = call_result.concurrency_guard;
         Ok(())
+    }
+}
+
+impl Drop for BufferedSseState {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle_error(
+                outcome::STREAM_INTERRUPTED,
+                "interrupted",
+                "response stream was cancelled before completion",
+            );
+        }
     }
 }
 
@@ -2255,6 +2270,7 @@ fn create_buffered_sse_stream(
         ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
         pending: VecDeque::new(),
         finished: false,
+        settled: false,
         hook,
         credential_id: call_result.credential_id,
         tracer,
@@ -2339,8 +2355,8 @@ fn create_buffered_sse_stream(
                             return state.pending.pop_front().map(|bytes| (Ok(bytes), state));
                         }
                         None => {
-                            // 必须在 finish 前取值：thinking-only 的本地兼容兜底会设置 max_tokens，
-                            // 但它不代表上游真的给出了容量终止原因。
+                            // Read this before finish: thinking-only compatibility fallback can set
+                            // max_tokens locally, but that is not an upstream terminal limit.
                             let terminal_limit = state.ctx.has_terminal_limit();
                             let all_events = state.ctx.finish_and_get_all_events();
 
@@ -2402,6 +2418,35 @@ mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
 
+    fn request_with_messages(messages: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-sonnet-4",
+            "messages": messages
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_continuation_retry_only_applies_after_tool_result() {
+        let tool_result = request_with_messages(json!([
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "run", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]}
+        ]));
+        assert!(last_message_has_tool_result(&tool_result));
+
+        let plain_user = request_with_messages(json!([
+            {"role": "user", "content": "hello"}
+        ]));
+        assert!(!last_message_has_tool_result(&plain_user));
+
+        let historical_tool_result = request_with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]},
+            {"role": "assistant", "content": "acknowledged"},
+            {"role": "user", "content": "continue"}
+        ]));
+        assert!(!last_message_has_tool_result(&historical_tool_result));
+    }
+
     #[test]
     fn dropped_stream_settles_latest_usage_exactly_once() {
         let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
@@ -2433,7 +2478,7 @@ mod tests {
         ctx.output_tokens = 7;
         ctx.credits = 0.5;
 
-        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx);
+        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx, None);
         settlement.update(&ctx, 123);
         drop(settlement);
 

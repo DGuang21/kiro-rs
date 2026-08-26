@@ -48,7 +48,8 @@ use super::types::{
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, RetryConfigResponse, SelfHealConfigResponse,
     SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetRetryConfigRequest, SetSelfHealConfigRequest,
+    SetCustomModelsRequest, SetLogGovernanceConfigRequest, SetRetryConfigRequest,
+    SetSelfHealConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
@@ -774,6 +775,7 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    metadata,
                     in_flight: entry.in_flight,
                     // RPM 由 handler 层用 UsageAggregator 补齐（service 不持有聚合器）
                     rpm: 0,
@@ -791,6 +793,7 @@ impl AdminService {
             total: snapshot.total,
             available: snapshot.available,
             current_id: exposed_current_id,
+            metadata_schema,
             active_concurrency: snapshot.active_concurrency,
             credentials,
         }
@@ -3945,6 +3948,7 @@ fn build_api_key_credential_request(
         endpoint,
         groups,
         source_channel,
+        metadata: CredentialMetadata::default(),
     }
 }
 

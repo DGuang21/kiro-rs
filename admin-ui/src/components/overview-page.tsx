@@ -2,8 +2,10 @@ import { useCallback, useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, Gauge, KeyRound, Server } from 'lucide-react'
-import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
+import { useByCredential, useByKey, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
+import { PageHeader } from '@/components/console/page-header'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { usePersistentState } from '@/hooks/use-persistent-state'
@@ -50,7 +52,6 @@ function toDateInputValue(d: Date): string {
   const day = String(d.getDate()).padStart(2, '0')
   return `${year}-${month}-${day}`
 }
-
 function customTimeFilter(
   startDate: string,
   endDate: string,
@@ -140,7 +141,6 @@ export function OverviewPage() {
       <StatsCards
         activeCredentials={overview?.activeCredentials ?? 0}
         activeKeys={overview?.activeClientKeys ?? 0}
-        rpm={overview?.rpm ?? 0}
         stats={rangeStats}
         timeText={timeLabel(filters.timeFilter)}
       />
@@ -184,14 +184,11 @@ export function OverviewPage() {
 
 function useOverviewFilters() {
   const today = useMemo(() => toDateInputValue(new Date()), [])
-  // 时间选择持久化。preset（近 24h / 7d / 30d）存的是相对区间，重新进页面时
-  // 按“今天”重算起止日期，避免下次打开还停在旧日期上；自定义区间则原样恢复。
   const [savedTime, setSavedTime] = usePersistentState<SavedTimeSelection>(
     PREF_KEYS.overviewTime,
     { granularity: 'hour', range: '24h' },
     reviveSavedTime,
   )
-  // 挂载时解析一次即可：后续变化都由用户操作驱动，各 state 已同步更新
   const [initial] = useState(() => resolveSavedTime(savedTime, today))
   const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>(initial.timeFilter)
   const [customStartDate, setCustomStartDate] = useState(initial.startDate)
@@ -216,11 +213,6 @@ function useOverviewFilters() {
     if (groupFilter !== 'all') f.group = groupFilter
     return f
   }, [keyFilter, groupFilter])
-  /**
-   * 「应用」是唯一让图表换数据的入口，所以也只在这里落盘 —— 保证「存下来的」
-   * 永远等于「图上画的」。若当前草稿来自 preset 按钮，存相对区间（range），
-   * 下次打开按当天重算；否则存用户手填的绝对日期。
-   */
   const applyCustomRange = () => {
     setTimeFilter(customTimeFilter(customStartDate, customEndDate, draftGranularity))
     setSavedTime(
@@ -266,11 +258,6 @@ function useOverviewFilters() {
   }
 }
 
-/**
- * 持久化的时间选择。二者互斥：
- * - `range` 有值 → 相对区间（近 24h/7d/30d），每次打开按当天重算起止
- * - `startDate`/`endDate` 有值 → 用户显式应用过的绝对区间，原样恢复
- */
 interface SavedTimeSelection {
   endDate?: string
   granularity: StatsGranularity
@@ -282,23 +269,21 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 
 const reviveSavedTime: Revive<SavedTimeSelection> = (raw) => {
   if (typeof raw !== 'object' || raw === null) return undefined
-  const o = raw as Record<string, unknown>
-  const granularity = GRANULARITIES.some((g) => g.value === o.granularity)
-    ? (o.granularity as StatsGranularity)
+  const value = raw as Record<string, unknown>
+  const granularity = GRANULARITIES.some((item) => item.value === value.granularity)
+    ? (value.granularity as StatsGranularity)
     : 'hour'
-  if (typeof o.range === 'string' && RANGES.some((r) => r.value === o.range)) {
-    return { granularity, range: o.range as StatsRange }
+  if (typeof value.range === 'string' && RANGES.some((item) => item.value === value.range)) {
+    return { granularity, range: value.range as StatsRange }
   }
-  const startDate = typeof o.startDate === 'string' ? o.startDate : ''
-  const endDate = typeof o.endDate === 'string' ? o.endDate : ''
+  const startDate = typeof value.startDate === 'string' ? value.startDate : ''
+  const endDate = typeof value.endDate === 'string' ? value.endDate : ''
   if (DATE_RE.test(startDate) && DATE_RE.test(endDate) && startDate <= endDate) {
     return { endDate, granularity, startDate }
   }
-  // 区间坏了但粒度还能用，回落到默认 preset
   return { granularity, range: '24h' }
 }
 
-/** 把持久化的选择还原成页面初始状态 */
 function resolveSavedTime(saved: SavedTimeSelection, today: string) {
   if (saved.range) {
     const startDate = presetStartDate(saved.range, today)
@@ -350,13 +335,11 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
 function StatsCards({
   activeCredentials,
   activeKeys,
-  rpm,
   stats,
   timeText,
 }: {
   activeCredentials: number
   activeKeys: number
-  rpm: number
   stats: RangeStats
   timeText: string
 }) {
@@ -368,14 +351,6 @@ function StatsCards({
       extra: stats.errors > 0 ? (
         <Badge variant="destructive">异常 {formatNumber(stats.errors)}</Badge>
       ) : null,
-    },
-    {
-      icon: <Gauge className="h-4 w-4" />,
-      label: 'RPM',
-      // RPM 是实时瞬时值，不受上方时间筛选影响，需覆盖默认的 meta 文案
-      meta: '最近 60 秒',
-      value: formatNumber(rpm),
-      extra: <span className="text-[11px] text-muted-foreground">请求/分钟</span>,
     },
     { icon: <Cpu className="h-4 w-4" />, label: '输入 Token', value: formatNumber(stats.inputTokens) },
     { icon: <Cpu className="h-4 w-4" />, label: '输出 Token', value: formatNumber(stats.outputTokens) },
@@ -400,8 +375,7 @@ function StatsCards({
   ]
 
   return (
-    // 每行最多 3 个：6 列时每格宽度不够，数字和 extra 会被截断。
-    <div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-5">
       {cards.map((card) => (
         <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
       ))}

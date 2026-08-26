@@ -30,7 +30,6 @@ function formatTokens(n: number): string {
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
   return n.toString()
 }
-
 /**
  * 解析积分上限输入框：
  * - 空字符串 → null（不限制）
@@ -74,7 +73,7 @@ function formatRelative(ts?: string): string {
   return `${Math.floor(diff / 86400_000)} 天前`
 }
 
-export function ClientKeysPage({ embedded = false }: { embedded?: boolean } = {}) {
+export function ClientKeysPage() {
   const { data, isLoading } = useClientKeys()
   // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
   const groupOptions = useGroupOptions()
@@ -248,19 +247,17 @@ export function ClientKeysPage({ embedded = false }: { embedded?: boolean } = {}
 
   return (
     <div>
-      <div className="mb-6 flex items-end justify-between gap-4">
-        <div>
-          {!embedded && (
-            <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
-          )}
-          <p className={`text-sm text-muted-foreground ${embedded ? '' : 'mt-1'}`}>
-            分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。
-          </p>
-        </div>
-        <Button onClick={() => setCreateOpen(true)} size="sm">
-          <Plus className="h-3.5 w-3.5" />新建 Key
-        </Button>
-      </div>
+      <PageHeader
+        className="mb-4"
+        icon={<KeyRound className="h-4 w-4" />}
+        title="客户端 Key"
+        description="分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。"
+        actions={
+          <Button onClick={() => setCreateOpen(true)} size="sm">
+            <Plus className="h-3.5 w-3.5" />新建 Key
+          </Button>
+        }
+      />
 
       {isLoading ? (
         <Card>

@@ -35,12 +35,10 @@ import {
   List,
   Search,
   X,
-  FilterX,
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
   Loader2,
-  PackageCheck,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -90,8 +88,8 @@ import {
   type VerifyResult,
 } from "@/components/batch-verify-dialog";
 import { detectTier, type Tier } from "@/components/subscription-badge";
+import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
-import { RestockDialog } from "@/components/restock-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   useCredentials,
@@ -110,7 +108,6 @@ import {
   usePersistentSet,
   usePersistentState,
 } from "@/hooks/use-persistent-state";
-import { useTheme } from "@/hooks/use-theme";
 import {
   PREF_KEYS,
   reviveNonNegativeInt,
@@ -147,8 +144,6 @@ import {
   enableOverageForAllCapable,
   exportKamCredentials,
   updateAdminKey,
-  nextLoadBalancingMode,
-  loadBalancingModeLabel,
 } from "@/api/credentials";
 import {
   cn,
@@ -181,7 +176,6 @@ const TIER_OPTIONS: { value: Tier; label: string }[] = [
   { value: "power", label: "POWER" },
   { value: "unknown", label: "未知/未查询" },
 ];
-// 持久化校验用：读 localStorage 时过滤掉已不存在的分级值
 const TIER_VALUES = TIER_OPTIONS.map((o) => o.value) as readonly Tier[];
 const TIER_LABELS: Record<Tier, string> = {
   free: "FREE",
@@ -193,7 +187,6 @@ const TIER_LABELS: Record<Tier, string> = {
 
 // 每页数量可选项；另有“全部”（pageSize = 0）由下拉单独追加
 const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
-/** 默认每页数量；0 视为“全部”（不分页） */
 const DEFAULT_PAGE_SIZE = 12;
 const CREDENTIAL_VIEWS = ["card", "list"] as const;
 
@@ -267,10 +260,6 @@ const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
   { value: "lastUsedAt", label: "最后使用" },
   { value: "id", label: "ID" },
 ];
-const SORT_FIELDS = [
-  "manual",
-  ...SORT_OPTIONS.map((o) => o.value),
-] as readonly SortField[];
 const SORT_LABELS: Record<SortField, string> = {
   manual: "手动顺序",
   priority: "优先级",
@@ -279,57 +268,11 @@ const SORT_LABELS: Record<SortField, string> = {
   lastUsedAt: "最后使用",
   id: "ID",
 };
+const SORT_FIELDS = Object.keys(SORT_LABELS) as SortField[];
+const STATE_FILTERS = ["", "healthy", "throttled", "quota", "dead"] as const;
 
-// 按状态隐藏：勾选即隐藏对应状态的凭据。状态含义与卡片徽章一致。
-type StatusKey =
-  | "current"
-  | "enabled"
-  | "disabled"
-  | "throttled"
-  | "quotaExceeded";
-const STATUS_OPTIONS: { value: StatusKey; label: string }[] = [
-  { value: "current", label: "当前优先" },
-  { value: "enabled", label: "已启用" },
-  { value: "disabled", label: "已禁用" },
-  { value: "throttled", label: "冷却中" },
-  { value: "quotaExceeded", label: "已超额" },
-];
-const STATUS_KEYS = STATUS_OPTIONS.map((o) => o.value) as readonly StatusKey[];
-
-/**
- * 判断凭据是否命中某个隐藏状态。
- *
- * `enabled` 指“正常启用且无异常态”（非禁用 / 非冷却 / 非超额）；`current` 与
- * 主状态正交（一个当前优先的凭据同时也可能是 enabled），勾选任一命中即隐藏。
- * 超额判定优先用本地验活/缓存余额，回落到 disabledReason。
- */
-function credentialHasStatus(
-  c: CredentialStatusItem,
-  key: StatusKey,
-  balance: BalanceResponse | undefined,
-): boolean {
-  const quotaByBalance = balance
-    ? balance.remaining <= 0 || balance.usagePercentage >= 100
-    : false;
-  const quotaExceeded =
-    (!c.disabled && quotaByBalance) ||
-    (c.disabled && c.disabledReason === "QuotaExceeded");
-  const throttled = !c.disabled && (c.throttledRemainingSecs ?? 0) > 0;
-  switch (key) {
-    case "current":
-      return c.isCurrent;
-    case "disabled":
-      return c.disabled;
-    case "throttled":
-      return throttled;
-    case "quotaExceeded":
-      return quotaExceeded;
-    case "enabled":
-      return !c.disabled && !throttled && !quotaExceeded;
-    default:
-      return false;
-  }
-}
+// 注：PR #56 的 StatusKey / STATUS_OPTIONS / credentialHasStatus 已随「隐藏状态」
+// 下拉一并移除，改由顶部状态账条（StatusStrip + credential-state.ts）承担同一职责。
 
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
@@ -341,7 +284,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
-  const [restockDialogOpen, setRestockDialogOpen] = useState(false);
+  const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
   const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
   const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
   const [newAdminKey, setNewAdminKey] = useState("");
@@ -397,8 +340,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     setPageSize(n);
     setCurrentPage(1);
   };
-  const theme = useTheme();
-  const darkMode = theme.isDark;
+  const [darkMode, setDarkMode] = useState(() => {
+    if (typeof window !== "undefined") {
+      return document.documentElement.classList.contains("dark");
+    }
+    return false;
+  });
 
   const queryClient = useQueryClient();
   const { data, isLoading, error, refetch } = useCredentials();
@@ -435,7 +382,31 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     "",
     reviveString,
   );
-  // 字段排序：'manual' 保留服务端顺序与拖拽调优先级；其余字段按方向排序并禁用拖拽
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Cmd/Ctrl+K 聚焦搜索框；搜索框聚焦时按 Esc 可快速清空并失焦
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (searchQuery || document.activeElement === searchInputRef.current) {
+          setSearchQuery("");
+          searchInputRef.current?.blur();
+        }
+        return;
+      }
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [searchQuery]);
+
+  // 字段排序（来自 PR #56）：'manual' 保留服务端顺序与拖拽调优先级；
+  // 其余字段按方向排序并禁用拖拽。console-ui 没有同类能力，纯增量保留。
   const [sortField, setSortField] = usePersistentState<SortField>(
     PREF_KEYS.credentialSortField,
     "manual",
@@ -445,12 +416,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     PREF_KEYS.credentialSortDir,
     "asc",
     reviveOneOf(SORT_DIRS),
-  );
-  // 按状态隐藏（多选）：集合内的状态对应的凭据不显示；空集合 = 不隐藏任何状态
-  const [hiddenStatuses, setHiddenStatuses] = usePersistentSet<StatusKey>(
-    PREF_KEYS.credentialHiddenStatuses,
-    new Set(),
-    reviveStringSet(STATUS_KEYS),
   );
   // 选中排序字段：点已选字段则切换升/降序；换字段时用该字段的直观默认方向
   const applySort = (field: SortField) => {
@@ -471,12 +436,24 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // 默认落在「可用」而非全部：这一屏最常做的事是调排队顺序，而只有可用凭据才真的
   // 在队列里 —— 混进禁用/超额的行会让拖拽出来的次序与实际调度顺序对不上。
   // 其余状态的计数仍在账条上，点一下即可切过去。
-  const [stateFilter, setStateFilter] = useState<StateFilter>("healthy");
+  const [stateFilter, setStateFilter] = usePersistentState<StateFilter>(
+    PREF_KEYS.credentialState,
+    "healthy",
+    reviveOneOf(STATE_FILTERS),
+  );
+  const anyFilterActive =
+    searchQuery !== "" ||
+    groupFilter !== "" ||
+    tierFilter.size > 0 ||
+    stateFilter !== "healthy" ||
+    sortField !== "manual";
   const clearAllFilters = () => {
     setSearchQuery("");
     setGroupFilter("");
     setTierFilter(new Set());
-    setStateFilter("");
+    setStateFilter("healthy");
+    setSortField("manual");
+    setSortDir("asc");
   };
   const toggleTier = (t: Tier) => {
     setTierFilter((prev) => {
@@ -485,21 +462,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       else next.add(t);
       return next;
     });
-  };
-  // 是否有任何筛选/排序偏离默认值（决定是否显示「清除筛选」）
-  const anyFilterActive =
-    groupFilter !== "" ||
-    tierFilter.size > 0 ||
-    searchQuery !== "" ||
-    hiddenStatuses.size > 0 ||
-    sortField !== "manual";
-  const clearAllFilters = () => {
-    setGroupFilter("");
-    setTierFilter(new Set());
-    setSearchQuery("");
-    setHiddenStatuses(new Set());
-    setSortField("manual");
-    setSortDir("asc");
   };
 
   // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
@@ -780,7 +742,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     });
   }, [data?.credentials]);
 
-  const toggleDarkMode = () => theme.toggle();
+  const toggleDarkMode = () => {
+    setDarkMode(!darkMode);
+    document.documentElement.classList.toggle("dark");
+  };
 
   const handleRefresh = () => {
     refetch();
@@ -1399,10 +1364,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || "priority";
-    const next = nextLoadBalancingMode(cur);
+    const next = cur === "priority" ? "balanced" : "priority";
     setLoadBalancingMode(next, {
       onSuccess: () =>
-        toast.success(`已切换到${loadBalancingModeLabel(next)}模式`),
+        toast.success(
+          `已切换到${next === "priority" ? "优先级模式" : "均衡负载模式"}`,
+        ),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     });
   };
@@ -1465,7 +1432,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <Activity className="h-3.5 w-3.5" />
                 {isLoadingMode
                   ? "加载中…"
-                  : loadBalancingModeLabel(loadBalancingData?.mode || "priority")}
+                  : loadBalancingData?.mode === "priority"
+                    ? "优先级"
+                    : "均衡负载"}
               </Button>
               <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
                 <a
@@ -1561,93 +1530,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           description="管理 Kiro 的所有访问凭据、负载均衡与登录信息"
         />
 
-        {/* 统计卡片 */}
-        <div className="mb-5 grid grid-cols-2 gap-2 sm:mb-6 sm:grid-cols-4 sm:gap-4">
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                凭据总数
-              </div>
-              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl">
-                {formatNumber(data?.total)}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                可用凭据
-              </div>
-              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400 sm:mt-2 sm:text-3xl">
-                {formatNumber(data?.available)}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                {loadBalancingData?.mode === "balanced" ? "调度模式" : "当前优先"}
-              </div>
-              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5 sm:mt-2 sm:gap-2">
-                <span className="truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
-                  {loadBalancingData?.mode === "balanced"
-                    ? "均衡负载"
-                    : `#${data?.currentId || "-"}`}
-                </span>
-                {loadBalancingData?.mode === "balanced" ? (
-                  <Badge variant="secondary">动态选择</Badge>
-                ) : (
-                  data?.currentId && <Badge variant="success">当前优先</Badge>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                当前并发
-              </div>
-              <div
-                className={`mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl ${
-                  data?.activeConcurrency
-                    ? "text-blue-600 dark:text-blue-400"
-                    : ""
-                }`}
-                title="正在进行、尚未结束的请求总数（含流式响应期间）"
-              >
-                {formatNumber(data?.activeConcurrency)}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+        {/* 状态标签条已下移到紧贴列表处（见下方 <StatusStrip />）：
+            它是列表的表头兼筛选器，放在标题下方会与它筛选的列表隔开两行工具栏。 */}
 
         {/* 工具栏 */}
         <div className="mb-5 flex flex-col gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
-            {data?.credentials && data.credentials.length > 0 && (
-              <Badge variant="secondary">
-                {filteredCredentials.length !== data.credentials.length
-                  ? `${filteredCredentials.length} / ${data.credentials.length}`
-                  : data.credentials.length}
-              </Badge>
-            )}
-            {/*
-              筛选条件会持久化到 localStorage，下次打开仍生效。为避免用户以为
-              「数据丢了」，只要有任一筛选生效就给一个一键清空的出口。
-            */}
-            {anyFilterActive && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-6 px-2 text-[11px] text-muted-foreground"
-                onClick={clearAllFilters}
-                title="清除全部筛选条件（搜索、分组、分级、隐藏状态、排序）"
-              >
-                <FilterX className="h-3 w-3" />
-                清除筛选
-              </Button>
-            )}
+            {/* 原先这里有「凭据列表」标题 + 总数徽章：标题与页面大标题「凭据管理」
+                说的是同一件事，总数已由状态标签条的「全部 N」给出，两者都删掉。 */}
             {groupFilter && (
               <Badge variant="outline" className="gap-1">
                 筛选：{groupFilter === "__none__" ? "未分组" : groupFilter}
@@ -1935,18 +1825,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 添加凭据
               </Button>
 
-              {/* 一键补货：从上游提货并批量入库 */}
-              <Button
-                onClick={() => setRestockDialogOpen(true)}
-                size="sm"
-                variant="outline"
-                className="w-full sm:w-auto"
-                title="从配置的上游渠道提货，批量入库并指定代理"
-              >
-                <PackageCheck className="h-3.5 w-3.5" />
-                一键补货
-              </Button>
-
               {/* 导入 / 登录折叠菜单 */}
               <DropdownMenu modal={false}>
                 <DropdownMenuTrigger asChild>
@@ -2037,9 +1915,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       : "刷新当前页余额"}
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={() => {
-                      window.location.hash = "#/settings/proxies";
-                    }}
+                    onSelect={() => setProxyPoolDialogOpen(true)}
                   >
                     <Globe />
                     IP 代理池管理
@@ -2181,7 +2057,31 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               },
             ]}
             trailing={
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground">
+              <div className="inline-flex items-center gap-3 px-2.5 py-1 text-xs text-muted-foreground">
+                {anyFilterActive && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 px-2 text-[11px]"
+                    onClick={clearAllFilters}
+                    title="清除搜索、分组、分级、状态和排序筛选"
+                  >
+                    清除筛选
+                  </Button>
+                )}
+                <span title="正在进行、尚未结束的请求总数（包含流式响应期间）">
+                  当前并发{" "}
+                  <span
+                    className={cn(
+                      "console-num font-mono font-bold",
+                      (data?.activeConcurrency ?? 0) > 0
+                        ? "text-blue-600 dark:text-blue-400"
+                        : "text-foreground",
+                    )}
+                  >
+                    {data?.activeConcurrency ?? 0}
+                  </span>
+                </span>
                 <span
                   className={cn(
                     "h-2 w-2 rounded-sm",
@@ -2475,9 +2375,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
       />
-      <RestockDialog
-        open={restockDialogOpen}
-        onOpenChange={setRestockDialogOpen}
+      <ProxyPoolDialog
+        open={proxyPoolDialogOpen}
+        onOpenChange={setProxyPoolDialogOpen}
       />
       <ImageUpdateDialog
         open={imageUpdateDialogOpen}

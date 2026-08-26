@@ -2777,22 +2777,6 @@ impl StreamContext {
             self.tool_json_error = Some(e);
         }
 
-        // 工具调用 JSON 错误是一次失败的流，不能先发 message_stop 再补 error，
-        // 也不能使用 Anthropic 协议不存在的 stop_reason="error"。
-        if let Some(err) = &self.tool_json_error {
-            events.push(SseEvent::new(
-                "error",
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": err.error_type(),
-                        "message": err.message()
-                    }
-                }),
-            ));
-            return events;
-        }
-
         // 工具调用 JSON 错误必须直接以异常终态结束，不能先发送正常的
         // message_delta/message_stop，否则 Responses 等下游会把请求标记为 completed。
         if let Some(err) = &self.tool_json_error {
@@ -2815,6 +2799,16 @@ impl StreamContext {
             self.metering.as_ref(),
         ));
 
+        events
+    }
+
+    /// 上游响应体读取失败时生成异常终态，不 flush 可能已被截断的缓冲内容。
+    pub fn generate_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        let mut events = self.close_open_thinking_block();
+        events.extend(
+            self.state_manager
+                .generate_error_events(error_type, message),
+        );
         events
     }
 }

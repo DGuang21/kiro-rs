@@ -4,8 +4,10 @@ export interface CredentialsStatusResponse {
   available: number
   /** 优先级模式下的当前优先凭据 ID；均衡模式为 0 */
   currentId: number
-  /** 全局在途请求总数（当前并发，所有凭据在途数之和） */
-  activeConcurrency: number
+  /** 描述 metadata 字段、值类型和选项的 JSON Schema */
+  metadataSchema: CredentialMetadataSchema
+  /** 全局在途请求总数（包含流式响应尚未结束的请求） */
+  activeConcurrency?: number
   credentials: CredentialStatusItem[]
 }
 
@@ -96,8 +98,10 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 已关联描述与当前值的凭据 metadata。 */
+  metadata: CredentialStatusMetadata
   /** 该凭据当前的在途请求数（并发） */
-  inFlight: number
+  inFlight?: number
   /** 该凭据最近 60 秒的请求数（瞬时 RPM） */
   rpm?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
@@ -523,8 +527,6 @@ export interface OverviewStats {
   weekCredits: number
   activeClientKeys: number
   activeCredentials: number
-  /** 最近 60 秒的瞬时请求速率（每分钟请求数） */
-  rpm?: number
 }
 
 export interface TimeSeriesPoint {

@@ -265,6 +265,11 @@ impl RpmRing {
     fn record(&mut self, ts: i64, credential_id: u64) {
         let idx = Self::slot_index(ts);
         let slot = &mut self.slots[idx];
+        // 历史 JSONL 按文件/行回放时可能不是时间顺序。旧记录不能覆盖同一
+        // 秒槽中较新的请求，否则一条 90 秒前的记录会抹掉窗口内的请求。
+        if slot.ts != 0 && ts < slot.ts {
+            return;
+        }
         // 槽被上一轮（≥60s 前）占用：先清空再复用
         if slot.ts != ts {
             slot.ts = ts;

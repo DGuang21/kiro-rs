@@ -1,5 +1,7 @@
 //! Admin API 类型定义
 
+use std::collections::BTreeMap;
+
 use crate::admin::proxy_pool::ProxyHealth;
 use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
@@ -16,6 +18,8 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
     pub current_id: u64,
+    /// 描述 metadata 字段、值类型和选项的 JSON Schema
+    pub metadata_schema: serde_json::Value,
     /// 全局在途请求总数（当前并发，所有凭据在途数之和）
     pub active_concurrency: u64,
     /// 各凭据状态列表
@@ -80,6 +84,8 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 已关联描述与当前值的凭据 metadata。
+    pub metadata: BTreeMap<String, CredentialMetadataDetail>,
     /// 该凭据当前的在途请求数（并发）
     pub in_flight: u32,
     /// 该凭据最近 60 秒的请求数（瞬时 RPM）

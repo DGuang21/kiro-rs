@@ -1,30 +1,36 @@
 import { useState, useEffect, lazy, Suspense } from "react";
 import { storage } from "@/lib/storage";
-import { useTheme } from "@/hooks/use-theme";
-import type { ThemeMode } from "@/lib/theme";
+import {
+  applyTheme,
+  applyThemeWithTransition,
+  resolveDarkMode,
+  type ThemeId,
+  type ThemeMode,
+  type ThemeSelection,
+} from "@/lib/theme";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import {
+  Activity,
+  FolderTree,
+  KeyRound,
+  LogOut,
+  MoreHorizontal,
+  PackagePlus,
+  ScrollText,
+  Server,
+  SlidersHorizontal,
+} from "lucide-react";
+import {
   DropdownMenu,
-  DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  Activity,
-  Server,
-  LogOut,
-  Moon,
-  Sun,
-  ScrollText,
-  PackagePlus,
-  Settings2,
-  Check,
-  MonitorSmartphone,
-} from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
 import { tabFromHash } from "@/hooks/use-url-state";
@@ -50,14 +56,19 @@ const OverviewPage = lazy(() =>
     default: m.OverviewPage,
   })),
 );
+const ClientKeysPage = lazy(() =>
+  import("@/components/client-keys-page").then((m) => ({
+    default: m.ClientKeysPage,
+  })),
+);
 const TraceLogPage = lazy(() =>
   import("@/components/trace-log-page").then((m) => ({
     default: m.TraceLogPage,
   })),
 );
-const UpstreamPage = lazy(() =>
-  import("@/components/upstream-page").then((m) => ({
-    default: m.UpstreamPage,
+const GroupsPage = lazy(() =>
+  import("@/components/groups-page").then((m) => ({
+    default: m.GroupsPage,
   })),
 );
 const SettingsPage = lazy(() =>
@@ -65,8 +76,20 @@ const SettingsPage = lazy(() =>
     default: m.SettingsPage,
   })),
 );
+const UpstreamPage = lazy(() =>
+  import("@/components/upstream-page").then((m) => ({
+    default: m.UpstreamPage,
+  })),
+);
 
-type Tab = "overview" | "credentials" | "restock" | "traces" | "settings";
+type Tab =
+  | "overview"
+  | "credentials"
+  | "keys"
+  | "groups"
+  | "traces"
+  | "settings"
+  | "restock";
 
 const TABS: {
   key: Tab;
@@ -87,10 +110,16 @@ const TABS: {
     icon: <Server className="h-3.5 w-3.5" />,
   },
   {
-    key: "restock",
-    label: "补货上游",
-    mobileLabel: "补货",
-    icon: <PackagePlus className="h-3.5 w-3.5" />,
+    key: "keys",
+    label: "客户端 Key",
+    mobileLabel: "Key",
+    icon: <KeyRound className="h-3.5 w-3.5" />,
+  },
+  {
+    key: "groups",
+    label: "分组管理",
+    mobileLabel: "分组",
+    icon: <FolderTree className="h-3.5 w-3.5" />,
   },
   {
     key: "traces",
@@ -100,72 +129,37 @@ const TABS: {
   },
   {
     key: "settings",
-    label: "系统设置",
+    label: "设置",
     mobileLabel: "设置",
-    icon: <Settings2 className="h-3.5 w-3.5" />,
+    icon: <SlidersHorizontal className="h-3.5 w-3.5" />,
   },
 ];
 
-/**
- * 旧入口 → 新位置的重定向表。
- *
- * 分组管理、代理池和客户端 Key 原先是顶级 Tab，合并进「系统设置」后旧链接（含
- * 用户书签、文档里的 `#/proxies`）仍应可用，这里映射到对应的二级面板。
- */
-const LEGACY_HASH_REDIRECTS: Record<string, string> = {
-  groups: "settings/groups",
-  proxies: "settings/proxies",
-  keys: "settings/keys",
-};
-
 function readTabFromHash(): Tab {
-  // 只取第一段：`#/settings/proxies` 的二级面板由 SettingsPage 自己解析
-  const h = window.location.hash.replace(/^#\/?/, "").split("/")[0];
+  // 走共享解析：hash 里现在可能带筛选查询串（#/traces?status=error），
+  // 直接全等比较会认不出 Tab。
+  const h = tabFromHash();
   if (
     h === "credentials" ||
-    h === "restock" ||
+    h === "keys" ||
+    h === "groups" ||
     h === "overview" ||
     h === "traces" ||
-    h === "settings"
+    h === "settings" ||
+    h === "restock"
   )
     return h;
   return "overview";
-}
-
-/**
- * 把旧的顶级 hash 重写成新的二级路径。返回是否发生了重写。
- *
- * 用 replace 而不是赋值 `location.hash`，避免在浏览器历史里留下一条指向
- * 已不存在的 Tab 的记录（否则用户点「后退」会再次落到旧地址）。
- */
-function redirectLegacyHash(): boolean {
-  const h = window.location.hash.replace(/^#\/?/, "").split("/")[0];
-  const target = LEGACY_HASH_REDIRECTS[h];
-  if (!target) return false;
-  window.location.replace(`#/${target}`);
-  return true;
-}
-
-/**
- * 初始 Tab：先处理旧 hash 重定向，再读。
- *
- * `location.replace` 对同文档 fragment 是同步更新 `location.hash` 的
- * （hashchange 事件才是异步派发），所以紧随其后的读取能拿到新值，
- * 首帧就不会闪一下「概览」。
- */
-function initialTab(): Tab {
-  redirectLegacyHash();
-  return readTabFromHash();
 }
 
 interface AppHeaderProps {
   theme: ThemeSelection;
   isDarkMode: boolean;
   tab: Tab;
-  themeMode: ThemeMode;
   onLogout: () => void;
   onSwitchTab: (next: Tab) => void;
-  onSetThemeMode: (mode: ThemeMode) => void;
+  onSelectPalette: (palette: ThemeId) => void;
+  onSelectMode: (mode: ThemeMode) => void;
 }
 
 function App() {
@@ -180,29 +174,26 @@ function App() {
       theme={app.theme}
       isDarkMode={app.isDarkMode}
       tab={app.tab}
-      themeMode={app.themeMode}
       onLogout={app.handleLogout}
       onSwitchTab={app.switchTab}
-      onSetThemeMode={app.setThemeMode}
+      onSelectPalette={app.selectPalette}
+      onSelectMode={app.selectMode}
     />
   );
 }
 
 function useAppShell() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [tab, setTab] = useState<Tab>(initialTab);
-  const theme = useTheme();
+  const [tab, setTab] = useState<Tab>(readTabFromHash);
+  const [theme, setTheme] = useState<ThemeSelection>(() => storage.getThemeSelection());
+  const [isDarkMode, setIsDarkMode] = useState(() => resolveDarkMode(theme));
 
   useEffect(() => {
     if (storage.getApiKey()) setIsLoggedIn(true);
   }, []);
 
   useEffect(() => {
-    const onHash = () => {
-      // 旧 hash 会被改写，改写本身又触发一次 hashchange，那次再更新 tab
-      if (redirectLegacyHash()) return;
-      setTab(readTabFromHash());
-    };
+    const onHash = () => setTab(readTabFromHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -238,9 +229,14 @@ function useAppShell() {
     storage.removeApiKey();
     setIsLoggedIn(false);
   };
+  const selectPalette = (palette: ThemeId) => {
+    setTheme((current) => ({ ...current, palette }));
+  };
+  const selectMode = (mode: ThemeMode) => {
+    setTheme((current) => ({ ...current, mode }));
+  };
 
   return {
-    darkMode: theme.isDark,
     handleLogin,
     handleLogout,
     isLoggedIn,
@@ -249,8 +245,7 @@ function useAppShell() {
     selectPalette,
     switchTab,
     tab,
-    themeMode: theme.mode,
-    setThemeMode: theme.setMode,
+    theme,
   };
 }
 
@@ -267,10 +262,10 @@ function LoggedInApp({
   theme,
   isDarkMode,
   onLogout,
-  onSetThemeMode,
   onSwitchTab,
+  onSelectPalette,
+  onSelectMode,
   tab,
-  themeMode,
 }: AppHeaderProps) {
   return (
     <ConfirmProvider>
@@ -278,10 +273,10 @@ function LoggedInApp({
         theme={theme}
         isDarkMode={isDarkMode}
         tab={tab}
-        themeMode={themeMode}
         onLogout={onLogout}
         onSwitchTab={onSwitchTab}
-        onSetThemeMode={onSetThemeMode}
+        onSelectPalette={onSelectPalette}
+        onSelectMode={onSelectMode}
       />
       <AppMain tab={tab} onLogout={onLogout} />
       <Toaster position="top-center" />
@@ -293,20 +288,21 @@ function AppHeader({
   theme,
   isDarkMode,
   onLogout,
-  onSetThemeMode,
   onSwitchTab,
+  onSelectPalette,
+  onSelectMode,
   tab,
-  themeMode,
 }: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-50 w-full glass">
       <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
         <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
         <HeaderActions
-          darkMode={darkMode}
-          themeMode={themeMode}
+          theme={theme}
+          isDarkMode={isDarkMode}
           onLogout={onLogout}
-          onSetThemeMode={onSetThemeMode}
+          onSelectPalette={onSelectPalette}
+          onSelectMode={onSelectMode}
         />
       </div>
       <MobileTabs tab={tab} onSwitchTab={onSwitchTab} />
@@ -345,7 +341,7 @@ function DesktopTabs({
   tab: Tab;
 }) {
   return (
-    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 xl:flex">
+    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 2xl:flex">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -362,13 +358,14 @@ function HeaderActions({
   theme,
   isDarkMode,
   onLogout,
-  onSetThemeMode,
-  themeMode,
+  onSelectPalette,
+  onSelectMode,
 }: {
-  darkMode: boolean;
-  themeMode: ThemeMode;
+  theme: ThemeSelection;
+  isDarkMode: boolean;
   onLogout: () => void;
-  onSetThemeMode: (mode: ThemeMode) => void;
+  onSelectPalette: (palette: ThemeId) => void;
+  onSelectMode: (mode: ThemeMode) => void;
 }) {
   const confirm = useConfirm();
 
@@ -384,73 +381,47 @@ function HeaderActions({
 
   return (
     <div className="flex shrink-0 items-center gap-1">
-      <div className="xl:hidden">
+      <div className="2xl:hidden">
         <TopbarTools compact />
       </div>
-      <div className="hidden items-center gap-1 xl:flex">
+      <div className="hidden items-center gap-1 2xl:flex">
         <TopbarTools />
       </div>
-      <span className="mx-1 hidden h-5 w-px bg-border/70 xl:inline-block" />
+      <MoreMenu />
+      <span className="mx-1 hidden h-5 w-px bg-border/70 2xl:inline-block" />
       <GithubButton />
-      <ThemeMenu
-        darkMode={darkMode}
-        themeMode={themeMode}
-        onSetThemeMode={onSetThemeMode}
+      <ThemePicker
+        theme={theme}
+        isDarkMode={isDarkMode}
+        onSelectPalette={onSelectPalette}
+        onSelectMode={onSelectMode}
       />
-      <Button variant="ghost" size="icon" onClick={onLogout} title="退出登录">
+      <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
         <LogOut className="h-4 w-4" />
       </Button>
     </div>
   );
 }
 
-const THEME_OPTIONS: { value: ThemeMode; label: string; icon: React.ReactNode }[] = [
-  { value: "light", label: "浅色", icon: <Sun className="h-4 w-4" /> },
-  { value: "dark", label: "深色", icon: <Moon className="h-4 w-4" /> },
-  {
-    value: "system",
-    label: "跟随系统",
-    icon: <MonitorSmartphone className="h-4 w-4" />,
-  },
-];
-
-/**
- * 主题切换：下拉里显式选择「浅色 / 深色 / 跟随系统」。
- * 选择结果写入 localStorage，刷新后保持；跟随系统时会实时响应系统切换。
- */
-function ThemeMenu({
-  darkMode,
-  onSetThemeMode,
-  themeMode,
-}: {
-  darkMode: boolean;
-  themeMode: ThemeMode;
-  onSetThemeMode: (mode: ThemeMode) => void;
-}) {
-  const current = THEME_OPTIONS.find((o) => o.value === themeMode);
-
+function MoreMenu() {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title={`主题：${current?.label ?? "浅色"}`}>
-          {themeMode === "system" ? (
-            <MonitorSmartphone className="h-4 w-4" />
-          ) : darkMode ? (
-            <Moon className="h-4 w-4" />
-          ) : (
-            <Sun className="h-4 w-4" />
-          )}
+        <Button variant="ghost" size="icon" title="更多">
+          <MoreHorizontal className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuLabel>主题</DropdownMenuLabel>
-        {THEME_OPTIONS.map((o) => (
-          <DropdownMenuItem key={o.value} onSelect={() => onSetThemeMode(o.value)}>
-            {o.icon}
-            <span className="flex-1">{o.label}</span>
-            {themeMode === o.value && <Check className="h-3.5 w-3.5" />}
-          </DropdownMenuItem>
-        ))}
+      <DropdownMenuContent align="end" className="w-52">
+        <DropdownMenuLabel>更多</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={() => { window.location.hash = "#/restock" }}>
+          <PackagePlus className="h-4 w-4" />
+          补货上游
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => { window.location.hash = "#/settings?s=advanced" }}>
+          <SlidersHorizontal className="h-4 w-4" />
+          高级调度与代理
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -463,7 +434,7 @@ function GithubButton() {
       size="icon"
       asChild
       title="GitHub 仓库"
-      className="hidden xl:inline-flex"
+      className="hidden 2xl:inline-flex"
     >
       <a
         href="https://github.com/ZyphrZero/kiro.rs"
@@ -485,7 +456,7 @@ function MobileTabs({
   tab: Tab;
 }) {
   return (
-    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-6 items-center gap-0.5 overflow-hidden px-2 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-6 items-center gap-0.5 overflow-hidden px-2 pb-2 2xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -536,9 +507,11 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
       <Suspense fallback={<div className="text-sm text-muted-foreground">加载中…</div>}>
         {tab === "overview" && <OverviewPage />}
         {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
-        {tab === "restock" && <UpstreamPage />}
+        {tab === "keys" && <ClientKeysPage />}
+        {tab === "groups" && <GroupsPage />}
         {tab === "traces" && <TraceLogPage />}
         {tab === "settings" && <SettingsPage />}
+        {tab === "restock" && <UpstreamPage />}
       </Suspense>
     </main>
   );
