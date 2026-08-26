@@ -546,13 +546,14 @@ pub(crate) async fn get_usage_limits(
     let attempts = usage_api_attempts(credentials, &candidates);
 
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let response = send_usage_limits_request(
             &client,
             credentials,
             config,
             token,
             region,
+            *profile_arn,
         )
         .await?;
 
@@ -610,7 +611,15 @@ pub(crate) async fn probe_api_key_region(
 ) -> anyhow::Result<bool> {
     let client = build_client(proxy, 60, config.tls_backend)?;
     let response =
-        send_usage_limits_request(&client, credentials, config, token, api_region).await?;
+        send_usage_limits_request(
+            &client,
+            credentials,
+            config,
+            token,
+            api_region,
+            credentials.effective_profile_arn(),
+        )
+        .await?;
     let status = response.status();
     let rate_limit_error = (status.as_u16() == 429)
         .then(|| UpstreamRateLimitError::from_headers(response.headers()));
@@ -642,13 +651,14 @@ async fn send_usage_limits_request(
     config: &Config,
     token: &str,
     api_region: &str,
+    profile_arn: Option<&str>,
 ) -> anyhow::Result<reqwest::Response> {
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
     // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
     let kiro_version = USAGE_API_KIRO_VERSION;
     let host = format!("q.{}.amazonaws.com", api_region);
-    let url = usage_limits_url(&host, credentials);
+    let url = usage_limits_url(&host, profile_arn);
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         config.system_version, config.node_version, kiro_version, machine_id
@@ -2205,6 +2215,11 @@ impl MultiTokenManager {
                         .filter(|e| self.entry_available_for_request(e, model, group, now))
                         .map(|e| e.credentials.priority)
                         .min();
+                    let best_id = entries
+                        .iter()
+                        .filter(|e| self.entry_available_for_request(e, model, group, now))
+                        .min_by_key(|e| (e.credentials.priority, e.id))
+                        .map(|e| e.id);
                     // 复用统一的可用性判定：Unsupported 在那里已被排除。刻意不再要求
                     // "当前凭据必须是 Confirmed"——那个交叉条件会让尚未预热模型缓存
                     // （Unknown）的高优先级凭据被判为不可用，转而选中已预热的低优先级
@@ -2216,6 +2231,7 @@ impl MultiTokenManager {
                                 && !skip.contains(&e.id)
                                 && self.entry_available_for_request(e, model, group, now)
                                 && Some(e.credentials.priority) == best_priority
+                                && Some(e.id) == best_id
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -2263,11 +2279,6 @@ impl MultiTokenManager {
                         }
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
-                    // 注意：必须在 bail! 之前计算 available_count，
-                    // 因为 available_count() 会尝试获取 entries 锁，
-                    // 而此时我们已经持有该锁，会导致死锁
-                    let available = entries.iter().filter(|e| !e.disabled).count();
-                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                 };
 
                 (id, credentials, is_balanced)
@@ -6977,6 +6988,30 @@ mod tests {
         c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         c.groups = groups.iter().map(|s| s.to_string()).collect();
         c
+    }
+
+    #[test]
+    fn request_guard_tracks_concurrency_until_drop() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("guard-test", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let guard = manager.begin_request(1);
+        let active = manager.snapshot();
+        assert_eq!(active.active_concurrency, 1);
+        assert_eq!(active.entries[0].in_flight, 1);
+
+        drop(guard);
+        let idle = manager.snapshot();
+        assert_eq!(idle.active_concurrency, 0);
+        assert_eq!(idle.entries[0].in_flight, 0);
     }
 
     fn model_response(ids: &[&str]) -> ListAvailableModelsResponse {

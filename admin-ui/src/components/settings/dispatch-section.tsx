@@ -53,11 +53,17 @@ function LoadBalancingGroup() {
         hint={
           data?.mode === 'balanced'
             ? '按用量动态挑选凭据，把请求摊平到整个池子'
-            : '按优先级数字从小到大用：先用完 0 号，再换 1 号'
+            : data?.mode === 'priority-balanced'
+              ? '锁定最高优先级层，并在层内按成功次数均衡分发'
+              : data?.mode === 'priority-random'
+                ? '锁定最高优先级层，并在层内随机选择'
+                : '按优先级数字从小到大用：先用完 0 号，再换 1 号'
         }
         value={data?.mode ?? 'priority'}
         options={[
           { value: 'priority', label: '按优先级', hint: '小数字先用，顺序耗尽' },
+          { value: 'priority-balanced', label: '优先级均衡', hint: '最高优先级层内均衡' },
+          { value: 'priority-random', label: '优先级随机', hint: '最高优先级层内随机' },
           { value: 'balanced', label: '均衡负载', hint: '按用量动态摊平' },
         ]}
         onChange={(next) => saver.save('mode', next)}

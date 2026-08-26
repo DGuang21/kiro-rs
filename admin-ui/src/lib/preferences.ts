@@ -19,6 +19,7 @@ export const PREF_KEYS = {
   credentialSearch: 'credentials.search',
   credentialSortDir: 'credentials.sortDir',
   credentialSortField: 'credentials.sortField',
+  credentialState: 'credentials.state',
   credentialTiers: 'credentials.tiers',
   credentialView: 'credentials.view',
 
@@ -29,6 +30,8 @@ export const PREF_KEYS = {
   traceErrorType: 'traces.errorType',
   traceGroup: 'traces.group',
   traceKeyId: 'traces.keyId',
+  traceQuery: 'traces.query',
+  traceRange: 'traces.range',
   traceOnlyFailed: 'traces.onlyFailed',
   traceStatus: 'traces.status',
 } as const

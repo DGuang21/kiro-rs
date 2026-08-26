@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { readPref, writePref } from '@/lib/preferences'
 
 /**
  * 把筛选态同步进 URL hash 的查询串：`#/traces?status=error&range=60`。
@@ -16,17 +17,25 @@ import { useCallback, useEffect, useState } from 'react'
 export function useUrlState<T extends Record<string, string>>(
   tab: string,
   defaults: T,
+  persistence?: Partial<Record<keyof T, string>>,
 ): [T, (patch: Partial<T>) => void, () => void] {
-  const [state, setState] = useState<T>(() => readFromHash(defaults))
+  const [state, setState] = useState<T>(() => readInitialState(defaults, persistence))
 
   // 浏览器前进 / 后退时跟随 URL 回到对应筛选态
   useEffect(() => {
-    const onHash = () => setState(readFromHash(defaults))
+    const onHash = () => {
+      // hashchange 会先通知所有已挂载页面，再触发 App 切换 Tab。旧页面不应
+      // 读取目标页面的查询参数；目标页若没有查询串，则恢复本地持久化偏好。
+      if (tabFromHash() !== tab) return
+      const next = readInitialState(defaults, persistence)
+      setState(next)
+      writePersisted(next, persistence)
+    }
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
-    // defaults 是模块级常量，不参与依赖
+    // defaults / persistence 是模块级常量，不参与依赖
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [tab])
 
   const write = useCallback(
     (next: T) => {
@@ -40,6 +49,7 @@ export function useUrlState<T extends Record<string, string>>(
       const qs = params.toString()
       const url = `${window.location.pathname}${window.location.search}#/${tab}${qs ? `?${qs}` : ''}`
       window.history.replaceState(null, '', url)
+      writePersisted(next, persistence)
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tab],
@@ -76,6 +86,34 @@ function readFromHash<T extends Record<string, string>>(defaults: T): T {
     if (v != null) out[key as keyof T] = v as T[keyof T]
   }
   return out
+}
+
+function readInitialState<T extends Record<string, string>>(
+  defaults: T,
+  persistence?: Partial<Record<keyof T, string>>,
+): T {
+  if (window.location.hash.includes('?')) return readFromHash(defaults)
+  const restored = { ...defaults }
+  if (!persistence) return restored
+  for (const [key, prefKey] of Object.entries(persistence)) {
+    if (!prefKey) continue
+    restored[key as keyof T] = readPref(
+      prefKey,
+      defaults[key],
+      (raw) => (typeof raw === 'string' ? raw : undefined),
+    ) as T[keyof T]
+  }
+  return restored
+}
+
+function writePersisted<T extends Record<string, string>>(
+  state: T,
+  persistence?: Partial<Record<keyof T, string>>,
+) {
+  if (!persistence) return
+  for (const [key, prefKey] of Object.entries(persistence)) {
+    if (prefKey) writePref(prefKey, state[key])
+  }
 }
 
 /** 从 hash 中取出 Tab 名，忽略查询串。App 的路由与本 hook 共用这一份解析。 */
