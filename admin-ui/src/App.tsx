@@ -14,24 +14,11 @@ import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import {
   Activity,
-  FolderTree,
-  KeyRound,
   LogOut,
-  MoreHorizontal,
-  PackagePlus,
   ScrollText,
   Server,
   SlidersHorizontal,
 } from "lucide-react";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
 import { tabFromHash } from "@/hooks/use-url-state";
 
@@ -56,19 +43,9 @@ const OverviewPage = lazy(() =>
     default: m.OverviewPage,
   })),
 );
-const ClientKeysPage = lazy(() =>
-  import("@/components/client-keys-page").then((m) => ({
-    default: m.ClientKeysPage,
-  })),
-);
 const TraceLogPage = lazy(() =>
   import("@/components/trace-log-page").then((m) => ({
     default: m.TraceLogPage,
-  })),
-);
-const GroupsPage = lazy(() =>
-  import("@/components/groups-page").then((m) => ({
-    default: m.GroupsPage,
   })),
 );
 const SettingsPage = lazy(() =>
@@ -76,20 +53,11 @@ const SettingsPage = lazy(() =>
     default: m.SettingsPage,
   })),
 );
-const UpstreamPage = lazy(() =>
-  import("@/components/upstream-page").then((m) => ({
-    default: m.UpstreamPage,
-  })),
-);
-
 type Tab =
   | "overview"
   | "credentials"
-  | "keys"
-  | "groups"
   | "traces"
-  | "settings"
-  | "restock";
+  | "settings";
 
 const TABS: {
   key: Tab;
@@ -110,18 +78,6 @@ const TABS: {
     icon: <Server className="h-3.5 w-3.5" />,
   },
   {
-    key: "keys",
-    label: "客户端 Key",
-    mobileLabel: "Key",
-    icon: <KeyRound className="h-3.5 w-3.5" />,
-  },
-  {
-    key: "groups",
-    label: "分组管理",
-    mobileLabel: "分组",
-    icon: <FolderTree className="h-3.5 w-3.5" />,
-  },
-  {
     key: "traces",
     label: "请求日志",
     mobileLabel: "日志",
@@ -139,14 +95,22 @@ function readTabFromHash(): Tab {
   // 走共享解析：hash 里现在可能带筛选查询串（#/traces?status=error），
   // 直接全等比较会认不出 Tab。
   const h = tabFromHash();
+  const legacySettingsSection: Record<string, string> = {
+    keys: "keys",
+    groups: "groups",
+    restock: "upstreams",
+  };
+  const legacySection = legacySettingsSection[h];
+  if (legacySection) {
+    const url = `${window.location.pathname}${window.location.search}#/settings?s=${legacySection}`;
+    window.history.replaceState(null, "", url);
+    return "settings";
+  }
   if (
     h === "credentials" ||
-    h === "keys" ||
-    h === "groups" ||
     h === "overview" ||
     h === "traces" ||
-    h === "settings" ||
-    h === "restock"
+    h === "settings"
   )
     return h;
   return "overview";
@@ -341,7 +305,7 @@ function DesktopTabs({
   tab: Tab;
 }) {
   return (
-    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 2xl:flex">
+    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 md:flex">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -381,14 +345,6 @@ function HeaderActions({
 
   return (
     <div className="flex shrink-0 items-center gap-1">
-      <div className="2xl:hidden">
-        <TopbarTools compact />
-      </div>
-      <div className="hidden items-center gap-1 2xl:flex">
-        <TopbarTools />
-      </div>
-      <MoreMenu />
-      <span className="mx-1 hidden h-5 w-px bg-border/70 2xl:inline-block" />
       <GithubButton />
       <ThemePicker
         theme={theme}
@@ -403,30 +359,6 @@ function HeaderActions({
   );
 }
 
-function MoreMenu() {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title="更多">
-          <MoreHorizontal className="h-4 w-4" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-52">
-        <DropdownMenuLabel>更多</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={() => { window.location.hash = "#/restock" }}>
-          <PackagePlus className="h-4 w-4" />
-          补货上游
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => { window.location.hash = "#/settings?s=advanced" }}>
-          <SlidersHorizontal className="h-4 w-4" />
-          高级调度与代理
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
 function GithubButton() {
   return (
     <Button
@@ -434,7 +366,7 @@ function GithubButton() {
       size="icon"
       asChild
       title="GitHub 仓库"
-      className="hidden 2xl:inline-flex"
+      className="hidden md:inline-flex"
     >
       <a
         href="https://github.com/ZyphrZero/kiro.rs"
@@ -456,7 +388,7 @@ function MobileTabs({
   tab: Tab;
 }) {
   return (
-    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-6 items-center gap-0.5 overflow-hidden px-2 pb-2 2xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-4 items-center gap-0.5 overflow-hidden px-2 pb-2 md:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -507,11 +439,8 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
       <Suspense fallback={<div className="text-sm text-muted-foreground">加载中…</div>}>
         {tab === "overview" && <OverviewPage />}
         {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
-        {tab === "keys" && <ClientKeysPage />}
-        {tab === "groups" && <GroupsPage />}
         {tab === "traces" && <TraceLogPage />}
         {tab === "settings" && <SettingsPage />}
-        {tab === "restock" && <UpstreamPage />}
       </Suspense>
     </main>
   );

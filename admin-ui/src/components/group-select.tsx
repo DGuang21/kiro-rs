@@ -29,7 +29,7 @@ function ManageGroupsHint() {
   return (
     <p className={NO_GROUPS_HINT_CLS}>
       还没有分组？前往
-      <a href="#/settings/groups" className="text-primary underline mx-1">
+      <a href="#/settings?s=groups" className="text-primary underline mx-1">
         分组管理
       </a>
       创建。分组名统一注册后才能在此选择，避免拼写漂移。
@@ -40,7 +40,7 @@ function ManageGroupsHint() {
 /** 单选分组：下拉选现有分组 / 不绑定。用于客户端 Key 绑定分组。
  *
  *  与改造前的差异：去掉"+ 新建分组"option（避免 typo 漂移）。
- *  新建分组请去 #/settings/groups 管理页。
+ *  新建分组请去设置页的分组管理分区。
  */
 export function GroupSingleSelect({
   value,
@@ -86,7 +86,7 @@ export function GroupSingleSelect({
       {isOrphan && (
         <p className="text-xs text-amber-600">
           当前绑定的分组 &quot;{value}&quot; 已不在注册表，请重新选择或前往
-          <a href="#/settings/groups" className="text-primary underline mx-1">
+          <a href="#/settings?s=groups" className="text-primary underline mx-1">
             分组管理
           </a>
           重建同名分组。
@@ -101,7 +101,7 @@ export function GroupSingleSelect({
  *  与改造前的差异：
  *  - 收起时只显示一个按钮，节省空间
  *  - 多选能力保留（一个凭据可以同时属于多个分组）
- *  - 去掉"+ 新建分组"输入框，新建分组请去 #/settings/groups 管理页
+ *  - 去掉"+ 新建分组"输入框，新建分组请去设置页的分组管理分区
  */
 export function GroupMultiSelect({
   value,
@@ -186,7 +186,7 @@ export function GroupMultiSelect({
               className="cursor-pointer text-xs text-muted-foreground"
               onSelect={(e) => {
                 e.preventDefault()
-                window.location.hash = '#/settings/groups'
+                window.location.hash = '#/settings?s=groups'
               }}
             >
               管理分组…
@@ -202,7 +202,7 @@ export function GroupMultiSelect({
       {orphans.length > 0 && (
         <p className="text-xs text-amber-600">
           有 {orphans.length} 个分组已不在注册表，建议取消或前往
-          <a href="#/settings/groups" className="text-primary underline mx-1">
+          <a href="#/settings?s=groups" className="text-primary underline mx-1">
             分组管理
           </a>
           重建。

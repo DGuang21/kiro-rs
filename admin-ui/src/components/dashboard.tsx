@@ -13,14 +13,12 @@ import {
   RotateCcw,
   CheckCircle2,
   CheckSquare,
-  Globe,
   LogIn,
   Key,
   Building2,
   Settings,
   UploadCloud,
   MoreHorizontal,
-  Activity,
   ChevronLeft,
   ChevronRight,
   AlertTriangle,
@@ -88,7 +86,6 @@ import {
   type VerifyResult,
 } from "@/components/batch-verify-dialog";
 import { detectTier, type Tier } from "@/components/subscription-badge";
-import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
@@ -96,7 +93,6 @@ import {
   useDeleteCredential,
   useResetFailure,
   useLoadBalancingMode,
-  useSetLoadBalancingMode,
   useResetAllSuccessCount,
   useSetPriority,
 } from "@/hooks/use-credentials";
@@ -284,7 +280,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
-  const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
   const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
   const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
   const [newAdminKey, setNewAdminKey] = useState("");
@@ -351,10 +346,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials();
   const { mutate: deleteCredential } = useDeleteCredential();
   const { mutate: resetFailure } = useResetFailure();
-  const { data: loadBalancingData, isLoading: isLoadingMode } =
-    useLoadBalancingMode();
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
-    useSetLoadBalancingMode();
+  const { data: loadBalancingData } = useLoadBalancingMode();
   const resetAllSuccess = useResetAllSuccessCount();
   const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
@@ -1362,18 +1354,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   };
 
-  const handleToggleLoadBalancing = () => {
-    const cur = loadBalancingData?.mode || "priority";
-    const next = cur === "priority" ? "balanced" : "priority";
-    setLoadBalancingMode(next, {
-      onSuccess: () =>
-        toast.success(
-          `已切换到${next === "priority" ? "优先级模式" : "均衡负载模式"}`,
-        ),
-      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
-    });
-  };
-
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -1422,20 +1402,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               <span className="font-semibold tracking-tight">Kiro Admin</span>
             </div>
             <div className="flex items-center gap-1.5">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleToggleLoadBalancing}
-                disabled={isLoadingMode || isSettingMode}
-                title="切换负载均衡模式"
-              >
-                <Activity className="h-3.5 w-3.5" />
-                {isLoadingMode
-                  ? "加载中…"
-                  : loadBalancingData?.mode === "priority"
-                    ? "优先级"
-                    : "均衡负载"}
-              </Button>
               <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
                 <a
                   href="https://github.com/ZyphrZero/kiro.rs"
@@ -1915,12 +1881,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       : "刷新当前页余额"}
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={() => setProxyPoolDialogOpen(true)}
-                  >
-                    <Globe />
-                    IP 代理池管理
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
                     disabled={
                       resetAllSuccess.isPending || !data?.credentials?.length
                     }
@@ -2374,10 +2334,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
-      />
-      <ProxyPoolDialog
-        open={proxyPoolDialogOpen}
-        onOpenChange={setProxyPoolDialogOpen}
       />
       <ImageUpdateDialog
         open={imageUpdateDialogOpen}

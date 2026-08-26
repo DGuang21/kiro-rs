@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 interface PageHeaderProps {
   icon: ReactNode
   title: ReactNode
+  level?: 1 | 2
   description?: ReactNode
   meta?: ReactNode
   actions?: ReactNode
@@ -15,9 +16,12 @@ export function PageHeader({
   className,
   description,
   icon,
+  level = 1,
   meta,
   title,
 }: PageHeaderProps) {
+  const Heading = level === 2 ? 'h2' : 'h1'
+
   return (
     <div className={cn('flex flex-wrap items-center justify-between gap-2', className)}>
       <div className="min-w-0">
@@ -28,7 +32,7 @@ export function PageHeader({
           >
             {icon}
           </span>
-          <h1 className="text-lg font-semibold">{title}</h1>
+          <Heading className="text-lg font-semibold">{title}</Heading>
           {meta}
         </div>
         {description && (

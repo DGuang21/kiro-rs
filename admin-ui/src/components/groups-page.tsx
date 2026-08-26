@@ -27,7 +27,7 @@ import type { GroupItem } from '@/types/api'
  * - 删除默认拒绝有引用的，二次确认才允许 force 级联清理
  * - 列表展示每个分组当前被多少个凭据 / Key 引用，删除前清楚知道影响
  */
-export function GroupsPage() {
+export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { data, isLoading, isFetching, refetch } = useGroups()
   const createGroup = useCreateGroup()
   const updateGroup = useUpdateGroup()
@@ -136,6 +136,7 @@ export function GroupsPage() {
   return (
     <div className="space-y-4">
       <PageHeader
+        level={embedded ? 2 : 1}
         icon={<FolderTree className="h-4 w-4" />}
         title="分组管理"
         description="分组是凭据 / 客户端 Key 共享的独立实体；改名 / 删除会级联同步。"

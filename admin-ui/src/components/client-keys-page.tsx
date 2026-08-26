@@ -73,7 +73,7 @@ function formatRelative(ts?: string): string {
   return `${Math.floor(diff / 86400_000)} 天前`
 }
 
-export function ClientKeysPage() {
+export function ClientKeysPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { data, isLoading } = useClientKeys()
   // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
   const groupOptions = useGroupOptions()
@@ -248,6 +248,7 @@ export function ClientKeysPage() {
   return (
     <div>
       <PageHeader
+        level={embedded ? 2 : 1}
         className="mb-4"
         icon={<KeyRound className="h-4 w-4" />}
         title="客户端 Key"
