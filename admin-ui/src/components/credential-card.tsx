@@ -345,15 +345,22 @@ function getDisabledReasonStyle(reason?: string | null): {
 
 function MetadataSummary({
   credential,
+  scrollable = false,
 }: {
   credential: CredentialStatusItem;
+  scrollable?: boolean;
 }) {
   const entries = metadataEntries(credential);
   if (entries.length === 0) return null;
 
   return (
     <div
-      className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden"
+      className={cn(
+        "mt-1 flex min-w-0 items-center gap-1",
+        scrollable
+          ? "select-none overflow-x-auto overflow-y-hidden overscroll-x-contain touch-pan-x [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          : "overflow-hidden",
+      )}
       aria-label="凭据 Metadata"
     >
       {entries.map((entry) => (
@@ -863,7 +870,7 @@ export function CredentialCard({
             </span>
           )}
         </div>
-        <MetadataSummary credential={credential} />
+        <MetadataSummary credential={credential} scrollable />
       </div>
 
       <div className="hidden shrink-0 items-center gap-6 lg:flex">
