@@ -175,6 +175,78 @@ impl ThinkingXmlTagFilter {
     }
 }
 
+/// Suppresses legacy `<thinking>...</thinking>` blocks when the client did not
+/// request a reasoning channel. Kiro may still emit these transport wrappers,
+/// and forwarding them as text leaks private reasoning to the user.
+///
+/// The filter is incremental because either delimiter can be split across
+/// `assistantResponseEvent` chunks. Text outside the blocks is returned
+/// immediately; an unterminated block is discarded at a hard boundary.
+#[derive(Debug, Default)]
+struct HiddenThinkingXmlFilter {
+    buffer: String,
+    stripping: bool,
+}
+
+impl HiddenThinkingXmlFilter {
+    fn filter(&mut self, content: &str) -> String {
+        self.buffer.push_str(content);
+        let input = std::mem::take(&mut self.buffer);
+        let mut out = String::with_capacity(input.len());
+        let mut rest = input.as_str();
+
+        loop {
+            if self.stripping {
+                if let Some(end_pos) = find_real_thinking_end_tag(rest) {
+                    rest = &rest[end_pos + THINKING_END_TAG.len()..];
+                    self.stripping = false;
+                    continue;
+                }
+
+                // Everything in an open block is hidden. Retain only a possible
+                // split closing delimiter (and its quote marker) for the next chunk.
+                let keep = partial_thinking_tag_suffix_len(rest);
+                self.buffer = rest[rest.len().saturating_sub(keep)..].to_string();
+                return out;
+            }
+
+            let start = find_real_thinking_start_tag(rest);
+            let orphan_end = find_real_thinking_end_tag(rest);
+
+            // A closing delimiter outside a block is transport residue as well.
+            if let Some(end_pos) = orphan_end
+                && start.is_none_or(|start_pos| end_pos < start_pos)
+            {
+                out.push_str(&rest[..end_pos]);
+                rest = &rest[end_pos + THINKING_END_TAG.len()..];
+                continue;
+            }
+
+            if let Some(start_pos) = start {
+                out.push_str(&rest[..start_pos]);
+                rest = &rest[start_pos + THINKING_START_TAG.len()..];
+                self.stripping = true;
+                continue;
+            }
+
+            let keep = partial_thinking_tag_suffix_len(rest);
+            let emit_len = rest.len().saturating_sub(keep);
+            out.push_str(&rest[..emit_len]);
+            self.buffer = rest[emit_len..].to_string();
+            return out;
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        let remaining = std::mem::take(&mut self.buffer);
+        if self.stripping {
+            self.stripping = false;
+            return String::new();
+        }
+        strip_unquoted_partial_thinking_tag_suffix(&remaining)
+    }
+}
+
 /// One-shot counterpart used by buffered/non-streaming paths.
 pub(crate) fn strip_thinking_xml_tags(text: &str) -> String {
     let stripped = text
@@ -1526,6 +1598,9 @@ pub struct StreamContext {
     pending_thinking_signature: Option<String>,
     /// Native reasoning may still contain legacy XML delimiters split across events.
     native_reasoning_tag_filter: ThinkingXmlTagFilter,
+    /// When reasoning was not requested, suppress complete legacy thinking blocks
+    /// instead of forwarding their tags and private contents as ordinary text.
+    hidden_thinking_xml_filter: HiddenThinkingXmlFilter,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
@@ -1647,6 +1722,7 @@ impl StreamContext {
             thinking_block_index: None,
             pending_thinking_signature: None,
             native_reasoning_tag_filter: ThinkingXmlTagFilter::default(),
+            hidden_thinking_xml_filter: HiddenThinkingXmlFilter::default(),
             text_block_index: None,
             strip_thinking_leading_newline: false,
             strip_text_leading_whitespace_after_thinking: false,
@@ -1820,18 +1896,20 @@ impl StreamContext {
             events.extend(self.close_open_thinking_block());
         }
 
-        // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
-
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
+            self.output_tokens += estimate_tokens(content);
             events.extend(self.process_content_with_thinking(content));
             return events;
         }
 
-        // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
-        // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
-        events.extend(self.create_text_delta_events(content));
+        // 客户端未请求 reasoning 时，上游仍可能在普通 assistant 文本里返回
+        // `<thinking>...</thinking>`。整个块都必须隐藏，不能只去掉标签。
+        let visible = self.hidden_thinking_xml_filter.filter(content);
+        if !visible.is_empty() {
+            self.output_tokens += estimate_tokens(&visible);
+            events.extend(self.create_text_delta_events(&visible));
+        }
         events
     }
 
@@ -2381,14 +2459,8 @@ impl StreamContext {
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
         if !self.thinking_enabled {
-            if let Some(text) = reasoning.text.as_deref() {
-                let text = self.native_reasoning_tag_filter.filter(text);
-                if text.is_empty() {
-                    return Vec::new();
-                }
-                self.output_tokens += estimate_tokens(&text);
-                return self.create_text_delta_events(&text);
-            }
+            // `reasoningContentEvent` is private reasoning by definition. When the
+            // client did not request a reasoning channel, silently discard it.
             return Vec::new();
         }
 
@@ -2552,6 +2624,14 @@ impl StreamContext {
         self.state_manager.set_has_tool_use(true);
         events.extend(self.flush_native_reasoning_tag_filter());
 
+        if !self.thinking_enabled {
+            let visible = self.hidden_thinking_xml_filter.finish();
+            if !visible.is_empty() {
+                self.output_tokens += estimate_tokens(&visible);
+                events.extend(self.create_text_delta_events(&visible));
+            }
+        }
+
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
         }
@@ -2672,7 +2752,19 @@ impl StreamContext {
             if self.thinking_enabled {
                 events.extend(self.process_content_with_thinking(&leftover));
             } else {
-                events.extend(self.create_text_delta_events(&leftover));
+                let visible = self.hidden_thinking_xml_filter.filter(&leftover);
+                if !visible.is_empty() {
+                    self.output_tokens += estimate_tokens(&visible);
+                    events.extend(self.create_text_delta_events(&visible));
+                }
+            }
+        }
+
+        if !self.thinking_enabled {
+            let visible = self.hidden_thinking_xml_filter.finish();
+            if !visible.is_empty() {
+                self.output_tokens += estimate_tokens(&visible);
+                events.extend(self.create_text_delta_events(&visible));
             }
         }
 
@@ -5640,7 +5732,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_filters_split_tags_when_thinking_disabled() {
+    fn test_native_reasoning_is_hidden_when_thinking_disabled() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -5661,8 +5753,104 @@ mod tests {
         }
         all.extend(ctx.generate_final_events());
 
-        assert_eq!(collect_text_content(&all), "visible fallback");
+        assert_eq!(collect_text_content(&all), "");
         assert_eq!(collect_thinking_content(&all), "");
+    }
+
+    #[test]
+    fn test_legacy_thinking_is_hidden_when_thinking_disabled() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(ctx.process_assistant_response(
+            "before<thinking>private chain of thought</thinking>after",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all), "beforeafter");
+        assert_eq!(collect_thinking_content(&all), "");
+        assert!(all.iter().all(|event| {
+            !event.data["delta"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("thinking") || text.contains("chain of thought"))
+        }));
+    }
+
+    #[test]
+    fn test_split_legacy_thinking_is_hidden_when_thinking_disabled() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        for chunk in [
+            "visible before<thi",
+            "nking>private ",
+            "reasoning</thin",
+            "king>visible after",
+        ] {
+            all.extend(ctx.process_assistant_response(chunk));
+        }
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all), "visible beforevisible after");
+        assert_eq!(collect_thinking_content(&all), "");
+    }
+
+    #[test]
+    fn test_unterminated_legacy_thinking_is_dropped_at_stream_boundary() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(ctx.process_assistant_response("visible<thinking>private unfinished"));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all), "visible");
+        assert_eq!(collect_thinking_content(&all), "");
+    }
+
+    #[test]
+    fn test_unterminated_legacy_thinking_is_dropped_before_tool_call() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(
+            ctx.process_assistant_response("<thinking>private plan immediately before a tool"),
+        );
+        all.extend(ctx.process_tool_use(&tool_evt(
+            "toolu_1",
+            "read_file",
+            "{\"path\":\"/tmp/example\"}",
+            true,
+        )));
+        all.extend(ctx.process_assistant_response("final answer"));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all), "final answer");
+        assert_eq!(collect_thinking_content(&all), "");
+        assert_eq!(collect_tool_uses(&all).len(), 1);
     }
 
     #[test]
@@ -5770,9 +5958,8 @@ mod tests {
             test_known_tools(),
         );
         let mut final_events = final_ctx.generate_initial_events();
-        final_events.extend(final_ctx.process_assistant_response(
-            "<thinking>plan</thinking>answer</thin",
-        ));
+        final_events
+            .extend(final_ctx.process_assistant_response("<thinking>plan</thinking>answer</thin"));
         final_events.extend(final_ctx.generate_final_events());
         assert_eq!(collect_text_content(&final_events), "answer");
 
@@ -5784,9 +5971,8 @@ mod tests {
             test_known_tools(),
         );
         let mut tool_events = tool_ctx.generate_initial_events();
-        tool_events.extend(tool_ctx.process_assistant_response(
-            "<thinking>plan</thinking>answer</thin",
-        ));
+        tool_events
+            .extend(tool_ctx.process_assistant_response("<thinking>plan</thinking>answer</thin"));
         tool_events.extend(tool_ctx.process_tool_use(&tool_evt(
             "toolu_1",
             "read_file",
@@ -5864,7 +6050,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_text_downgrades_to_text_when_thinking_disabled() {
+    fn test_native_reasoning_text_is_dropped_when_thinking_disabled() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -5883,10 +6069,7 @@ mod tests {
         )));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(
-            collect_text_content(&all_events),
-            "visible reasoning fallback"
-        );
+        assert_eq!(collect_text_content(&all_events), "");
         assert_eq!(collect_thinking_content(&all_events), "");
         assert!(!all_events.iter().any(|e| {
             e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
