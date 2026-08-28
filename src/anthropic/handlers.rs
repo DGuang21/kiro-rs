@@ -1277,7 +1277,8 @@ fn inspect_non_stream_continuation(
         .finish()
         .map_err(|error| error.message())?;
     let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
-    if has_tool_use || !text.trim().is_empty() {
+    let (_, visible_text) = super::stream::extract_thinking_from_complete_text(&text);
+    if has_tool_use || !visible_text.trim().is_empty() {
         Ok(NonStreamContinuation::Visible)
     } else if terminal_limit {
         Ok(NonStreamContinuation::TerminalLimit)
@@ -1680,10 +1681,10 @@ fn build_non_stream_content(
     let mut content = Vec::new();
     let native_thinking = super::stream::strip_thinking_xml_tags(&native_thinking);
     let has_native_thinking = !native_thinking.is_empty();
+    let (legacy_thinking, remaining_text) =
+        super::stream::extract_thinking_from_complete_text(&text_content);
 
     if thinking_enabled {
-        let (legacy_thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
         let mut combined_thinking = native_thinking;
         if let Some(legacy_thinking) = legacy_thinking {
             if !combined_thinking.is_empty() {
@@ -1719,15 +1720,10 @@ fn build_non_stream_content(
                 "text": remaining_text
             }));
         }
-    } else if !text_content.is_empty() {
+    } else if !remaining_text.is_empty() {
         content.push(json!({
             "type": "text",
-            "text": text_content
-        }));
-    } else if has_native_thinking {
-        content.push(json!({
-            "type": "text",
-            "text": native_thinking
+            "text": remaining_text
         }));
     }
     content
@@ -2776,10 +2772,10 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
+    fn non_stream_thinking_is_hidden_when_thinking_disabled() {
         let content = build_non_stream_content(
             false,
-            String::new(),
+            "before<thinking>legacy private thought</thinking>after".to_string(),
             "native thinking fallback".to_string(),
             Some("ignored-signature".to_string()),
             vec!["ignored-redacted".to_string()],
@@ -2787,7 +2783,7 @@ mod tests {
 
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "native thinking fallback");
+        assert_eq!(content[0]["text"], "beforeafter");
     }
 
     #[test]
