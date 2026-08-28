@@ -457,7 +457,7 @@ pub(super) struct ParsedResponse {
 }
 
 pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedResponse {
-    let mut text = String::new();
+    let mut raw_text = String::new();
     let mut tool_calls = Vec::new();
     let mut thinking = String::new();
     let mut web_searches = Vec::new();
@@ -467,7 +467,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
             match block.get("type").and_then(|v| v.as_str()) {
                 Some("text") => {
                     if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                        text.push_str(t);
+                        raw_text.push_str(t);
                     }
                 }
                 Some("thinking") => {
@@ -526,6 +526,10 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
             thinking.push_str(t);
         }
     }
+
+    // Final buffered-response boundary shared by Responses and Chat Completions.
+    // Never trust a text block to be free of legacy private-reasoning wrappers.
+    let (_, text) = super::stream::extract_thinking_from_complete_text(&raw_text);
 
     let stop_reason = anthropic
         .get("stop_reason")
@@ -938,6 +942,26 @@ mod tests {
         assert_eq!(p.credit_usage, Some(0.6));
         assert_eq!(p.credit_unit.as_deref(), Some("credit"));
         assert_eq!(p.credit_unit_plural.as_deref(), Some("credits"));
+    }
+
+    #[test]
+    fn parse_anthropic_message_never_exposes_legacy_thinking_as_text() {
+        let anthropic = json!({
+            "content": [
+                {"type": "thinking", "thinking": "normal thought", "signature": "sig"},
+                {"type": "text", "text":
+                    "before<thinking>private plan</thinking>after"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+
+        let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+
+        assert_eq!(parsed.thinking, "normal thought");
+        assert_eq!(parsed.text, "beforeafter");
+        assert!(!parsed.text.contains("private plan"));
+        assert!(!parsed.text.contains("thinking>"));
     }
 
     #[test]

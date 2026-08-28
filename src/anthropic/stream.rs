@@ -124,12 +124,12 @@ impl ToolUseXmlLeakFilter {
 /// `reasoningContentEvent.text` chunks. Native reasoning is already carried by
 /// the Anthropic thinking channel, so these delimiters are transport artifacts.
 #[derive(Debug, Default)]
-struct ThinkingXmlTagFilter {
+pub(crate) struct ThinkingXmlTagFilter {
     buffer: String,
 }
 
 impl ThinkingXmlTagFilter {
-    fn filter(&mut self, content: &str) -> String {
+    pub(crate) fn filter(&mut self, content: &str) -> String {
         self.buffer.push_str(content);
         let mut out = String::with_capacity(self.buffer.len());
         let mut rest = self.buffer.as_str();
@@ -166,7 +166,7 @@ impl ThinkingXmlTagFilter {
         }
     }
 
-    fn finish(&mut self) -> String {
+    pub(crate) fn finish(&mut self) -> String {
         let remaining = std::mem::take(&mut self.buffer);
         if THINKING_START_TAG.starts_with(&remaining) || THINKING_END_TAG.starts_with(&remaining) {
             return String::new();
@@ -183,13 +183,13 @@ impl ThinkingXmlTagFilter {
 /// `assistantResponseEvent` chunks. Text outside the blocks is returned
 /// immediately; an unterminated block is discarded at a hard boundary.
 #[derive(Debug, Default)]
-struct HiddenThinkingXmlFilter {
+pub(crate) struct HiddenThinkingXmlFilter {
     buffer: String,
     stripping: bool,
 }
 
 impl HiddenThinkingXmlFilter {
-    fn filter(&mut self, content: &str) -> String {
+    pub(crate) fn filter(&mut self, content: &str) -> String {
         self.buffer.push_str(content);
         let input = std::mem::take(&mut self.buffer);
         let mut out = String::with_capacity(input.len());
@@ -237,7 +237,7 @@ impl HiddenThinkingXmlFilter {
         }
     }
 
-    fn finish(&mut self) -> String {
+    pub(crate) fn finish(&mut self) -> String {
         let remaining = std::mem::take(&mut self.buffer);
         if self.stripping {
             self.stripping = false;
