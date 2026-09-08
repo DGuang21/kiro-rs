@@ -8,8 +8,6 @@ import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
 import { PageHeader } from '@/components/console/page-header'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
-import { usePersistentState } from '@/hooks/use-persistent-state'
-import { PREF_KEYS, reviveString, type Revive } from '@/lib/preferences'
 import type {
   ClientKeyItem,
   CredentialDistribution,
@@ -52,6 +50,7 @@ function toDateInputValue(d: Date): string {
   const day = String(d.getDate()).padStart(2, '0')
   return `${year}-${month}-${day}`
 }
+
 function customTimeFilter(
   startDate: string,
   endDate: string,
@@ -189,29 +188,15 @@ export function OverviewPage() {
 
 function useOverviewFilters() {
   const today = useMemo(() => toDateInputValue(new Date()), [])
-  const [savedTime, setSavedTime] = usePersistentState<SavedTimeSelection>(
-    PREF_KEYS.overviewTime,
-    { granularity: 'hour', range: '24h' },
-    reviveSavedTime,
+  const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>(() =>
+    customTimeFilter(presetStartDate('24h', today), today, 'hour'),
   )
-  const [initial] = useState(() => resolveSavedTime(savedTime, today))
-  const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>(initial.timeFilter)
-  const [customStartDate, setCustomStartDate] = useState(initial.startDate)
-  const [customEndDate, setCustomEndDate] = useState(initial.endDate)
-  const [draftGranularity, setDraftGranularity] = useState<StatsGranularity>(
-    initial.granularity,
-  )
-  const [draftRange, setDraftRange] = useState<StatsRange | undefined>(initial.range)
-  const [keyFilter, setKeyFilter] = usePersistentState<string>(
-    PREF_KEYS.overviewKeyFilter,
-    'all',
-    reviveString,
-  )
-  const [groupFilter, setGroupFilter] = usePersistentState<string>(
-    PREF_KEYS.overviewGroupFilter,
-    'all',
-    reviveString,
-  )
+  const [customStartDate, setCustomStartDate] = useState(() => presetStartDate('24h', today))
+  const [customEndDate, setCustomEndDate] = useState(today)
+  const [draftGranularity, setDraftGranularity] = useState<StatsGranularity>('hour')
+  const [draftRange, setDraftRange] = useState<StatsRange | undefined>('24h')
+  const [keyFilter, setKeyFilter] = useState('all')
+  const [groupFilter, setGroupFilter] = useState('all')
   const statsFilter = useMemo<StatsFilter>(() => {
     const f: StatsFilter = {}
     if (keyFilter !== 'all') f.keyId = Number(keyFilter)
@@ -220,15 +205,6 @@ function useOverviewFilters() {
   }, [keyFilter, groupFilter])
   const applyCustomRange = () => {
     setTimeFilter(customTimeFilter(customStartDate, customEndDate, draftGranularity))
-    setSavedTime(
-      draftRange
-        ? { granularity: draftGranularity, range: draftRange }
-        : {
-            endDate: customEndDate,
-            granularity: draftGranularity,
-            startDate: customStartDate,
-          },
-    )
   }
   const updateCustomStartDate = (value: string) => {
     setCustomStartDate(value)
@@ -260,54 +236,6 @@ function useOverviewFilters() {
     setGroupFilter,
     statsFilter,
     timeFilter,
-  }
-}
-
-interface SavedTimeSelection {
-  endDate?: string
-  granularity: StatsGranularity
-  range?: StatsRange
-  startDate?: string
-}
-
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
-
-const reviveSavedTime: Revive<SavedTimeSelection> = (raw) => {
-  if (typeof raw !== 'object' || raw === null) return undefined
-  const value = raw as Record<string, unknown>
-  const granularity = GRANULARITIES.some((item) => item.value === value.granularity)
-    ? (value.granularity as StatsGranularity)
-    : 'hour'
-  if (typeof value.range === 'string' && RANGES.some((item) => item.value === value.range)) {
-    return { granularity, range: value.range as StatsRange }
-  }
-  const startDate = typeof value.startDate === 'string' ? value.startDate : ''
-  const endDate = typeof value.endDate === 'string' ? value.endDate : ''
-  if (DATE_RE.test(startDate) && DATE_RE.test(endDate) && startDate <= endDate) {
-    return { endDate, granularity, startDate }
-  }
-  return { granularity, range: '24h' }
-}
-
-function resolveSavedTime(saved: SavedTimeSelection, today: string) {
-  if (saved.range) {
-    const startDate = presetStartDate(saved.range, today)
-    return {
-      endDate: today,
-      granularity: saved.granularity,
-      range: saved.range,
-      startDate,
-      timeFilter: customTimeFilter(startDate, today, saved.granularity),
-    }
-  }
-  const startDate = saved.startDate ?? presetStartDate('24h', today)
-  const endDate = saved.endDate ?? today
-  return {
-    endDate,
-    granularity: saved.granularity,
-    range: undefined,
-    startDate,
-    timeFilter: customTimeFilter(startDate, endDate, saved.granularity),
   }
 }
 

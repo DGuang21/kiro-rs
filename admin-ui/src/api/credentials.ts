@@ -436,48 +436,15 @@ export async function assignProxiesRoundRobin(
   return data
 }
 
-// 负载均衡模式
-export type LoadBalancingMode =
-  | 'priority'
-  | 'balanced'
-  | 'priority-balanced'
-  | 'priority-random'
-
-// 切换顺序：优先级 → 优先级均衡 → 优先级随机 → 均衡负载 → 优先级
-const LOAD_BALANCING_CYCLE: LoadBalancingMode[] = [
-  'priority',
-  'priority-balanced',
-  'priority-random',
-  'balanced',
-]
-
-export function nextLoadBalancingMode(cur: LoadBalancingMode): LoadBalancingMode {
-  const idx = LOAD_BALANCING_CYCLE.indexOf(cur)
-  return LOAD_BALANCING_CYCLE[(idx + 1) % LOAD_BALANCING_CYCLE.length]
-}
-
-export function loadBalancingModeLabel(mode: LoadBalancingMode): string {
-  switch (mode) {
-    case 'balanced':
-      return '均衡负载'
-    case 'priority-balanced':
-      return '优先级均衡'
-    case 'priority-random':
-      return '优先级随机'
-    default:
-      return '优先级'
-  }
-}
-
 // 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: LoadBalancingMode }> {
-  const { data } = await api.get<{ mode: LoadBalancingMode }>('/config/load-balancing')
+export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
+  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
   return data
 }
 
 // 设置负载均衡模式
-export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ mode: LoadBalancingMode }> {
-  const { data } = await api.put<{ mode: LoadBalancingMode }>('/config/load-balancing', { mode })
+export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
+  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
   return data
 }
 
@@ -549,25 +516,6 @@ export async function setSelfHealConfig(
   patch: SelfHealConfigPatch,
 ): Promise<SelfHealConfig> {
   const { data } = await api.put<SelfHealConfig>('/config/self-heal', patch)
-  return data
-}
-
-export interface RetryConfig {
-  // 每个凭据的最大重试次数（1-10）
-  perCredential: number
-  // 单次请求总重试次数硬上限（1-20）
-  total: number
-}
-
-// 获取重试次数配置
-export async function getRetryConfig(): Promise<RetryConfig> {
-  const { data } = await api.get<RetryConfig>('/config/retry')
-  return data
-}
-
-// 更新重试次数配置
-export async function setRetryConfig(patch: Partial<RetryConfig>): Promise<RetryConfig> {
-  const { data } = await api.put<RetryConfig>('/config/retry', patch)
   return data
 }
 

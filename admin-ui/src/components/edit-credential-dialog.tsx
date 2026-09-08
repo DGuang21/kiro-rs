@@ -42,6 +42,7 @@ interface EditCredentialDialogProps {
   credential: CredentialStatusItem
   metadataSchema?: CredentialMetadataSchema
 }
+
 /** 状态接口的 metadata 带展示信息；编辑时只回填其中的实际值。 */
 function metadataValues(metadata: CredentialStatusItem['metadata']): Partial<CredentialMetadata> {
   return Object.fromEntries(

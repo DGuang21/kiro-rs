@@ -24,6 +24,7 @@ export function getThemeSelection(): ThemeSelection {
     return { ...DEFAULT_THEME_SELECTION }
   }
 }
+
 export function setThemeSelection(selection: ThemeSelection): void {
   if (typeof localStorage !== 'undefined') {
     localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(selection))

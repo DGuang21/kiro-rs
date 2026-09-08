@@ -1003,38 +1003,6 @@ function CredentialCardImpl({
             <RotateCcw className="h-3 w-3 opacity-50" />
           </button>
         </div>
-
-        <div className="w-14 text-center">
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/80">
-            并发
-          </div>
-          <div
-            className={`mt-0.5 font-mono text-xs font-semibold tabular-nums ${
-              (credential.inFlight ?? 0) > 0
-                ? "text-blue-600 dark:text-blue-400"
-                : "text-muted-foreground"
-            }`}
-            title="该凭据当前的在途请求数（并发）"
-          >
-            {credential.inFlight ?? 0}
-          </div>
-        </div>
-
-        <div className="w-14 text-center">
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/80">
-            RPM
-          </div>
-          <div
-            className={`mt-0.5 font-mono text-xs font-semibold tabular-nums ${
-              (credential.rpm ?? 0) > 0
-                ? "text-emerald-600 dark:text-emerald-400"
-                : "text-muted-foreground"
-            }`}
-            title="该凭据最近 60 秒的请求数"
-          >
-            {credential.rpm ?? 0}
-          </div>
-        </div>
       </div>
 
       <div className="hidden w-44 shrink-0 xl:block">
@@ -1316,28 +1284,6 @@ function CredentialCardImpl({
               <LedgerRow label="最近调用">
                 <span className="font-mono text-muted-foreground">
                   {formatLastUsed(credential.lastUsedAt)}
-                </span>
-              </LedgerRow>
-              <LedgerRow label="当前并发">
-                <span
-                  className={`font-mono font-semibold ${
-                    (credential.inFlight ?? 0) > 0
-                      ? "text-blue-600 dark:text-blue-400"
-                      : "text-muted-foreground"
-                  }`}
-                >
-                  {credential.inFlight ?? 0}
-                </span>
-              </LedgerRow>
-              <LedgerRow label="最近 60 秒 RPM">
-                <span
-                  className={`font-mono font-semibold ${
-                    (credential.rpm ?? 0) > 0
-                      ? "text-emerald-600 dark:text-emerald-400"
-                      : "text-muted-foreground"
-                  }`}
-                >
-                  {credential.rpm ?? 0}
                 </span>
               </LedgerRow>
               <LedgerRow label="添加时间">
