@@ -1,3 +1,4 @@
+import { LOAD_BALANCING_LABELS, LOAD_BALANCING_HINTS, nextLoadBalancingMode } from '@/lib/load-balancing'
 import { useState } from 'react'
 import {
   Activity,
@@ -51,7 +52,9 @@ interface TopbarToolsProps {
 // 顶栏“刷新数据”只刷新数据查询；配置查询有各自的保存/轮询语义。
 const NON_DATA_QUERY_ROOTS = new Set([
   'loadBalancingMode',
+  'retryConfig',
   'accountThrottleConfig',
+  'modelApiRetryConfig',
   'accountRpmLimitConfig',
   'selfHealConfig',
   'logGovernanceConfig',
@@ -76,7 +79,7 @@ interface ToggleSpec {
   onToggle: () => void
 }
 
-export function TopbarTools({ compact = false }: TopbarToolsProps) {
+export function TopbarTools({ compact }: TopbarToolsProps) {
   const queryClient = useQueryClient()
   const { data: lbData, isLoading: lbLoading } = useLoadBalancingMode()
   const { mutate: setLb, isPending: lbSaving } = useSetLoadBalancingMode()
@@ -103,7 +106,8 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const onError = (err: unknown) =>
     toast.error('切换失败：' + extractErrorMessage(err))
 
-  const balanced = lbData?.mode === 'balanced'
+  const mode = lbData?.mode ?? 'priority'
+  const nextMode = nextLoadBalancingMode(mode)
   const failover = throttle?.failover ?? true
   const healing = selfHeal?.enabled ?? true
   const cooldownMin = Math.round((throttle?.cooldownSecs ?? 1800) / 60)
@@ -111,20 +115,15 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const toggles: ToggleSpec[] = [
     {
       key: 'lb',
-      on: balanced,
+      on: mode !== 'priority',
       busy: lbLoading || lbSaving,
-      label: lbLoading ? '加载中…' : balanced ? '均衡负载' : '按优先级',
-      menuLabel: balanced ? '切换到按优先级' : '切换到均衡负载',
-      title: balanced
-        ? '调度模式：均衡负载 —— 按用量动态摊平到整个池子'
-        : '调度模式：按优先级 —— 数字越小越先用，用完再换下一个',
+      label: lbLoading ? '加载中…' : LOAD_BALANCING_LABELS[mode],
+      menuLabel: `切换到${LOAD_BALANCING_LABELS[nextMode]}`,
+      title: `${LOAD_BALANCING_HINTS[mode]}；点击切换到${LOAD_BALANCING_LABELS[nextMode]}`,
       icon: <Activity className="h-3.5 w-3.5" />,
       onToggle: () =>
-        setLb(balanced ? 'priority' : 'balanced', {
-          onSuccess: () =>
-            toast.success(
-              balanced ? '已切换到按优先级调度' : '已切换到均衡负载',
-            ),
+        setLb(nextMode, {
+          onSuccess: () => toast.success(`已切换到${LOAD_BALANCING_LABELS[nextMode]}`),
           onError,
         }),
     },
@@ -135,8 +134,8 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       label: thLoading ? '加载中…' : failover ? `故障转移 · ${cooldownMin}m` : '不切换',
       menuLabel: failover ? '关闭故障转移' : '开启故障转移',
       title: failover
-        ? `账号级风控故障转移：开启（冷却 ${cooldownMin} 分钟，可在设置页调整）`
-        : '账号级风控故障转移：关闭',
+        ? `账号级 429 故障转移：开启（冷却 ${cooldownMin} 分钟，可在设置页调整）`
+        : '账号级 429 故障转移：关闭',
       icon: failover ? (
         <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
       ) : (
@@ -180,22 +179,27 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
 
   return (
     <>
-      {compact ? (
-        <CompactTools
-          toggles={toggles}
-          hasUpdate={!!updateCheck?.hasUpdate}
-          onRefresh={handleRefresh}
-          onOpenModels={() => setModelsOpen(true)}
-          onOpenImageUpdate={() => setImageUpdateOpen(true)}
-        />
-      ) : (
-        <FullTools
-          toggles={toggles}
-          updateCheck={updateCheck}
-          onRefresh={handleRefresh}
-          onOpenModels={() => setModelsOpen(true)}
-          onOpenImageUpdate={() => setImageUpdateOpen(true)}
-        />
+      {compact !== false && (
+        <div className={compact === undefined ? 'md:hidden' : undefined}>
+          <CompactTools
+            toggles={toggles}
+            hasUpdate={!!updateCheck?.hasUpdate}
+            onRefresh={handleRefresh}
+            onOpenModels={() => setModelsOpen(true)}
+            onOpenImageUpdate={() => setImageUpdateOpen(true)}
+          />
+        </div>
+      )}
+      {!compact && (
+        <div className={compact === undefined ? 'hidden items-center gap-2 md:flex' : 'flex items-center gap-2'}>
+          <FullTools
+            toggles={toggles}
+            updateCheck={updateCheck}
+            onRefresh={handleRefresh}
+            onOpenModels={() => setModelsOpen(true)}
+            onOpenImageUpdate={() => setImageUpdateOpen(true)}
+          />
+        </div>
       )}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <AvailableModelsDialog open={modelsOpen} onOpenChange={setModelsOpen} />
@@ -268,7 +272,7 @@ function CompactTools({
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title="更多操作" className="relative">
+        <Button variant="ghost" size="icon" title="更多操作" aria-label="更多操作" className="relative">
           <MoreHorizontal className="h-4 w-4" />
           {hasUpdate && <UpdateDot />}
         </Button>

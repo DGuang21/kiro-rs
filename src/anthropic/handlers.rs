@@ -1,13 +1,15 @@
 //! Anthropic API Handler 函数
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::{
-    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceRoute, TraceSink, outcome,
+    usage_source,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
@@ -32,7 +34,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -131,12 +133,61 @@ pub(crate) struct RequestTracer {
     ts: String,
     key_id: u64,
     key_source: TraceKeySource,
+    client_ip: Option<String>,
     model: String,
     is_stream: bool,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 首次选号的路由决策。web_search 一条 trace 内多次 provider 调用，
+    /// 「是否沿用了上一轮账号」只看第一次。
+    route: parking_lot::Mutex<Option<TraceRoute>>,
+    /// 是否已落库。[`finalize`](Self::finalize) 首次进入即置位，保证同一条 trace
+    /// 只写一行；[`Drop`] 兜底时据此判断「本请求从未正常收尾」。
+    finalized: std::sync::atomic::AtomicBool,
+    /// provider 成功返回 `reqwest::Response`，即已收到上游 HTTP 响应头。
+    /// 不能用「尚未 finalize」代替这个状态：下游可能在读取 body 前取消。
+    upstream_headers_received: std::sync::atomic::AtomicBool,
+}
+
+/// usage 三项的来源，落到 trace 行便于区分「上游真值」与「本地估算」。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum UsageSource {
+    /// 错误早退等无用量场景
+    #[default]
+    Unknown,
+    /// 上游 metadataEvent.tokenUsage
+    Provider,
+    /// 本地 CacheMeter 按断点估算
+    Simulated,
+    /// 无断点 / 计量关闭
+    None,
+}
+
+impl UsageSource {
+    fn as_db(self) -> Option<&'static str> {
+        match self {
+            Self::Unknown => Option::None,
+            Self::Provider => Some(usage_source::PROVIDER),
+            Self::Simulated => Some(usage_source::SIMULATED),
+            Self::None => Some(usage_source::NONE),
+        }
+    }
+
+    /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
+    pub fn resolve(
+        has_provider_usage: bool,
+        cache_usage: &super::cache_metering::CacheUsage,
+    ) -> Self {
+        if has_provider_usage {
+            Self::Provider
+        } else if cache_usage.cache_covered_est > 0 {
+            Self::Simulated
+        } else {
+            Self::None
+        }
+    }
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -147,6 +198,7 @@ pub(crate) struct TraceUsage {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub credits: f64,
+    pub source: UsageSource,
 }
 
 impl TraceUsage {
@@ -170,12 +222,23 @@ impl RequestTracer {
             ts: Utc::now().to_rfc3339(),
             key_id: options.key_ctx.key_id,
             key_source: options.key_ctx.key_source,
+            client_ip: options.key_ctx.client_ip,
             model: options.model,
             is_stream: options.is_stream,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 标记 provider 已成功返回响应头。应在取得 `reqwest::Response` 后立刻调用，
+    /// 在创建/轮询下游 response body 之前完成。
+    pub(super) fn mark_upstream_headers_received(&self) {
+        self.upstream_headers_received
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
@@ -198,6 +261,13 @@ impl RequestTracer {
         interrupted_after_bytes: Option<u64>,
         usage: TraceUsage,
     ) {
+        // 幂等：首次进入置位，防止显式收尾后 Drop 兜底再写一次（insert 按 trace_id 覆盖）。
+        if self
+            .finalized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let Some(store) = &self.store else { return };
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
@@ -206,6 +276,7 @@ impl RequestTracer {
             .first_token_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let route = self.route.lock().take();
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -226,9 +297,51 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            session_id: route.as_ref().and_then(|r| r.session_id.clone()),
+            sticky_outcome: route.as_ref().map(|r| r.sticky_outcome.to_string()),
+            previous_credential_id: route.as_ref().and_then(|r| r.previous_credential_id),
+            usage_source: usage.source.as_db().map(|s| s.to_string()),
+            client_ip: self.client_ip.clone(),
             attempts,
         };
         store.insert(&rec);
+    }
+}
+
+/// 兜底落库：请求被取消、走不到任何显式 finalize 时补一行。
+///
+/// `upstream_headers_received=false` 才表示请求仍在等待上游响应头；若 headers 已到
+/// 但 body 尚未被读取/收尾，则应归为流中断，不能误报为等头超时。
+///
+/// 只记录可观测到的事实（头未到达即被取消），不推断原因：此处无法区分前置 SLB 等头超时、
+/// 客户端读超时、用户主动中断、客户端进程退出等——它们在这一层长得完全一样。原因需结合
+/// `duration_ms`（如贴近 SLB 的等头超时值）与下游日志判断。
+///
+/// 已正常收尾的请求已置位 `finalized`，幂等守卫使此处成为空操作，不会双写或覆盖。
+impl Drop for RequestTracer {
+    fn drop(&mut self) {
+        let headers_received = self
+            .upstream_headers_received
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (error_type, message) = if headers_received {
+            (
+                outcome::STREAM_INTERRUPTED,
+                "request was cancelled after upstream response headers arrived",
+            )
+        } else {
+            (
+                outcome::ABANDONED_BEFORE_HEADERS,
+                "request was cancelled while awaiting upstream response headers",
+            )
+        };
+        // final_status 复用 "interrupted"（前端归入「中断」徽章），靠 error_type 区分具体类型。
+        self.finalize(
+            "interrupted",
+            Some(error_type),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
     }
 }
 
@@ -240,6 +353,13 @@ impl TraceSink for RequestTracer {
         // before persisting to the (trace_id, attempt) primary key.
         attempt.attempt = attempts.len() as u32;
         attempts.push(attempt);
+    }
+
+    fn on_route(&self, route: TraceRoute) {
+        let mut slot = self.route.lock();
+        if slot.is_none() {
+            *slot = Some(route);
+        }
     }
 }
 
@@ -316,6 +436,21 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if err
+        .downcast_ref::<crate::kiro::error::UpstreamContextOverflowError>()
+        .is_some()
+    {
+        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Context window is full. Reduce conversation history, system prompt, or tools.",
+            )),
+        )
+            .into_response();
+    }
+
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
         tracing::warn!(error = %err, "上游限流（映射为 429）");
         let mut response = (
@@ -418,7 +553,12 @@ fn resolve_non_stream_usage(
         );
     }
 
-    let total_input = context_total_input_tokens.unwrap_or(fallback_total_input_tokens);
+    // contextUsage 覆盖生成结束后的整个上下文（含本轮输出），分摊前先扣掉输出。
+    let total_input = token::input_tokens_excluding_output(
+        context_total_input_tokens,
+        fallback_total_input_tokens,
+        fallback_output_tokens,
+    );
     let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input);
     (
         input,
@@ -468,6 +608,14 @@ fn infer_model_owner(model_id: &str) -> &'static str {
     }
 }
 
+fn context_window_from_upstream(model_id: &str, token_limits: Option<&TokenLimits>) -> i32 {
+    token_limits
+        .and_then(|limits| limits.max_input_tokens)
+        .and_then(|limit| i32::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or_else(|| get_context_window_size(model_id))
+}
+
 fn model_from_upstream(upstream: UpstreamModel) -> Model {
     let max_tokens = upstream
         .token_limits
@@ -476,6 +624,8 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         .and_then(|limit| i32::try_from(limit).ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(64_000);
+    let context_window =
+        context_window_from_upstream(&upstream.model_id, upstream.token_limits.as_ref());
     Model {
         display_name: upstream
             .model_name
@@ -486,6 +636,7 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         object: "model".to_string(),
         created: 0,
         model_type: "chat".to_string(),
+        context_window,
         max_tokens,
     }
 }
@@ -533,6 +684,9 @@ fn aggregate_available_models_with_custom(
                 .clone()
                 .unwrap_or_else(|| custom.id.clone()),
             model_type: "chat".to_string(),
+            context_window: custom
+                .context_window
+                .unwrap_or_else(|| get_context_window_size(&custom.id)),
             max_tokens: custom.max_tokens.unwrap_or(64_000),
         };
         models.insert(model.id.clone(), model);
@@ -716,6 +870,10 @@ pub async fn post_messages(
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("invalid message sequence: {reason}"),
+                ),
                 ConversionError::InvalidModel(reason) => {
                     ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
@@ -784,11 +942,12 @@ pub async fn post_messages(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    let cache_usage = match state.cache_meter.as_ref() {
+        Some(cache) => {
+            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
+        }
+        None => super::cache_metering::CacheUsage::default(),
+    };
 
     if payload.stream {
         // 流式响应
@@ -914,6 +1073,7 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
+    tracer.mark_upstream_headers_received();
     // 创建 SSE 流
     let stream = create_sse_stream(
         call_result.response,
@@ -930,6 +1090,7 @@ async fn handle_stream_request(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
@@ -945,8 +1106,7 @@ fn last_message_has_tool_result(payload: &MessagesRequest) -> bool {
         last.role == "user"
             && last.content.as_array().is_some_and(|blocks| {
                 blocks.iter().any(|block| {
-                    block.get("type").and_then(serde_json::Value::as_str)
-                        == Some("tool_result")
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
                 })
             })
     })
@@ -992,13 +1152,7 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
-    let settlement = StreamSettlement::new(
-        hook,
-        credential_id,
-        tracer,
-        &ctx,
-        concurrency_guard,
-    );
+    let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx, concurrency_guard);
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
@@ -1207,6 +1361,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.resolved_output_tokens() as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
+        source: UsageSource::resolve(ctx.provider_token_usage.is_some(), &ctx.cache_usage),
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
             ctx.credits
         } else {
@@ -1214,8 +1369,6 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         },
     }
 }
-
-use super::converter::get_context_window_size;
 
 #[derive(Debug, PartialEq, Eq)]
 enum NonStreamContinuation {
@@ -1274,7 +1427,10 @@ fn inspect_non_stream_continuation(
     }
 
     tool_accumulator
-        .finish()
+        .finish(tool_name_map)
+        .map(|recovered| {
+            has_tool_use |= !recovered.is_empty();
+        })
         .map_err(|error| error.message())?;
     let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
     let (_, visible_text) = super::stream::extract_thinking_from_complete_text(&text);
@@ -1285,6 +1441,26 @@ fn inspect_non_stream_continuation(
     } else {
         Ok(NonStreamContinuation::Empty)
     }
+}
+
+pub(crate) enum NonStreamExecutionError {
+    Provider(Error),
+    Response(Response),
+}
+
+pub(crate) fn new_non_stream_request_tracer(
+    state: &AppState,
+    key_ctx: KeyContext,
+    model: String,
+) -> std::sync::Arc<RequestTracer> {
+    std::sync::Arc::new(RequestTracer::new(
+        state,
+        RequestTraceOptions {
+            key_ctx,
+            model,
+            is_stream: false,
+        },
+    ))
 }
 
 /// 处理非流式请求
@@ -1304,103 +1480,176 @@ async fn handle_non_stream_request(
     group: Option<String>,
     retry_empty_continuation: bool,
 ) -> Response {
+    match execute_non_stream_request_with_retry(
+        provider,
+        request_body,
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        hook,
+        cache_usage,
+        tracer,
+        group,
+        retry_empty_continuation,
+    )
+    .await
+    {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
+        Err(NonStreamExecutionError::Response(response)) => response,
+    }
+}
+
+pub(crate) async fn execute_non_stream_request(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+) -> Result<serde_json::Value, NonStreamExecutionError> {
+    execute_non_stream_request_with_retry(
+        provider,
+        request_body,
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        hook,
+        cache_usage,
+        tracer,
+        group,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn execute_non_stream_request_with_retry(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+    retry_empty_continuation: bool,
+) -> Result<serde_json::Value, NonStreamExecutionError> {
+    let mut discarded_usage = TraceUsage::zero();
     let mut retries = 0;
     let (body_bytes, credential_id, _concurrency_guard) = loop {
         let call_result = match provider
             .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
             .await
         {
-            Ok(resp) => resp,
-            Err(e) => {
-                hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            Ok(result) => result,
+            Err(error) => {
+                record_trace_usage(&hook, 0, discarded_usage, "error");
                 tracer.finalize(
                     "error",
                     last_attempt_outcome(&tracer),
-                    Some(&e.to_string()),
+                    Some(&error.to_string()),
                     None,
-                    TraceUsage::zero(),
+                    discarded_usage,
                 );
-                return map_provider_error(e);
+                return Err(NonStreamExecutionError::Provider(error));
             }
         };
+        tracer.mark_upstream_headers_received();
         let credential_id = call_result.credential_id;
-        let concurrency_guard = call_result.concurrency_guard;
-        let body_bytes = match call_result.response.bytes().await {
+        let guard = call_result.concurrency_guard;
+        let bytes = match call_result.response.bytes().await {
             Ok(bytes) => bytes,
-            Err(_e) if retry_empty_continuation && retries < MAX_EMPTY_TOOL_RESULT_RETRIES => {
+            Err(_) if retry_empty_continuation && retries < MAX_EMPTY_TOOL_RESULT_RETRIES => {
                 retries += 1;
-                tracing::warn!(
-                    retry = retries,
-                    "tool_result non-stream continuation was interrupted; retrying"
-                );
                 continue;
             }
-            Err(e) => {
-                tracing::error!("读取响应体失败: {}", e);
-                hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            Err(error) => {
+                record_trace_usage(&hook, credential_id, discarded_usage, "error");
                 tracer.finalize(
                     "interrupted",
                     Some(outcome::STREAM_INTERRUPTED),
-                    Some(&e.to_string()),
+                    Some(&error.to_string()),
                     None,
-                    TraceUsage::zero(),
+                    discarded_usage,
                 );
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new(
-                        "api_error",
-                        format!("读取响应失败: {}", e),
-                    )),
-                )
-                    .into_response();
+                return Err(NonStreamExecutionError::Response(
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorResponse::new(
+                            "api_error",
+                            format!("读取响应失败: {error}"),
+                        )),
+                    )
+                        .into_response(),
+                ));
             }
         };
-
-        match inspect_non_stream_continuation(&body_bytes, &tool_name_map) {
-            Ok(NonStreamContinuation::Empty)
-                if retry_empty_continuation && retries < MAX_EMPTY_TOOL_RESULT_RETRIES =>
-            {
-                retries += 1;
-                tracing::warn!(
-                    retry = retries,
-                    "upstream returned an empty non-stream assistant turn after tool_result; retrying"
-                );
-                continue;
+        if retry_empty_continuation {
+            match inspect_non_stream_continuation(&bytes, &tool_name_map) {
+                Ok(NonStreamContinuation::Empty) => {
+                    let usage = buffered_body_usage(
+                        &bytes,
+                        model,
+                        input_tokens,
+                        thinking_enabled,
+                        &tool_name_map,
+                        cache_usage,
+                    );
+                    discarded_usage = add_trace_usage(discarded_usage, usage);
+                    if retries < MAX_EMPTY_TOOL_RESULT_RETRIES {
+                        retries += 1;
+                        continue;
+                    }
+                    let message =
+                        "Upstream returned no assistant text or tool call after a tool result.";
+                    record_trace_usage(&hook, credential_id, discarded_usage, "error");
+                    tracer.finalize(
+                        "error",
+                        Some(outcome::UNKNOWN),
+                        Some(message),
+                        None,
+                        discarded_usage,
+                    );
+                    return Err(NonStreamExecutionError::Response(
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            Json(ErrorResponse::new("upstream_empty_response", message)),
+                        )
+                            .into_response(),
+                    ));
+                }
+                Err(message) => {
+                    let usage = buffered_body_usage(
+                        &bytes,
+                        model,
+                        input_tokens,
+                        thinking_enabled,
+                        &tool_name_map,
+                        cache_usage,
+                    );
+                    let usage = add_trace_usage(discarded_usage, usage);
+                    record_trace_usage(&hook, credential_id, usage, "error");
+                    tracer.finalize("error", Some(outcome::UNKNOWN), Some(&message), None, usage);
+                    return Err(NonStreamExecutionError::Response(
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            Json(ErrorResponse::new("upstream_response_error", message)),
+                        )
+                            .into_response(),
+                    ));
+                }
+                Ok(_) => {}
             }
-            Ok(NonStreamContinuation::Empty) if retry_empty_continuation => {
-                let message =
-                    "Upstream returned no assistant text or tool call after a tool result.";
-                hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-                tracer.finalize(
-                    "error",
-                    Some(outcome::UNKNOWN),
-                    Some(message),
-                    None,
-                    TraceUsage::zero(),
-                );
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new("upstream_empty_response", message)),
-                )
-                    .into_response();
-            }
-            Err(message) => {
-                hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-                tracer.finalize(
-                    "error",
-                    Some(outcome::UNKNOWN),
-                    Some(&message),
-                    None,
-                    TraceUsage::zero(),
-                );
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new("upstream_error", message)),
-                )
-                    .into_response();
-            }
-            _ => break (body_bytes, credential_id, concurrency_guard),
         }
+        break (bytes, credential_id, guard);
     };
 
     // 解析事件流
@@ -1528,13 +1777,21 @@ async fn handle_non_stream_request(
         }
     }
 
-    // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
-    // finish() 返回 IncompleteJson。已有错误则保持不变。
-    if tool_json_error.is_none()
-        && let Err(e) = tool_accumulator.finish()
-    {
-        tracing::error!("{}", e);
-        tool_json_error = Some(e);
+    // 收尾：无参工具的 0 字节滞留缓冲在此还原为 {} 补进 content；累积了非空内容
+    // 却从未收到 stop=true 的（上游在参数写到一半时截断）返回 IncompleteJson。
+    // 已有错误则保持不变。
+    if tool_json_error.is_none() {
+        match tool_accumulator.finish(&tool_name_map) {
+            Ok(recovered) => {
+                for completed in recovered {
+                    tool_uses.push(completed.to_anthropic_block());
+                }
+            }
+            Err(e) => {
+                tracing::error!("{}", e);
+                tool_json_error = Some(e);
+            }
+        }
     }
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
@@ -1543,26 +1800,22 @@ async fn handle_non_stream_request(
         let message = err.message();
         if let Some(usage) = provider_token_usage {
             let usage = usage.sanitized();
-            let trace_usage = TraceUsage {
-                input_tokens: usage.uncached_input_tokens as u64,
-                output_tokens: usage.output_tokens as u64,
-                cache_creation_tokens: usage.cache_write_input_tokens as u64,
-                cache_read_tokens: usage.cache_read_input_tokens as u64,
-                credits: if credits.is_finite() && credits > 0.0 {
-                    credits
-                } else {
-                    0.0
+            let trace_usage = add_trace_usage(
+                discarded_usage,
+                TraceUsage {
+                    input_tokens: usage.uncached_input_tokens as u64,
+                    output_tokens: usage.output_tokens as u64,
+                    cache_creation_tokens: usage.cache_write_input_tokens as u64,
+                    cache_read_tokens: usage.cache_read_input_tokens as u64,
+                    credits: if credits.is_finite() && credits > 0.0 {
+                        credits
+                    } else {
+                        0.0
+                    },
+                    source: UsageSource::Provider,
                 },
-            };
-            hook.record(
-                credential_id,
-                usage.uncached_input_tokens,
-                usage.output_tokens,
-                usage.cache_write_input_tokens,
-                usage.cache_read_input_tokens,
-                credits,
-                "error",
             );
+            record_trace_usage(&hook, credential_id, trace_usage, "error");
             tracer.finalize(
                 "error",
                 Some(outcome::BAD_REQUEST),
@@ -1571,21 +1824,31 @@ async fn handle_non_stream_request(
                 trace_usage,
             );
         } else {
-            // metadata 缺失时保留原有错误口径，不把不完整工具输出估算成已消费量。
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            // 不估算不完整工具的输出；已丢弃的重试响应仍必须计入用量。
+            let trace_usage = add_trace_usage(
+                discarded_usage,
+                TraceUsage {
+                    input_tokens: input_tokens.max(0) as u64,
+                    source: UsageSource::None,
+                    ..TraceUsage::zero()
+                },
+            );
+            record_trace_usage(&hook, credential_id, trace_usage, "error");
             tracer.finalize(
                 "error",
                 Some(outcome::BAD_REQUEST),
                 Some(&message),
                 None,
-                TraceUsage::zero(),
+                trace_usage,
             );
         }
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new("upstream_tool_json_error", message)),
-        )
-            .into_response();
+        return Err(NonStreamExecutionError::Response(
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("upstream_tool_json_error", message)),
+            )
+                .into_response(),
+        ));
     }
 
     // 确定 stop_reason
@@ -1608,15 +1871,28 @@ async fn handle_non_stream_request(
 
     // provider 未下发 metadataEvent 时才使用本地输出估算。
     let fallback_output_tokens = token::estimate_output_tokens(&content);
-    let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
-        resolve_non_stream_usage(
-            input_tokens,
-            context_input_tokens,
-            fallback_output_tokens,
-            cache_usage,
-            provider_token_usage,
-        );
+    let (
+        mut final_input_tokens,
+        mut output_tokens,
+        mut cache_creation_tokens,
+        mut cache_read_tokens,
+    ) = resolve_non_stream_usage(
+        input_tokens,
+        context_input_tokens,
+        fallback_output_tokens,
+        cache_usage,
+        provider_token_usage,
+    );
 
+    final_input_tokens =
+        final_input_tokens.saturating_add(discarded_usage.input_tokens.min(i32::MAX as u64) as i32);
+    output_tokens =
+        output_tokens.saturating_add(discarded_usage.output_tokens.min(i32::MAX as u64) as i32);
+    cache_creation_tokens = cache_creation_tokens
+        .saturating_add(discarded_usage.cache_creation_tokens.min(i32::MAX as u64) as i32);
+    cache_read_tokens = cache_read_tokens
+        .saturating_add(discarded_usage.cache_read_tokens.min(i32::MAX as u64) as i32);
+    credits += discarded_usage.credits;
     // 构建 Anthropic 响应
     let mut usage_json = json!({
         "input_tokens": final_input_tokens,
@@ -1627,7 +1903,7 @@ async fn handle_non_stream_request(
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
     // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
     if let Some(m) = &metering {
-        usage_json["credit_usage"] = json!(m.usage);
+        usage_json["credit_usage"] = json!(credits);
         usage_json["credit_unit"] = json!(m.unit);
         usage_json["credit_unit_plural"] = json!(m.unit_plural);
     }
@@ -1666,9 +1942,17 @@ async fn handle_non_stream_request(
             } else {
                 0.0
             },
+            source: add_trace_usage(
+                discarded_usage,
+                TraceUsage {
+                    source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
+                    ..TraceUsage::zero()
+                },
+            )
+            .source,
         },
     );
-    (StatusCode::OK, Json(response_body)).into_response()
+    Ok(response_body)
 }
 
 fn build_non_stream_content(
@@ -1891,6 +2175,10 @@ pub async fn post_messages_cc(
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("invalid message sequence: {reason}"),
+                ),
                 ConversionError::InvalidModel(reason) => {
                     ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
@@ -1958,11 +2246,12 @@ pub async fn post_messages_cc(
     let retry_empty_continuation = last_message_has_tool_result(&payload);
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    let cache_usage = match state.cache_meter.as_ref() {
+        Some(cache) => {
+            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
+        }
+        None => super::cache_metering::CacheUsage::default(),
+    };
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -2054,6 +2343,7 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e);
         }
     };
+    tracer.mark_upstream_headers_received();
     let stream = create_buffered_sse_stream(
         call_result,
         provider,
@@ -2075,6 +2365,7 @@ async fn handle_stream_request_buffered(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
@@ -2087,6 +2378,81 @@ async fn handle_stream_request_buffered(
 /// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
+fn add_trace_usage(a: TraceUsage, b: TraceUsage) -> TraceUsage {
+    TraceUsage {
+        input_tokens: a.input_tokens.saturating_add(b.input_tokens),
+        output_tokens: a.output_tokens.saturating_add(b.output_tokens),
+        cache_creation_tokens: a
+            .cache_creation_tokens
+            .saturating_add(b.cache_creation_tokens),
+        cache_read_tokens: a.cache_read_tokens.saturating_add(b.cache_read_tokens),
+        credits: a.credits + b.credits,
+        source: if a.source == UsageSource::Unknown {
+            b.source
+        } else if b.source == UsageSource::Unknown || a.source == b.source {
+            a.source
+        } else {
+            UsageSource::Simulated
+        },
+    }
+}
+
+fn record_trace_usage(hook: &UsageRecordHook, credential_id: u64, usage: TraceUsage, status: &str) {
+    hook.record(
+        credential_id,
+        usage.input_tokens.min(i32::MAX as u64) as i32,
+        usage.output_tokens.min(i32::MAX as u64) as i32,
+        usage.cache_creation_tokens.min(i32::MAX as u64) as i32,
+        usage.cache_read_tokens.min(i32::MAX as u64) as i32,
+        usage.credits,
+        status,
+    );
+}
+
+fn buffered_body_usage(
+    body: &[u8],
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: &std::collections::HashMap<String, String>,
+    cache_usage: super::cache_metering::CacheUsage,
+) -> TraceUsage {
+    let mut ctx = BufferedStreamContext::new(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map.clone(),
+        Default::default(),
+    );
+    ctx.set_cache_usage(cache_usage);
+    let mut decoder = EventStreamDecoder::new();
+    if decoder.feed(body).is_ok() {
+        for frame in decoder.decode_iter().flatten() {
+            if let Ok(event) = Event::from_frame(frame) {
+                ctx.process_and_buffer(&event);
+            }
+        }
+    }
+    ctx.finish_and_get_all_events();
+    buffered_trace_usage(&ctx)
+}
+
+fn buffered_trace_usage(ctx: &BufferedStreamContext) -> TraceUsage {
+    let (i, o, cc, cr, credits) = ctx.final_usage();
+    TraceUsage {
+        input_tokens: i.max(0) as u64,
+        output_tokens: o.max(0) as u64,
+        cache_creation_tokens: cc.max(0) as u64,
+        cache_read_tokens: cr.max(0) as u64,
+        credits: if credits.is_finite() && credits > 0.0 {
+            credits
+        } else {
+            0.0
+        },
+        source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
+    }
+}
+
 type UpstreamBodyStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 
@@ -2102,7 +2468,7 @@ struct BufferedSseState {
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
     received_bytes: u64,
-    discarded_credits: f64,
+    discarded_usage: TraceUsage,
     concurrency_guard: Option<crate::kiro::token_manager::RequestGuard>,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
@@ -2131,23 +2497,18 @@ impl BufferedSseState {
     }
 
     fn final_usage(&self) -> (i32, i32, i32, i32, f64) {
-        let (i, o, cc, cr, credits) = self.ctx.final_usage();
-        (i, o, cc, cr, credits + self.discarded_credits)
+        let u = self.trace_usage();
+        (
+            u.input_tokens.min(i32::MAX as u64) as i32,
+            u.output_tokens.min(i32::MAX as u64) as i32,
+            u.cache_creation_tokens.min(i32::MAX as u64) as i32,
+            u.cache_read_tokens.min(i32::MAX as u64) as i32,
+            u.credits,
+        )
     }
 
     fn trace_usage(&self) -> TraceUsage {
-        let (i, o, cc, cr, credits) = self.final_usage();
-        TraceUsage {
-            input_tokens: i.max(0) as u64,
-            output_tokens: o.max(0) as u64,
-            cache_creation_tokens: cc.max(0) as u64,
-            cache_read_tokens: cr.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 {
-                credits
-            } else {
-                0.0
-            },
-        }
+        add_trace_usage(self.discarded_usage, buffered_trace_usage(&self.ctx))
     }
 
     fn settle_error(&mut self, error_type: &str, trace_status: &str, trace_message: &str) {
@@ -2167,12 +2528,7 @@ impl BufferedSseState {
         self.settled = true;
     }
 
-    fn queue_error(
-        &mut self,
-        error_type: &str,
-        public_message: &str,
-        trace_message: &str,
-    ) {
+    fn queue_error(&mut self, error_type: &str, public_message: &str, trace_message: &str) {
         let trace_status = if error_type == outcome::STREAM_INTERRUPTED {
             "interrupted"
         } else {
@@ -2184,7 +2540,19 @@ impl BufferedSseState {
         self.finished = true;
     }
 
-    fn queue_success(&mut self, events: Vec<SseEvent>) {
+    fn queue_success(&mut self, mut events: Vec<SseEvent>) {
+        let (i, o, cc, cr, credits) = self.final_usage();
+        for event in &mut events {
+            if event.event == "message_delta" {
+                event.data["usage"]["input_tokens"] = json!(i);
+                event.data["usage"]["output_tokens"] = json!(o);
+                event.data["usage"]["cache_creation_input_tokens"] = json!(cc);
+                event.data["usage"]["cache_read_input_tokens"] = json!(cr);
+                if event.data["usage"].get("credit_usage").is_some() {
+                    event.data["usage"]["credit_usage"] = json!(credits);
+                }
+            }
+        }
         if !self.settled {
             let (i, o, cc, cr, credits) = self.final_usage();
             self.hook
@@ -2203,7 +2571,8 @@ impl BufferedSseState {
 
     async fn retry_upstream(&mut self) -> Result<(), anyhow::Error> {
         self.retries += 1;
-        self.discarded_credits += self.ctx.final_usage().4;
+        self.discarded_usage =
+            add_trace_usage(self.discarded_usage, buffered_trace_usage(&self.ctx));
         self.concurrency_guard.take();
         self.ctx = self.new_context();
         self.decoder = EventStreamDecoder::new();
@@ -2215,6 +2584,7 @@ impl BufferedSseState {
                 self.group.as_deref(),
             )
             .await?;
+        self.tracer.mark_upstream_headers_received();
         self.body_stream = Box::pin(call_result.response.bytes_stream());
         self.credential_id = call_result.credential_id;
         self.concurrency_guard = call_result.concurrency_guard;
@@ -2271,7 +2641,7 @@ fn create_buffered_sse_stream(
         credential_id: call_result.credential_id,
         tracer,
         received_bytes: 0,
-        discarded_credits: 0.0,
+        discarded_usage: TraceUsage::zero(),
         concurrency_guard: call_result.concurrency_guard,
         provider,
         request_body,
@@ -2414,35 +2784,6 @@ mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
 
-    fn request_with_messages(messages: serde_json::Value) -> MessagesRequest {
-        serde_json::from_value(json!({
-            "model": "claude-sonnet-4",
-            "messages": messages
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn empty_continuation_retry_only_applies_after_tool_result() {
-        let tool_result = request_with_messages(json!([
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "run", "input": {}}]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]}
-        ]));
-        assert!(last_message_has_tool_result(&tool_result));
-
-        let plain_user = request_with_messages(json!([
-            {"role": "user", "content": "hello"}
-        ]));
-        assert!(!last_message_has_tool_result(&plain_user));
-
-        let historical_tool_result = request_with_messages(json!([
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]},
-            {"role": "assistant", "content": "acknowledged"},
-            {"role": "user", "content": "continue"}
-        ]));
-        assert!(!last_message_has_tool_result(&historical_tool_result));
-    }
-
     #[test]
     fn dropped_stream_settles_latest_usage_exactly_once() {
         let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
@@ -2459,6 +2800,7 @@ mod tests {
                     key_id: 0,
                     group: None,
                     key_source: TraceKeySource::MasterApiKey,
+                    client_ip: None,
                 },
                 model: "test-model".to_string(),
                 is_stream: true,
@@ -2486,6 +2828,255 @@ mod tests {
         assert_eq!(overview.today_credits, 0.5);
     }
 
+    fn event_frame(event_type: &str, payload: serde_json::Value) -> Vec<u8> {
+        use crate::kiro::parser::crc::crc32;
+        let mut headers = Vec::new();
+        for (name, value) in [(":message-type", "event"), (":event-type", event_type)] {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7); // string header
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        }
+        let payload = serde_json::to_vec(&payload).unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn empty_continuation_inspection_preserves_no_argument_tools_and_rejects_truncated_json() {
+        let map = Default::default();
+        let no_args = event_frame("toolUseEvent", json!({"name":"noop","toolUseId":"call_1"}));
+        assert!(matches!(
+            inspect_non_stream_continuation(&no_args, &map),
+            Ok(NonStreamContinuation::Visible)
+        ));
+        let incomplete = event_frame(
+            "toolUseEvent",
+            json!({"name":"tool","toolUseId":"call_2","input":"{\"x\":"}),
+        );
+        assert!(inspect_non_stream_continuation(&incomplete, &map).is_err());
+        let thinking = event_frame(
+            "assistantResponseEvent",
+            json!({"content":"<thinking>reasoning</thinking>"}),
+        );
+        assert!(matches!(
+            inspect_non_stream_continuation(&thinking, &map),
+            Ok(NonStreamContinuation::Empty)
+        ));
+    }
+
+    #[test]
+    fn discarded_continuation_retains_precise_usage_and_credits() {
+        let mut bytes = event_frame(
+            "metadataEvent",
+            json!({"tokenUsage": {
+                "uncachedInputTokens": 5, "outputTokens": 7,
+                "cacheWriteInputTokens": 11, "cacheReadInputTokens": 13
+            }}),
+        );
+        bytes.extend(event_frame(
+            "meteringEvent",
+            json!({"usage":0.5,"unit":"credit","unitPlural":"credits"}),
+        ));
+        assert!(matches!(
+            inspect_non_stream_continuation(&bytes, &Default::default()),
+            Ok(NonStreamContinuation::Empty)
+        ));
+        let usage = buffered_body_usage(
+            &bytes,
+            "test-model",
+            100,
+            false,
+            &Default::default(),
+            Default::default(),
+        );
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_creation_tokens, 11);
+        assert_eq!(usage.cache_read_tokens, 13);
+        assert_eq!(usage.credits, 0.5);
+        assert_eq!(usage.source, UsageSource::Provider);
+    }
+
+    fn pending_buffered_fixture(state: &AppState) -> BufferedSseState {
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: KeyContext {
+                    key_id: 0,
+                    group: None,
+                    key_source: TraceKeySource::MasterApiKey,
+                    client_ip: None,
+                },
+                model: "test-model".to_string(),
+                is_stream: true,
+            },
+        ));
+        let mut ctx = BufferedStreamContext::new(
+            "test-model",
+            11,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.set_cache_usage(super::super::cache_metering::CacheUsage::default());
+
+        let config = crate::model::config::Config::default();
+        let manager = std::sync::Arc::new(
+            crate::kiro::token_manager::MultiTokenManager::new(config, vec![], None, None, false)
+                .unwrap(),
+        );
+        let endpoints: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
+        > = std::collections::HashMap::from([(
+            "ide".to_string(),
+            std::sync::Arc::new(crate::kiro::endpoint::ide::IdeEndpoint::new())
+                as std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
+        )]);
+        let provider = std::sync::Arc::new(crate::kiro::provider::KiroProvider::with_proxy(
+            manager,
+            None,
+            endpoints,
+            "ide".to_string(),
+        ));
+        tracer.mark_upstream_headers_received();
+        BufferedSseState {
+            body_stream: Box::pin(stream::pending()),
+            ctx,
+            decoder: EventStreamDecoder::new(),
+            ping_interval: interval(Duration::from_secs(25)),
+            pending: VecDeque::new(),
+            finished: false,
+            settled: false,
+            hook,
+            credential_id: 42,
+            tracer,
+            received_bytes: 456,
+            discarded_usage: TraceUsage::zero(),
+            concurrency_guard: None,
+            provider,
+            request_body: String::new(),
+            model: "test-model".into(),
+            thinking_enabled: false,
+            tool_name_map: Default::default(),
+            known_tool_names: Default::default(),
+            fallback_input_tokens: 11,
+            cache_usage: Default::default(),
+            group: None,
+            retry_empty_continuation: false,
+            retries: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_retry_usage_is_emitted_and_settled_once() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw)
+            .with_usage(None, None, Some(aggregator.clone()))
+            .with_trace_store(Some(store.clone()));
+        let mut buffered = pending_buffered_fixture(&state);
+        buffered.discarded_usage = TraceUsage {
+            input_tokens: 5,
+            output_tokens: 7,
+            cache_creation_tokens: 2,
+            cache_read_tokens: 3,
+            credits: 0.5,
+            source: UsageSource::Provider,
+        };
+        buffered.ctx.process_and_buffer(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                token_usage: Some(crate::kiro::model::events::TokenUsage {
+                    uncached_input_tokens: 11,
+                    output_tokens: 13,
+                    cache_write_input_tokens: 17,
+                    cache_read_input_tokens: 19,
+                }),
+            },
+        ));
+        buffered.queue_success(vec![SseEvent::new(
+            "message_delta",
+            json!({"usage": {"credit_usage": 0.0}}),
+        )]);
+        let event = String::from_utf8(buffered.pending.pop_front().unwrap().to_vec()).unwrap();
+        let data = event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(data["usage"]["input_tokens"], 16);
+        assert_eq!(data["usage"]["output_tokens"], 20);
+        assert_eq!(data["usage"]["cache_creation_input_tokens"], 19);
+        assert_eq!(data["usage"]["cache_read_input_tokens"], 22);
+        assert_eq!(data["usage"]["credit_usage"], 0.5);
+        drop(buffered);
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 0);
+        assert_eq!(overview.today_input_tokens, 16);
+        assert_eq!(overview.today_output_tokens, 20);
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records[0].final_status, "success");
+    }
+
+    /// 缓冲流（/cc/v1）在客户端于缓冲期断开时：Drop 必须记账 + 落 trace，
+    /// 且已产生的用量不能丢（与 /v1 的 StreamSettlement 行为一致）。
+    #[tokio::test]
+    async fn dropped_buffered_stream_settles_usage_and_trace() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw)
+            .with_usage(None, None, Some(aggregator.clone()))
+            .with_trace_store(Some(store.clone()));
+        let mut buffered = pending_buffered_fixture(&state);
+        buffered.discarded_usage = TraceUsage {
+            input_tokens: 5,
+            output_tokens: 7,
+            credits: 0.5,
+            source: UsageSource::Provider,
+            ..TraceUsage::zero()
+        };
+        drop(buffered);
+
+        // 用量必须落账（不能因取消而丢失）
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+
+        assert_eq!(overview.today_input_tokens, 16);
+        assert_eq!(overview.today_output_tokens, 7);
+        assert_eq!(overview.today_credits, 0.5);
+
+        // trace 必须留痕，且归类为流中断（而非 abandoned_before_headers）
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records[0].final_status, "interrupted");
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some(outcome::STREAM_INTERRUPTED)
+        );
+        assert_eq!(records[0].interrupted_after_bytes, Some(456));
+    }
+
     #[test]
     fn tracer_renumbers_attempts_across_provider_rounds_before_persisting() {
         use crate::admin::trace_db::{TraceQuery, TraceStore};
@@ -2497,11 +3088,15 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 7,
             key_source: TraceKeySource::ClientKey,
+            client_ip: None,
             model: "gpt-5.6-luna".to_string(),
             is_stream: false,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2529,6 +3124,7 @@ mod tests {
                 cache_creation_tokens: 7,
                 cache_read_tokens: 89,
                 credits: 0.25,
+                source: UsageSource::Simulated,
             },
         );
 
@@ -2565,11 +3161,15 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 0,
             key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
             model: "claude-sonnet-4".to_string(),
             is_stream: false,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
 
         tracer.mark_first_token();
@@ -2595,11 +3195,15 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 0,
             key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
             model: "claude-sonnet-4".to_string(),
             is_stream: true,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -2632,6 +3236,125 @@ mod tests {
         assert_eq!(record.total_attempts, 2);
         assert_eq!(record.attempts[0].endpoint, "ide");
         assert_eq!(record.attempts[1].endpoint, "cli");
+    }
+
+    /// 从未显式 finalize → Drop 兜底补一条 abandoned 记录（attempts=0 / first_token=None）。
+    #[test]
+    fn tracer_drop_records_abandoned_when_never_finalized() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let _tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "abandoned-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: true,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            // 不调用任何 finalize，直接离开作用域触发 Drop
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "Drop 应兜底落一行");
+        let record = &records[0];
+        assert_eq!(record.final_status, "interrupted");
+        assert_eq!(
+            record.error_type.as_deref(),
+            Some(outcome::ABANDONED_BEFORE_HEADERS)
+        );
+        assert_eq!(record.total_attempts, 0);
+        assert_eq!(record.first_token_ms, None);
+        assert_eq!(record.interrupted_after_bytes, None);
+    }
+
+    /// provider 已返回 response headers 后、body 收尾前请求被取消：不能误报为等头阶段
+    /// 中断。这个覆盖非流式 body 读取，以及未来忘记安装 stream settlement 的新路径。
+    #[test]
+    fn tracer_drop_records_stream_interrupted_after_headers_arrive() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "headers-arrived-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: true,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            tracer.mark_upstream_headers_received();
+            // 不调用 finalize，直接离开作用域模拟 headers 已到后 handler/body 被取消。
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "Drop 应兜底落一行");
+        assert_eq!(records[0].final_status, "interrupted");
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some(outcome::STREAM_INTERRUPTED)
+        );
+        assert_eq!(records[0].first_token_ms, None);
+    }
+
+    /// 已显式 finalize 的请求：Drop 走幂等守卫，不得再写第二行、也不得覆盖原记录。
+    #[test]
+    fn tracer_drop_is_noop_when_already_finalized() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "finalized-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: false,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            tracer.finalize("success", None, None, None, TraceUsage::zero());
+            // 离开作用域触发 Drop —— 应被幂等守卫拦下
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "已 finalize 后 Drop 不得再写一行");
+        assert_eq!(records[0].final_status, "success");
+        assert_eq!(records[0].error_type, None);
     }
 
     #[test]
@@ -2694,6 +3417,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_context_overflow_maps_to_stable_400() {
+        let resp = map_provider_error(crate::kiro::error::UpstreamContextOverflowError.into());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Context window is full")
+        );
+    }
+
+    #[tokio::test]
     async fn generic_upstream_error_does_not_expose_raw_body() {
         let secret = "aws-account=123456789012 request-id=private-request";
         let resp = map_provider_error(anyhow::anyhow!(secret));
@@ -2749,41 +3489,16 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_merges_native_and_multiple_legacy_thinking_without_xml_leaks() {
-        let content = build_non_stream_content(
-            true,
-            "</thinking>first text<thinking>legacy one</thinking>second text\
-             <thinking>legacy two</thinking>final text"
-                .to_string(),
-            "<thinking>native</thinking>".to_string(),
-            Some("real-signature".to_string()),
-            Vec::new(),
-        );
-
-        assert_eq!(content[0]["type"], "thinking");
-        assert_eq!(content[0]["thinking"], "native\n\nlegacy one\n\nlegacy two");
-        let visible: String = content
-            .iter()
-            .filter(|block| block["type"] == "text")
-            .filter_map(|block| block["text"].as_str())
-            .collect();
-        assert_eq!(visible, "first textsecond textfinal text");
-        assert!(!visible.contains("thinking"));
-    }
-
-    #[test]
-    fn non_stream_thinking_is_hidden_when_thinking_disabled() {
+    fn non_stream_native_thinking_is_hidden_when_thinking_disabled() {
         let content = build_non_stream_content(
             false,
-            "before<thinking>legacy private thought</thinking>after".to_string(),
+            String::new(),
             "native thinking fallback".to_string(),
             Some("ignored-signature".to_string()),
             vec!["ignored-redacted".to_string()],
         );
 
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "beforeafter");
+        assert!(content.is_empty());
     }
 
     #[test]
@@ -2882,6 +3597,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "GLM 5");
         assert_eq!(models[0].owned_by, "kiro");
+        assert_eq!(models[0].context_window, 1_000_000);
         assert_eq!(models[0].max_tokens, 32_000);
     }
 
@@ -2912,6 +3628,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "Configured GPT");
         assert_eq!(models[0].owned_by, "configured-owner");
+        assert_eq!(models[0].context_window, 500_000);
         assert_eq!(models[0].max_tokens, 12_345);
     }
 
@@ -2943,10 +3660,27 @@ mod tests {
             prompt_total_est: 100,
         };
 
+        // context 80 - output 9 = 71，再按 50/100 分摊：35 / 18 / 18。
+        // output_tokens 字段本身不受扣减影响，仍是 9。
         assert_eq!(
             resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
-            (40, 9, 20, 20)
+            (35, 9, 18, 18)
         );
+        let (input, _, creation, read) =
+            resolve_non_stream_usage(100, Some(80), 9, cache_usage, None);
+        assert_eq!(
+            input + creation + read,
+            71,
+            "分摊必须发生在扣减之后，三份之和等于修正后的 total"
+        );
+        // output 必须取正数：若传 -9，错实现（对 fallback 分支也扣减）因
+        // output.max(0) == 0 而照样得到 100，这条断言就失去鉴别力。
+        // 取 9 后，错实现会得到 91，与期望的 100 不符，立刻暴露。
+        assert_eq!(
+            resolve_non_stream_usage(100, None, 9, Default::default(), None),
+            (100, 9, 0, 0)
+        );
+        // 负输出的 clamp 另行单独覆盖（口径与上一条互不干扰）。
         assert_eq!(
             resolve_non_stream_usage(100, None, -9, Default::default(), None),
             (100, 0, 0, 0)
@@ -2958,5 +3692,117 @@ mod tests {
         assert!(validate_max_tokens(1).is_ok());
         assert!(validate_max_tokens(0).is_err());
         assert!(validate_max_tokens(-1).is_err());
+    }
+
+    /// 每个 SSE 响应都要带 `x-accel-buffering: no`。
+    ///
+    /// 走源码扫描而非构造响应：SSE 端点散落在 7 个模块且构造成本高，而风险点
+    /// 恰是"新增端点时忘了带"。
+    #[test]
+    fn every_sse_response_disables_proxy_buffering() {
+        const SSE_CONTENT_TYPE: &str = r#".header(header::CONTENT_TYPE, "text/event-stream")"#;
+        const NO_BUFFERING: &str = r#".header("x-accel-buffering", "no")"#;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0;
+        let mut missing = Vec::new();
+
+        let mut stack = vec![root];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path).expect("read src dir") {
+                let entry = entry.expect("dir entry");
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&p).expect("read rs file");
+                for (idx, _) in src.match_indices(SSE_CONTENT_TYPE) {
+                    checked += 1;
+                    // 头部块紧邻 content-type；按字符截取，避免切断中文注释的 UTF-8 编码。
+                    let tail: String = src[idx..].chars().take(400).collect();
+                    if !tail.contains(NO_BUFFERING) {
+                        let line = src[..idx].lines().count();
+                        missing.push(format!("{}:{}", p.display(), line));
+                    }
+                }
+            }
+        }
+
+        assert!(checked > 0, "未扫描到任何 SSE 响应，断言失效");
+        assert!(
+            missing.is_empty(),
+            "以下 SSE 响应缺少 `x-accel-buffering: no`：{missing:?}"
+        );
+    }
+
+    fn request_with_messages(messages: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-sonnet-4",
+            "messages": messages
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_continuation_retry_only_applies_after_tool_result() {
+        let tool_result = request_with_messages(json!([
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "run", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]}
+        ]));
+        assert!(last_message_has_tool_result(&tool_result));
+
+        let plain_user = request_with_messages(json!([
+            {"role": "user", "content": "hello"}
+        ]));
+        assert!(!last_message_has_tool_result(&plain_user));
+
+        let historical_tool_result = request_with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]},
+            {"role": "assistant", "content": "acknowledged"},
+            {"role": "user", "content": "continue"}
+        ]));
+        assert!(!last_message_has_tool_result(&historical_tool_result));
+    }
+
+    #[test]
+    fn non_stream_merges_native_and_multiple_legacy_thinking_without_xml_leaks() {
+        let content = build_non_stream_content(
+            true,
+            "</thinking>first text<thinking>legacy one</thinking>second text\
+             <thinking>legacy two</thinking>final text"
+                .to_string(),
+            "<thinking>native</thinking>".to_string(),
+            Some("real-signature".to_string()),
+            Vec::new(),
+        );
+
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "native\n\nlegacy one\n\nlegacy two");
+        let visible: String = content
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        assert_eq!(visible, "first textsecond textfinal text");
+        assert!(!visible.contains("thinking"));
+    }
+
+    #[test]
+    fn non_stream_thinking_is_hidden_when_thinking_disabled() {
+        let content = build_non_stream_content(
+            false,
+            "before<thinking>legacy private thought</thinking>after".to_string(),
+            "native thinking fallback".to_string(),
+            Some("ignored-signature".to_string()),
+            vec!["ignored-redacted".to_string()],
+        );
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "beforeafter");
     }
 }

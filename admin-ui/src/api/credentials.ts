@@ -158,7 +158,7 @@ export async function forceRefreshToken(
   return data
 }
 
-// 解除凭据的账号级风控冷却
+// 解除凭据的账号级限流冷却
 export async function clearThrottle(id: number): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/clear-throttle`)
   return data
@@ -436,15 +436,25 @@ export async function assignProxiesRoundRobin(
   return data
 }
 
+export type LoadBalancingMode = 'priority' | 'balanced' | 'priority-balanced' | 'priority-random'
+
+export interface RetryConfig { perCredential: number; total: number }
+export async function getRetryConfig(): Promise<RetryConfig> {
+  const { data } = await api.get<RetryConfig>('/config/retry'); return data
+}
+export async function setRetryConfig(patch: Partial<RetryConfig>): Promise<RetryConfig> {
+  const { data } = await api.put<RetryConfig>('/config/retry', patch); return data
+}
+
 // 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
+export async function getLoadBalancingMode(): Promise<{ mode: LoadBalancingMode }> {
+  const { data } = await api.get<{ mode: LoadBalancingMode }>('/config/load-balancing')
   return data
 }
 
 // 设置负载均衡模式
-export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ mode: LoadBalancingMode }> {
+  const { data } = await api.put<{ mode: LoadBalancingMode }>('/config/load-balancing', { mode })
   return data
 }
 
@@ -453,17 +463,35 @@ export interface AccountThrottleConfig {
   cooldownSecs: number
 }
 
-// 获取账号级风控故障转移配置
+// 获取账号级 429 限流故障转移配置
 export async function getAccountThrottleConfig(): Promise<AccountThrottleConfig> {
   const { data } = await api.get<AccountThrottleConfig>('/config/account-throttle')
   return data
 }
 
-// 更新账号级风控故障转移配置
+// 更新账号级 429 限流故障转移配置
 export async function setAccountThrottleConfig(
   patch: Partial<AccountThrottleConfig>,
 ): Promise<AccountThrottleConfig> {
   const { data } = await api.put<AccountThrottleConfig>('/config/account-throttle', patch)
+  return data
+}
+
+export interface ModelApiRetryConfig {
+  enabled: boolean
+}
+
+// 获取普通模型 API 429 自动重试配置
+export async function getModelApiRetryConfig(): Promise<ModelApiRetryConfig> {
+  const { data } = await api.get<ModelApiRetryConfig>('/config/model-api-retry')
+  return data
+}
+
+// 更新普通模型 API 429 自动重试配置
+export async function setModelApiRetryConfig(
+  config: ModelApiRetryConfig,
+): Promise<ModelApiRetryConfig> {
+  const { data } = await api.put<ModelApiRetryConfig>('/config/model-api-retry', config)
   return data
 }
 
@@ -483,6 +511,22 @@ export async function setAccountRpmLimitConfig(
   patch: Partial<AccountRpmLimitConfig>,
 ): Promise<AccountRpmLimitConfig> {
   const { data } = await api.put<AccountRpmLimitConfig>('/config/account-rpm-limit', patch)
+  return data
+}
+
+export interface QuotaResetRecoveryConfig {
+  enabled: boolean
+}
+
+export async function getQuotaResetRecoveryConfig(): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.get<QuotaResetRecoveryConfig>('/config/quota-reset-recovery')
+  return data
+}
+
+export async function setQuotaResetRecoveryConfig(
+  patch: Partial<QuotaResetRecoveryConfig>,
+): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.put<QuotaResetRecoveryConfig>('/config/quota-reset-recovery', patch)
   return data
 }
 

@@ -2,7 +2,6 @@ import { useState, useEffect, lazy, Suspense } from "react";
 import { storage } from "@/lib/storage";
 import {
   applyTheme,
-  applyThemeWithTransition,
   resolveDarkMode,
   type ThemeId,
   type ThemeMode,
@@ -38,6 +37,7 @@ const GroupsPage = lazy(() =>
     default: m.GroupsPage,
   })),
 );
+const UpstreamPage = lazy(() => import("@/components/upstream-page").then((m) => ({ default: m.UpstreamPage })));
 const SettingsPage = lazy(() =>
   import("@/components/settings-page").then((m) => ({
     default: m.SettingsPage,
@@ -55,7 +55,8 @@ function readTabFromHash(): Tab {
     h === "groups" ||
     h === "overview" ||
     h === "traces" ||
-    h === "settings"
+    h === "settings" ||
+    h === "upstream"
   )
     return h;
   return "overview";
@@ -110,11 +111,7 @@ function useAppShell() {
   useEffect(() => {
     storage.setThemeSelection(theme);
     const resolved = resolveDarkMode(theme);
-    const root = document.documentElement;
-    const alreadyApplied =
-      root.dataset.theme === theme.palette && root.classList.contains("dark") === resolved;
-    setIsDarkMode(alreadyApplied ? resolved : applyThemeWithTransition(theme, resolved));
-    if (alreadyApplied) applyTheme(theme, resolved);
+    setIsDarkMode(applyTheme(theme, resolved));
   }, [theme]);
 
   useEffect(() => {
@@ -122,7 +119,7 @@ function useAppShell() {
 
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const onSystemThemeChange = (event: MediaQueryListEvent) => {
-      setIsDarkMode(applyThemeWithTransition(theme, event.matches));
+      setIsDarkMode(applyTheme(theme, event.matches));
     };
     media.addEventListener("change", onSystemThemeChange);
     return () => media.removeEventListener("change", onSystemThemeChange);
@@ -215,6 +212,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
       {tab === "groups" && <GroupsPage />}
       {tab === "traces" && <TraceLogPage />}
       {tab === "settings" && <SettingsPage />}
+      {tab === "upstream" && <UpstreamPage />}
     </Suspense>
   );
 }

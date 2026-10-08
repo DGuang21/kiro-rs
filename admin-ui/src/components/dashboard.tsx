@@ -1,3 +1,5 @@
+import { LOAD_BALANCING_LABELS, nextLoadBalancingMode } from '@/lib/load-balancing';
+import { RestockDialog } from '@/components/restock-dialog'
 import { useState, useEffect, useRef, useDeferredValue, useCallback, useMemo } from "react";
 import {
   RefreshCw,
@@ -178,6 +180,8 @@ const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
 
 /** 仅供本地开发预览卡片布局，不会随生产构建或任何 API 请求出现。 */
 const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
+  inFlight: 0,
+  rpm: 0,
   id: -1,
   priority: 0,
   disabled: false,
@@ -260,6 +264,7 @@ const SORT_LABELS: Record<SortField, string> = {
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
+  const [restockDialogOpen, setRestockDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
   const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false);
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
@@ -1336,11 +1341,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || "priority";
-    const next = cur === "priority" ? "balanced" : "priority";
+    const next = nextLoadBalancingMode(cur);
     setLoadBalancingMode(next, {
       onSuccess: () =>
         toast.success(
-          `已切换到${next === "priority" ? "优先级模式" : "均衡负载模式"}`,
+          `已切换到${LOAD_BALANCING_LABELS[next]}`,
         ),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     });
@@ -1404,9 +1409,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <Activity className="h-3.5 w-3.5" />
                 {isLoadingMode
                   ? "加载中…"
-                  : loadBalancingData?.mode === "priority"
-                    ? "优先级"
-                    : "均衡负载"}
+                  : LOAD_BALANCING_LABELS[loadBalancingData?.mode ?? 'priority']}
               </Button>
               <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
                 <a
@@ -1501,32 +1504,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           title="凭据管理"
           description="上游提供商凭据集群、配额健康度与多通道负载均衡管理。"
           badge={
-            <span className="inline-flex items-center gap-1.5">
-              <Badge variant="secondary" className="font-mono text-xs">
-                {allCredentials.length} 个凭据
+            profileSummary.length > 0 && (
+              <Badge
+                variant="outline"
+                className={`font-mono text-xs ${
+                  profileSummary.length === 1
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                    : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                }`}
+                title={
+                  profileSummary.length === 1
+                    ? `全部账号同属 profile ${profileShortId(profileSummary[0][0])}\n上游 prompt cache 按 profile 隔离：这些账号互相共享缓存，会话在它们之间换号不会丢缓存`
+                    : `账号分布在 ${profileSummary.length} 个 profile：\n${profileSummary
+                        .map(([arn, n]) => `  ${profileShortId(arn)} × ${n}`)
+                        .join("\n")}\n跨 profile 换号会丢上游 prompt cache，此时会话粘性路由才真正起作用`
+                }
+              >
+                {profileSummary.length === 1
+                  ? `同一 profile · 缓存共享`
+                  : `${profileSummary.length} 个 profile`}
               </Badge>
-              {profileSummary.length > 0 && (
-                <Badge
-                  variant="outline"
-                  className={`font-mono text-xs ${
-                    profileSummary.length === 1
-                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                      : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-                  }`}
-                  title={
-                    profileSummary.length === 1
-                      ? `全部账号同属 profile ${profileShortId(profileSummary[0][0])}\n上游 prompt cache 按 profile 隔离：这些账号互相共享缓存，会话在它们之间换号不会丢缓存`
-                      : `账号分布在 ${profileSummary.length} 个 profile：\n${profileSummary
-                          .map(([arn, n]) => `  ${profileShortId(arn)} × ${n}`)
-                          .join("\n")}\n跨 profile 换号会丢上游 prompt cache，此时会话粘性路由才真正起作用`
-                  }
-                >
-                  {profileSummary.length === 1
-                    ? `同一 profile · 缓存共享`
-                    : `${profileSummary.length} 个 profile`}
-                </Badge>
-              )}
-            </span>
+            )
           }
         />
 
@@ -2007,6 +2005,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 </DropdownMenuContent>
               </DropdownMenu>
 
+              <Button size="sm" variant="outline" onClick={() => setRestockDialogOpen(true)}>一键补货</Button>
               {/* 主操作：添加凭据 */}
               <Button
                 onClick={() => setAddDialogOpen(true)}
@@ -2053,7 +2052,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 tone: "cool",
                 active: stateFilter === "throttled",
                 onClick: () => setStateFilter("throttled"),
-                hint: "账号级风控冷却中，到期自动恢复",
+                hint: "账号级限流冷却中，到期自动恢复",
               },
               {
                 label: "超额",
@@ -2082,8 +2081,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       : "bg-blue-500"
                   )}
                 />
-                {loadBalancingData?.mode === "balanced" ? (
-                  <span className="font-medium text-foreground/90">均衡负载模式</span>
+                {loadBalancingData?.mode !== "priority" ? (
+                  <span className="font-medium text-foreground/90">{LOAD_BALANCING_LABELS[loadBalancingData?.mode ?? 'priority']}</span>
                 ) : (
                   <span>
                     优先调度{" "}
@@ -2329,6 +2328,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       </main>
 
       {/* 弹窗们：按需挂载，彻底消除后台 hooks 与 DOM 驻留开销 */}
+      {restockDialogOpen && <RestockDialog open={restockDialogOpen} onOpenChange={setRestockDialogOpen} />}
       {addDialogOpen && (
         <AddCredentialDialog
           open={addDialogOpen}

@@ -664,7 +664,7 @@ function CredentialCardImpl({
         <Badge
           variant="warning"
           className="bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30 text-[11px]"
-          title="账号级风控冷却中"
+          title="账号级限流冷却中"
         >
           <Clock className="mr-1 h-3 w-3 inline" />
           冷却 {formatThrottleCountdown(throttleRemaining)}
@@ -757,7 +757,7 @@ function CredentialCardImpl({
             disabled={clearThrottle.isPending}
           >
             <Clock className="mr-2 h-4 w-4" />
-            解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
+            解除限流冷却（{formatThrottleCountdown(throttleRemaining)}）
           </DropdownMenuItem>
         )}
         {balance?.overageCapable === true &&
@@ -1005,6 +1005,9 @@ function CredentialCardImpl({
         </div>
       </div>
 
+      <div className="shrink-0 text-center text-xs font-mono text-muted-foreground" title="最近 60 秒请求数 / 当前并发">
+        <div>{credential.rpm ?? 0} RPM</div><div>{credential.inFlight ?? 0} 并发</div>
+      </div>
       <div className="hidden w-44 shrink-0 xl:block">
         {loadingBalance ? (
           <div className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
@@ -1278,6 +1281,7 @@ function CredentialCardImpl({
             <div className="space-y-1 border-t border-border/40 pt-3 px-3 text-[12px]">
               <CardSectionTitle icon={Activity}>运行与账号信息</CardSectionTitle>
               {groupingBlock && <div className="py-1">{groupingBlock}</div>}
+              <LedgerRow label="请求速率 / 并发"><span className="font-mono">{credential.rpm ?? 0} RPM / {credential.inFlight ?? 0}</span></LedgerRow>
               <LedgerRow label="凭据类型">
                 <span className="font-semibold">{authLabel}</span>
               </LedgerRow>

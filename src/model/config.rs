@@ -165,7 +165,7 @@ pub struct Config {
     /// 负载均衡模式（"priority"、"balanced"、"priority-balanced" 或 "priority-random"）
     ///
     /// - priority：始终使用优先级最高（priority 值最小）的可用凭据，故障时降级。
-    /// - balanced：在全部可用凭据中做 least-used 均衡。
+    /// - balanced：在全部可用凭据中随机均衡。
     /// - priority-balanced：先在最高优先级层内做 least-used 均衡，该层账号全部报错/
     ///   禁用/冷却后自动降级到下一优先级层。
     /// - priority-random：先在最高优先级层内随机选择，该层账号全部不可用后自动降级到
@@ -188,17 +188,24 @@ pub struct Config {
     #[serde(default = "default_session_affinity_ttl_secs")]
     pub session_affinity_ttl_secs: u64,
 
-    /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
+    /// 账号级 429 限流触发时是否冷却当前凭据并故障转移（默认 true）。
     ///
-    /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
-    /// 开启后：识别到 suspicious activity 字符串时，把当前凭据冷却 `account_throttle_cooldown_secs` 秒，
-    /// 立即切换到下一个可用凭据。
+    /// 适用于 USER_REQUEST_RATE_EXCEEDED、CREDIT_CONSUMPTION_RATE_EXCEEDED
+    /// 和 suspicious activity 等明确绑定账号的 429。关闭后直接返回客户端，不会由
+    /// `model_api_429_retry_enabled` 在原账号上继续重试。
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级风控冷却时长（秒，默认 1800 = 30 分钟）。
+    /// 账号级 429 限流冷却时长（秒，默认 1800 = 30 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
+
+    /// 普通模型 API 429 是否由中转侧自动重试（默认 true）。
+    ///
+    /// 仅控制不需要切换凭据的容量类 429（如 `INSUFFICIENT_MODEL_CAPACITY`）。
+    /// 关闭后首个普通 429 立即返回客户端；账号级故障转移不受影响。
+    #[serde(default = "default_model_api_429_retry_enabled")]
+    pub model_api_429_retry_enabled: bool,
 
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
@@ -245,6 +252,14 @@ pub struct Config {
     /// 错误日志提示人工介入。其它凭据、分组或模型的成功不会清零该计数。
     #[serde(default = "default_self_heal_max_consecutive_rounds")]
     pub self_heal_max_consecutive_rounds: u32,
+
+    /// 是否在上游月度额度重置后自动恢复 `QuotaExceeded` 凭据（默认 false）。
+    ///
+    /// 开启后，后台余额任务仅在该凭据的 `nextResetAt` 到期时复查它自己；确认
+    /// `remaining > 0` 后才恢复调度。关闭时，`QuotaExceeded` 凭据保持禁用，
+    /// 需管理员手动恢复。
+    #[serde(default)]
+    pub quota_reset_recovery_enabled: bool,
 
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
@@ -385,6 +400,10 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_model_api_429_retry_enabled() -> bool {
+    true
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -480,12 +499,14 @@ impl Default for Config {
             session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
+            quota_reset_recovery_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             max_retries_per_credential: default_max_retries_per_credential(),
             max_total_retries: default_max_total_retries(),
@@ -615,6 +636,14 @@ mod tests {
     }
 
     #[test]
+    fn quota_reset_recovery_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.quota_reset_recovery_enabled);
+        let config: Config = serde_json::from_str(r#"{"quotaResetRecoveryEnabled":true}"#).unwrap();
+        assert!(config.quota_reset_recovery_enabled);
+    }
+
+    #[test]
     fn account_rpm_limit_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(!config.account_rpm_limit_enabled);
@@ -623,6 +652,20 @@ mod tests {
         let default = Config::default();
         assert!(!default.account_rpm_limit_enabled);
         assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn model_api_429_retry_defaults_to_enabled_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.model_api_429_retry_enabled);
+        assert!(Config::default().model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn model_api_429_retry_accepts_explicitly_disabled() {
+        let config: Config =
+            serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
+        assert!(!config.model_api_429_retry_enabled);
     }
 
     #[test]
