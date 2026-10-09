@@ -16,6 +16,7 @@ import {
   Tags,
   Cpu,
   Globe,
+  Network,
   PackageOpen,
   PackagePlus,
   ShieldCheck,
@@ -38,7 +39,8 @@ export type TabKey =
   | "groups"
   | "traces"
   | "settings"
-  | "upstream";
+  | "upstream"
+  | "proxies";
 
 export interface SubMenuItem {
   key: string;
@@ -85,6 +87,7 @@ export const TABS: readonly TabItem[] = [
     description: "端到端审计追踪、耗时分析与异常排查",
     icon: ScrollText,
   },
+  { key: "proxies", label: "代理池", description: "代理健康、延迟、凭据绑定与轮询分配", icon: Network },
   { key: "upstream", label: "补货上游", description: "自动补货、购买入库与提货记录", icon: PackagePlus },
   {
     key: "settings",

@@ -37,6 +37,7 @@ const GroupsPage = lazy(() =>
     default: m.GroupsPage,
   })),
 );
+const ProxyPoolPage = lazy(() => import("@/components/proxy-pool-page").then((m) => ({ default: m.ProxyPoolPage })));
 const UpstreamPage = lazy(() => import("@/components/upstream-page").then((m) => ({ default: m.UpstreamPage })));
 const SettingsPage = lazy(() =>
   import("@/components/settings-page").then((m) => ({
@@ -56,7 +57,8 @@ function readTabFromHash(): Tab {
     h === "overview" ||
     h === "traces" ||
     h === "settings" ||
-    h === "upstream"
+    h === "upstream" ||
+    h === "proxies"
   )
     return h;
   return "overview";
@@ -213,6 +215,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
       {tab === "traces" && <TraceLogPage />}
       {tab === "settings" && <SettingsPage />}
       {tab === "upstream" && <UpstreamPage />}
+      {tab === "proxies" && <ProxyPoolPage />}
     </Suspense>
   );
 }

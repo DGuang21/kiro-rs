@@ -91,7 +91,6 @@ import {
   type VerifyResult,
 } from "@/components/batch-verify-dialog";
 import { detectTier, type Tier } from "@/components/subscription-badge";
-import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
@@ -272,7 +271,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
-  const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
   const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
   const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
   const [newAdminKey, setNewAdminKey] = useState("");
@@ -1919,7 +1917,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       : "刷新当前页余额"}
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={() => setProxyPoolDialogOpen(true)}
+                    onSelect={() => { window.location.hash = "#/proxies"; }}
                   >
                     <Globe />
                     IP 代理池管理
@@ -2388,12 +2386,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           onOpenChange={setKamImportDialogOpen}
         />
       )}
-      {proxyPoolDialogOpen && (
-        <ProxyPoolDialog
-          open={proxyPoolDialogOpen}
-          onOpenChange={setProxyPoolDialogOpen}
-        />
-      )}
+
       {imageUpdateDialogOpen && (
         <ImageUpdateDialog
           open={imageUpdateDialogOpen}

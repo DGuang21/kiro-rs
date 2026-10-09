@@ -84,6 +84,12 @@ export function NetworkSection() {
     : '未配置，直连上游。支持 HTTP / HTTPS / SOCKS，可填写认证凭据'
 
   return (
+    <div className="space-y-6">
+      <SettingGroup title="代理池" description="查看代理健康、延迟和凭据绑定，添加代理或轮询分配">
+        <Button size="sm" variant="outline" asChild>
+          <a href="#/proxies">打开代理池</a>
+        </Button>
+      </SettingGroup>
     <SettingGroup
       title="全局出站代理"
       description="所有上游请求默认走这个代理；未绑定专属代理的凭据都受它影响"
@@ -191,5 +197,6 @@ export function NetworkSection() {
         </>
       )}
     </SettingGroup>
+    </div>
   )
 }
