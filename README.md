@@ -46,9 +46,10 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
 - **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
-- **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
+- **多凭据调度**：`priority` 固定优先级、`balanced` 随机均衡、`priority-balanced` 优先级均衡和 `priority-random` 优先级随机。
 - **故障转移**：凭据失败、额度用尽、账号级 429 限流冷却、token 失效强制刷新。
-- **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
+- **profileArn 策略**：流式端点与 MCP（WebSearch）按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类调用跳过占位 ARN。
+- **可切换上游域名**：对话 / MCP 可发往 `q.{region}.amazonaws.com`（默认）或新版 Kiro 客户端使用的 `runtime.{region}.kiro.dev`，Admin 面板热切换。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
@@ -58,7 +59,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - **用量统计**：按客户端 Key、模型、凭据、日期聚合 input/output/cache token 和 credits。
 - **请求链路追踪**：SQLite `traces.db`，记录成功 / 失败请求、尝试链路和错误类型。
 - 客户端 Key 分发：Admin 面板生成 `sk-...` Key，支持独立启停、轮换、分组和统计；鉴权不强制 Key 前缀。
-- **Admin UI**：概览、凭据管理、客户端 Key、请求日志四个主视图。
+- **Admin UI**：概览、凭据管理、客户端 Key、请求日志、独立代理池和补货上游等视图；凭据管理显示总并发及各账号并发。
 - 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配。
 - **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
 - **多平台发布**：GitHub Release 构建 Windows、Linux、macOS 和 Docker Hub 多架构镜像。
@@ -322,7 +323,7 @@ codex
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
-| `/api/admin/config/*` | 运行时配置 |
+| `/api/admin/config/*` | 运行时配置（含 `GET/PUT /api/admin/config/api-domain` 上游域名） |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
 
@@ -362,10 +363,11 @@ Admin API 鉴权同样支持：
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
 | `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
+| `apiDomain` | `amazonaws` | 对话 / MCP 上游域名：`amazonaws` → `q.{region}.amazonaws.com`，`kiro` → `runtime.{region}.kiro.dev`。见[上游域名](#api-domain) |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
-| `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
+| `loadBalancingMode` | `priority` | `priority`、`balanced`、`priority-balanced` 或 `priority-random` |
 | `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
 | `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
 | `modelApi429RetryEnabled` | `true` | 无需换号的容量类模型 API 429 是否由中转自动重试 |
@@ -375,6 +377,10 @@ Admin API 鉴权同样支持：
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
 | `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
+| `cacheMeteringCapacity` | `262144` | prompt cache 计量条目上限，钳到 `[1024, 8388608]`；见下方「计量容量选型」 |
+| `cacheMeteringPersistEnabled` | `false` | 是否把计量快照落到 `cache_metering.json`（**0.9.x 起默认关闭**） |
+| `cacheMeteringFlushIntervalSecs` | `300` | 快照落盘间隔（秒），钳到 `[10, 3600]`，仅在落盘开启时有意义 |
+| `cacheMeteringMissDiagnostics` | `true` | 是否开启 miss 归因墓碑表（约 3MB 封顶），关闭后 `missEvicted` 退化为 `missNoEntry` |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
 | `usageLogRetentionDays` | `31` | `usage_log.*.jsonl` 保留天数 |
@@ -438,6 +444,8 @@ Admin API 鉴权同样支持：
 ```
 
 Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles` 解析真实 `profileArn`，成功后写回凭据。纯 Builder ID/free 账号没有 Enterprise profile 时，会回退到官方 IDE 使用的 Builder ID 占位 ARN，以避免流式端点缺少 `profileArn` 返回 400。
+
+上游对这类账号的 `ListAvailableProfiles` 固定返回 403 `AWS Builder ID is not supported for this operation`，该结果按「无 Enterprise profile」处理：不再请求另一区域，并在进程内标记已解析，后续请求不再重复查询（避免每个请求首字前多出两次串行握手）。
 
 #### Social 登录
 
@@ -655,6 +663,8 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 纯 web_search 请求会直接走上游 MCP 搜索接口。混合工具场景下，如果上游返回只包含 `web_search` 的工具调用，`kiro-rs` 会内部调用同一套 MCP 搜索接口，把结果作为 tool_result 喂回上游，直到上游停止搜索或达到轮数限制；其它工具调用会原样返回给客户端。
 
+MCP 搜索请求通过 `x-amzn-kiro-profile-arn` 头携带 profileArn，取值规则与对话请求相同（真实 ARN，或 Builder ID / Social 占位 ARN；API Key 凭据不发送）。上游 `/mcp` 缺少该头会返回 400 `profileArn is required for this request.`，表现为客户端收到 502 `Upstream API request failed.`。
+
 <a id="images"></a>
 ## 图片处理
 
@@ -700,7 +710,7 @@ data/
 - `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
 - `proxy_pool.json`：代理池与健康状态。
-- `cache_metering.json`：prompt cache 计量缓存，定期落盘。
+- `cache_metering.json`：prompt cache 计量快照，**默认不再读写**（需显式 `cacheMeteringPersistEnabled: true`）。
 - `traces.db`：SQLite 请求链路追踪数据库，WAL 模式。
 - `usage_log.*.jsonl`：按日滚动请求用量日志。
 
@@ -710,6 +720,78 @@ data/
 - `cache_creation_input_tokens`
 - `cache_read_input_tokens`
 - `output_tokens`
+
+### Prompt cache 计量容量选型
+
+`CacheMeter` 是一张定容表。写入速率为 `W` 条/秒时，一条 entry 的实际存活期是
+
+```text
+T_eff = min(C / W, TTL)
+```
+
+`C < W × TTL` 时 TTL 完全失效，命中率由容量而不是 TTL 决定，表现为 `cache_read`
+随负载**无声衰减**。上游每请求最多写 4 条断点、默认 TTL 300 秒，所以容量应满足：
+
+```text
+C >= peak_req_per_sec × entries_per_req × TTL_secs
+```
+
+默认 `262144` 支撑约 `262144 / (4 × 300) ≈ 218 req/s`，内存约 16–24MB
+（单条按 64 字节估算）。上界 `8388608` 约 512MB —— 那是「再大就该上 Redis
+共享层而不是堆内存」的界线，不是推荐值。改过切段策略、`entries_per_req`
+远大于 4 的部署，按公式自行调高。
+
+容量、落盘开关、落盘间隔、miss 诊断开关**启动时固定，运行时不可改**：
+改容量会立即触发一次大规模淘汰，不适合做热调旋钮。改这些 = 改 `config.json`
+（或环境变量）+ 重启。Admin API `GET /api/admin/cache-metering` 只读暴露当前生效值。
+
+环境变量（优先级：`config.json` 显式值 > 环境变量 > 内置默认）：
+
+| 环境变量 | 对应字段 | 默认 |
+|---|---|---:|
+| `KIRO_RS_CACHE_CAPACITY` | `cacheMeteringCapacity` | `262144` |
+| `KIRO_RS_CACHE_PERSIST` | `cacheMeteringPersistEnabled` | `false` |
+| `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` | `cacheMeteringFlushIntervalSecs` | `300` |
+| `KIRO_RS_CACHE_MISS_DIAGNOSTICS` | `cacheMeteringMissDiagnostics` | `true` |
+
+数值解析失败、为 `0` 或为空串都视为「未表态」并打一条 warn，回落到下一优先级，不会中止启动。
+
+#### 怎么判断该不该调容量
+
+后台任务每 60 秒输出一行（本周期无任何增量时不输出）：
+
+```text
+cache_meter stats entries_len=13421 capacity=262144 hits=90120 misses=10233 evicted=0 expired=240311
+  miss_no_entry=8120 miss_expired=1900 miss_evicted=13 miss_no_breakpoint=180 miss_no_seed=20 tombstone_clears=0
+```
+
+- `miss_evicted` 持续非零 + `entries_len` 贴着 `capacity` → **容量不够**，按上面的公式调高。
+- `miss_expired` 占多数、`evicted=0` → 是真实 TTL 过期，调容量没用。
+- `miss_no_breakpoint` / `miss_no_seed` 占多数 → 客户端没声明 `cache_control`，
+  或请求缺少 `metadata.user_id` 且用的是 `id=0` 系统 Key，与容量无关。
+
+单条 miss 的归因还会在 `RUST_LOG=debug` 下输出：有断点的请求按断点逐条打
+`cache_meter miss block_idx=.. reason=Absent|Expired|Evicted`（一个断点最多一条，
+单请求最多 4 条）；整条请求级的两种原因打 `cache_meter miss reason=no_breakpoint`
+与 `cache_meter miss reason=no_seed`。五种原因都可在 debug 日志里看到。
+
+> 计数口径：**一个断点只记一次账**。lookback 会向后探最多 20 个 hash，
+> 「深层没有、浅层命中」是正常的部分前缀命中，只记 1 次 `hits`，不会同时产生
+> 一堆 `misses` —— 否则命中率报表会被探测次数稀释。
+
+#### 升级提示：快照默认不再落盘
+
+`cacheMeteringPersistEnabled` 默认为 `false`，即**默认不再读写 `cache_metering.json`**。
+依据：计量 TTL 只有 300 秒，快照只在重启后 5 分钟内有价值，而容量调大后单次全量
+JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退出都不写该文件，
+也**不会删除**已有文件（留给回滚）。需要原行为显式写：
+
+```json
+{ "cacheMeteringPersistEnabled": true }
+```
+
+快照格式仍是 JSON（未换二进制）：默认关闭后这条路径不再是热点，换格式要带
+迁移与兼容分支，收益不抵复杂度。旧版本写的快照文件可直接被新版本加载。
 
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI
@@ -751,6 +833,18 @@ credential.apiRegion -> credential.region -> config.apiRegion -> config.region
 仅配置凭据 `region` 时，Token 刷新和 API 请求都默认使用该区域。需要分开设置时，使用凭据级 `authRegion` 和 `apiRegion`；`authRegion` 本身不作为 API 请求区域的回退值。
 
 部分 REST / 管理类上游接口只在 `us-east-1` 和 `eu-central-1` 提供服务，代码会按账号区域选择候选端点并在必要时回退。
+
+<a id="api-domain"></a>
+### 上游域名
+
+`apiDomain` 决定对话（`generateAssistantResponse`）和 MCP（WebSearch）请求的 host：
+
+| 值 | host | 说明 |
+|---|---|---|
+| `amazonaws`（默认） | `q.{apiRegion}.amazonaws.com` | 原有行为 |
+| `kiro` | `runtime.{apiRegion}.kiro.dev` | 新版 Kiro IDE / Kiro CLI 使用的域名；官方客户端只内置 `us-east-1`、`eu-central-1` 等少数区域 |
+
+Token 刷新、用量查询、`ListAvailableProfiles` 等 REST 接口不受影响。可在 Admin 面板「调度设置 → 上游域名」切换，或调用 `PUT /api/admin/config/api-domain`（Body：`{"domain":"kiro"}`），立即生效并写回 `config.json`，无需重启。
 
 ### 代理优先级
 
@@ -895,6 +989,6 @@ git diff --check
 
 ## Fork 保留功能
 
-本分支在上游 0.9.1 基础上保留补货上游管理、Webhook 入库、提号统计与凭据页一键补货，并恢复管理界面入口。支持 Legacy、KiroApp、Kiro Market、Kiro CEO 和直推 Key Webhook 平台；上游账号与事件文件保存在 `credentials.json` 同目录。
+本分支在上游 0.9.2 基础上保留独立代理池、补货上游管理、Webhook 入库、提号统计与凭据页一键补货。支持 Legacy、KiroApp、Kiro Market、Kiro CEO 和直推 Key Webhook 平台；上游账号与事件文件保存在 `credentials.json` 同目录。
 
-管理页继续显示最近 60 秒 RPM 和在途请求并发。Thinking 关闭时隐藏原生与兼容格式的思考内容；工具结果后的空白续接最多额外重试一次，重试前尚未输出正文，并将已观测的 Token 与 credits 累计到最终用量。
+凭据管理页顶部显示总并发和正在处理请求的账号数，每两秒更新；各账号继续显示最近 60 秒 RPM 和在途请求并发。Thinking 关闭时隐藏原生与兼容格式的思考内容；工具结果后的空白续接最多额外重试一次，出现可见内容后立即流式输出，并将已观测的 Token 与 credits 累计到最终用量。内容过滤拒答与上游明确的容量终止不触发空白重试。

@@ -17,6 +17,28 @@ impl Default for TlsBackend {
     }
 }
 
+/// 对话 / MCP 请求使用的上游域名。
+///
+/// - `Amazonaws`（默认）：`q.{region}.amazonaws.com`
+/// - `Kiro`：`runtime.{region}.kiro.dev`，新版 Kiro IDE / Kiro CLI 使用的域名，
+///   官方客户端仅内置 us-east-1、eu-central-1 等少数区域
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiDomain {
+    #[default]
+    Amazonaws,
+    Kiro,
+}
+
+impl ApiDomain {
+    pub fn runtime_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{}.amazonaws.com", region),
+            Self::Kiro => format!("runtime.{}.kiro.dev", region),
+        }
+    }
+}
+
 /// 工具兼容模式。
 ///
 /// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
@@ -107,6 +129,21 @@ pub struct Config {
 
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
+
+    /// Deadline for establishing an upstream API connection.
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// Maximum silence while waiting for headers or the next upstream body read.
+    #[serde(default = "default_upstream_read_timeout_secs")]
+    pub upstream_read_timeout_secs: u64,
+
+    /// Deadline for a whole upstream API request, body included. An active
+    /// stream cannot reset it, so it also caps how long an answer may be.
+    /// Defaults to the previously hardcoded 720s; set 0 to disable it and
+    /// leave stalled upstreams to `upstream_read_timeout_secs`.
+    #[serde(default = "default_upstream_total_timeout_secs")]
+    pub upstream_total_timeout_secs: u64,
 
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
@@ -300,6 +337,11 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 对话 / MCP 请求的上游域名：`amazonaws`（默认）或 `kiro`。
+    /// 仅影响 ide / cli 端点的 generateAssistantResponse 与 mcp，不影响 token 刷新和用量查询
+    #[serde(default)]
+    pub api_domain: ApiDomain,
+
     /// 是否启用中转层 prompt cache 本地计量模拟。未设置时回落到
     /// `KIRO_RS_CACHE_METERING` 环境变量，再回落到默认开启。
     ///
@@ -308,6 +350,35 @@ pub struct Config {
     /// 上游若下发真实 `metadataEvent.tokenUsage`，仍按真值上报，不受此开关影响。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_metering_enabled: Option<bool>,
+
+    /// prompt cache 计量模拟的条目上限。未设置时回落到 `KIRO_RS_CACHE_CAPACITY`
+    /// 环境变量，再回落到内置默认 262144。
+    ///
+    /// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
+    /// 生效值钳到 `[1024, 8388608]`。启动时固定，运行时不可改。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_capacity: Option<usize>,
+
+    /// 是否把 prompt cache 计量快照落到 `cache_metering.json`。未设置时回落到
+    /// `KIRO_RS_CACHE_PERSIST` 环境变量，再回落到默认**关闭**。
+    ///
+    /// 关闭后启动不读该文件、运行与退出都不写该文件，也不会删除已有文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_persist_enabled: Option<bool>,
+
+    /// prompt cache 计量快照的落盘间隔（秒）。未设置时回落到
+    /// `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` 环境变量，再回落到默认 300。
+    /// 生效值钳到 `[10, 3600]`。仅在落盘开启时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_flush_interval_secs: Option<u64>,
+
+    /// 是否开启 miss 归因（墓碑表，用于区分 `miss_evicted` / `miss_expired`）。
+    /// 未设置时回落到 `KIRO_RS_CACHE_MISS_DIAGNOSTICS` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后不建墓碑表（内存归零），`miss_evicted` 退化为 `miss_no_entry`，
+    /// 其余计数器与 `entries_len` 仍然输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_miss_diagnostics: Option<bool>,
 
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
@@ -378,6 +449,16 @@ fn default_count_tokens_auth_type() -> String {
 
 fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
+}
+
+fn default_upstream_connect_timeout_secs() -> u64 {
+    15
+}
+fn default_upstream_read_timeout_secs() -> u64 {
+    120
+}
+fn default_upstream_total_timeout_secs() -> u64 {
+    720
 }
 
 fn default_load_balancing_mode() -> String {
@@ -482,6 +563,9 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
+            upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
+            upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
+            upstream_total_timeout_secs: default_upstream_total_timeout_secs(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -513,7 +597,12 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            api_domain: ApiDomain::default(),
             cache_metering_enabled: None,
+            cache_metering_capacity: None,
+            cache_metering_persist_enabled: None,
+            cache_metering_flush_interval_secs: None,
+            cache_metering_miss_diagnostics: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
@@ -591,6 +680,48 @@ mod tests {
     use super::Config;
 
     #[test]
+    fn upstream_deadlines_default_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 15);
+        assert_eq!(config.upstream_read_timeout_secs, 120);
+        assert_eq!(Config::default().upstream_connect_timeout_secs, 15);
+        assert_eq!(Config::default().upstream_read_timeout_secs, 120);
+    }
+
+    /// The default keeps the previously hardcoded deadline, so existing
+    /// deployments behave exactly as before this became configurable.
+    #[test]
+    fn upstream_total_timeout_defaults_to_previous_hardcoded_value() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 720);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 720);
+    }
+
+    #[test]
+    fn upstream_deadlines_accept_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45}"#,
+        )
+        .unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 7);
+        assert_eq!(config.upstream_read_timeout_secs, 45);
+    }
+
+    #[test]
+    fn upstream_total_timeout_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":1800}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 1800);
+    }
+
+    /// 0 is a meaningful setting, not a missing one: it turns the overall
+    /// deadline off for deployments that would rather let long answers finish.
+    #[test]
+    fn upstream_total_timeout_accepts_zero_to_disable() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":0}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
+    }
+
+    #[test]
     fn model_cache_ttl_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.model_cache_ttl_secs, 3600);
@@ -663,8 +794,7 @@ mod tests {
 
     #[test]
     fn model_api_429_retry_accepts_explicitly_disabled() {
-        let config: Config =
-            serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
+        let config: Config = serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
         assert!(!config.model_api_429_retry_enabled);
     }
 

@@ -334,7 +334,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
 
   const queryClient = useQueryClient();
-  const { data, isLoading, error, refetch } = useCredentials();
+  const { data, isLoading, error, refetch } = useCredentials(2_000);
   const { mutate: deleteCredential } = useDeleteCredential();
   const { mutate: resetFailure } = useResetFailure();
   const { data: loadBalancingData, isLoading: isLoadingMode } =
@@ -1525,6 +1525,28 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             )
           }
         />
+
+        <Card className="mb-5">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
+            <div>
+              <div className="text-xs font-medium text-muted-foreground">当前并发</div>
+              <div
+                className="mt-1 font-mono text-3xl font-semibold tabular-nums text-primary"
+                aria-label="当前并发请求数"
+                title="正在进行、尚未结束的请求总数，包含流式响应期间"
+              >
+                {(data?.activeConcurrency ?? 0).toLocaleString()}
+              </div>
+            </div>
+            <div className="space-y-1 text-right text-xs text-muted-foreground">
+              <div>
+                {data?.credentials.filter((credential) => (credential.inFlight ?? 0) > 0).length ?? 0}
+                {" 个账号正在处理请求"}
+              </div>
+              <div>每 2 秒更新 · 包含流式请求</div>
+            </div>
+          </CardContent>
+        </Card>
 
         {/* 状态标签条已下移到紧贴列表处（见下方 <StatusStrip />）：
             它是列表的表头兼筛选器，放在标题下方会与它筛选的列表隔开两行工具栏。 */}

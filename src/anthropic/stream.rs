@@ -22,6 +22,10 @@ use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 /// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
 pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
 
+/// 上游内容过滤拦截（`metadataEvent.stopReason = CONTENT_FILTERED`）映射到的
+/// Anthropic `stop_reason`。一经设置即为终态，后续事件不得覆盖。
+pub(super) const REFUSAL_STOP_REASON: &str = "refusal";
+
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 const THINKING_START_TAG: &str = "<thinking>";
@@ -1349,8 +1353,12 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
-    /// 设置 stop_reason
+    /// 设置 stop_reason。`refusal` 是终态：拦截后同一条流里再到的
+    /// contextUsage / exception 不得把它覆盖成 max_tokens 之类的可重试原因。
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
+        if self.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON) {
+            return;
+        }
         self.stop_reason = Some(reason.into());
     }
 
@@ -1853,6 +1861,10 @@ impl StreamContext {
                     // tokenUsage 是最终快照；同一 provider 流内重复出现时取最后一份，
                     // 不能累加，否则会重复计费。
                     self.provider_token_usage = Some(usage);
+                }
+                if let Some(refusal) = metadata.content_filter_refusal() {
+                    tracing::warn!("上游内容过滤拒答: {}", refusal);
+                    self.state_manager.set_stop_reason(REFUSAL_STOP_REASON);
                 }
                 Vec::new()
             }
@@ -2895,7 +2907,11 @@ impl StreamContext {
         // 收尾检查工具调用累积器：无参工具（0 字节滞留）在此还原为 `{}` 并正常发出；
         // 累积了非空内容却从未 stop=true 的才是上游中途截断，记为错误。
         // process_tool_use 中已置位的错误保持不变。
-        if self.tool_json_error.is_none() {
+        if self.state_manager.get_stop_reason() == REFUSAL_STOP_REASON {
+            // Refused generation can end in the middle of a tool call. Drop
+            // pending calls rather than recovering them or reporting JSON errors.
+            self.tool_json_error = None;
+        } else if self.tool_json_error.is_none() {
             let finished = self.tool_json_accumulator.finish(&self.tool_name_map);
             match finished {
                 Ok(recovered) => {
@@ -2947,16 +2963,11 @@ impl StreamContext {
     }
 }
 
-/// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
+/// 工具结果续轮的暂存上下文。
 ///
-/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
-///
-/// 工作流程：
-/// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
-/// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
-/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
-/// 4. 一次性返回所有事件
+/// 在出现可见文本或完整工具调用前保留事件，以便空回答能安全重试。
+/// 出现可见内容后可通过 `take_buffered_events` 即时发送，最终用量由
+/// `message_delta` 提供；未提前发送的 `message_start` 也会在收尾时校正。
 pub struct BufferedStreamContext {
     /// 内部流处理上下文（复用现有的事件处理逻辑）
     inner: StreamContext,
@@ -3008,6 +3019,12 @@ impl BufferedStreamContext {
         // 处理事件并缓冲结果
         let events = self.inner.process_kiro_event(event);
         self.event_buffer.extend(events);
+    }
+
+    /// Publish buffered events once a continuation has visible text or a tool
+    /// call. Final usage is subsequently delivered in message_delta.
+    pub fn take_buffered_events(&mut self) -> Vec<SseEvent> {
+        std::mem::take(&mut self.event_buffer)
     }
 
     /// 完成流处理并返回所有事件
@@ -3089,6 +3106,11 @@ impl BufferedStreamContext {
     /// 是否由上游明确给出了 max_tokens / context-window 终止。
     pub fn has_terminal_limit(&self) -> bool {
         self.inner.has_terminal_limit()
+    }
+
+    /// Content filtering ends the turn without an empty-continuation retry.
+    pub fn is_refusal(&self) -> bool {
+        self.inner.state_manager.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON)
     }
 }
 
@@ -6463,8 +6485,9 @@ mod tests {
                 cache_read_input_tokens: 7,
                 cache_write_input_tokens: 4,
             }),
+            ..Default::default()
         }));
-        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent::default()));
         assert_eq!(ctx.resolved_usage(), (3, 4, 7));
         assert_eq!(ctx.resolved_output_tokens(), 11);
 
@@ -6475,6 +6498,7 @@ mod tests {
                 cache_read_input_tokens: 23,
                 cache_write_input_tokens: 24,
             }),
+            ..Default::default()
         }));
         assert_eq!(ctx.resolved_usage(), (0, 24, 23));
         assert_eq!(ctx.resolved_output_tokens(), 22);
@@ -6546,7 +6570,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_stream_reports_the_same_provider_usage_in_events_and_final_usage() {
+    fn live_stream_reports_final_provider_usage_without_delaying_initial_event() {
         use crate::kiro::model::events::MetadataEvent;
 
         let usage = TokenUsage {
@@ -6555,27 +6579,29 @@ mod tests {
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
         };
-        let mut ctx = BufferedStreamContext::new(
+        let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-7",
             100,
             false,
             HashMap::new(),
             test_known_tools(),
         );
-        ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
             token_usage: Some(usage),
-        }));
-        let events = ctx.finish_and_get_all_events();
+            ..Default::default()
+        })));
+        events.extend(ctx.generate_final_events());
 
-        assert_eq!(ctx.final_usage(), (3, 11, 4, 7, 0.0));
+        assert_eq!(ctx.resolved_usage(), (3, 4, 7));
         let start_usage = &events
             .iter()
             .find(|event| event.event == "message_start")
             .unwrap()
             .data["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], json!(3));
-        assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
-        assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
+        assert_eq!(start_usage["input_tokens"], json!(100));
+        assert_eq!(start_usage["cache_creation_input_tokens"], json!(0));
+        assert_eq!(start_usage["cache_read_input_tokens"], json!(0));
         let delta_usage = &events
             .iter()
             .find(|event| event.event == "message_delta")
