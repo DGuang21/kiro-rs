@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased] — Fork 同步
 
+- 同步上游 0.9.3 与后续 Haiku 5.5 适配，保留独立代理池、补货、四种调度及总并发和每账号并发显示。
+- 全局代理改动在下一次模型 / MCP 请求或重试时生效；单次尝试复用同一个 Client，并保留在途并发守卫及可配置重试预算。
+- 取消模型级跨请求冷却，模型过载仅让当前请求快速返回 503；补齐 Sonnet / Haiku 5.5 的 1M 上下文估算及 Haiku 5.5 原生 reasoning。
+
 - 合并上游 0.9.2，保留独立代理池、补货、四种调度与每账号并发，并恢复凭据管理顶部的并发汇总和两秒刷新。
 - Claude Code 请求即时流式输出；工具结果续轮在首段可见输出后即时发送，空白续轮仍按预算重试，拒答与明确的容量终止不触发空白重试。
 - 非流式响应逐帧解析，同时保留在途并发守卫和被丢弃续轮的累计计量；上游超时立即返回，专属代理故障只在本次请求内排除对应凭据。
@@ -13,6 +17,49 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 合并上游 0.9.1，保留补货、Webhook、提号统计、RPM 与在途并发显示，恢复补货管理页面和一键补货入口。
 - 四种调度模式接入上游会话粘性、模型缓存预热与请求级排除；容量 429 在原账号退避，账号级 429 按开关换号，408/5xx 按在线配置的重试预算降级。
 - 保留 Thinking 输出隔离和工具结果空白续接重试；累计被丢弃响应的 Token 与 credits，并沿用上游中断追踪与幂等结算。
+
+## [0.9.3] - 2026-10-26
+
+主题：**全局代理热更新、模型过载隔离与 Sonnet 5.5 上下文计量修复**。本版汇总 `v0.9.2` 之后合并的 3 个 PR；没有新增配置项，现有配置、凭据与请求日志无需手动迁移。
+
+### 🌐 全局代理热更新
+
+> 来源：[PR #120](https://github.com/ZyphrZero/kiro.rs/pull/120)。提交人：[@cyx0215](https://github.com/cyx0215)，感谢贡献。
+
+- 修复管理端修改全局代理后，模型生成和 MCP（WebSearch）请求仍使用启动时代理的问题；代理地址、用户名或密码的修改，以及启用、清除代理，均在下一次请求或重试时生效，无需重启服务。
+- 切换代理时释放旧全局代理的连接池缓存引用，保留缓存容量上限；已开始的响应继续完成，账号专属代理与显式直连仍优先于全局代理。
+- 热更新范围为模型生成和 MCP 请求；后台版本刷新与外部 `count_tokens` 仍使用启动时代理，修改后需要重启才能对这两条路径生效。
+
+### 🔧 模型过载仅影响当前请求
+
+> 来源：[PR #125](https://github.com/ZyphrZero/kiro.rs/pull/125)。提交人：[@childe](https://github.com/childe)，感谢贡献。
+
+- 移除跨请求的模型级冷却，修复单次上游 `MODEL_TEMPORARILY_UNAVAILABLE` 导致冷却期内同模型的其他请求未经上游便直接返回 503 的问题；后续请求正常尝试上游。
+- 保留单次请求的快速失败行为：模型过载时返回 503 `overloaded_error` 与 `Retry-After`，不在网关内连续重试三次；客户端仍应遵循 `Retry-After` 重试。
+
+### 📊 Sonnet 5.5 上下文计量
+
+> 来源：[PR #126](https://github.com/ZyphrZero/kiro.rs/pull/126)。提交人：[@d0zingcat](https://github.com/d0zingcat)，感谢贡献。
+
+- 将 `claude-sonnet-5.5` 及映射到该模型的 `claude-sonnet-5-5` 等别名纳入 1M 上下文窗口估算，修复此前回退到 200K、按上游上下文占比换算时将输入 Token 低估约 5 倍的问题。
+- 上下文进度、自动压缩判断与基于 Token 的用量统计使用修正后的估算；1M 取值来自本项目测试推断，后续以上游公布的窗口为准。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@cyx0215](https://github.com/cyx0215) | [#120](https://github.com/ZyphrZero/kiro.rs/pull/120) |
+| [@childe](https://github.com/childe) | [#125](https://github.com/ZyphrZero/kiro.rs/pull/125) |
+| [@d0zingcat](https://github.com/d0zingcat) | [#126](https://github.com/ZyphrZero/kiro.rs/pull/126) |
+
+以上按 GitHub PR 作者列出。感谢 [@childe](https://github.com/childe) 合并 PR #120、#125，以及 [@ZyphrZero](https://github.com/ZyphrZero) 合并 PR #126。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.3`，无需手动转换现有配置、凭据、客户端 Key 或日志数据库。
+- 模型级过载冷却已移除，客户端可能更快再次访问上游；请继续按服务端返回的 `Retry-After` 安排重试。
+
+完整变更：[v0.9.2...v0.9.3](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.2...v0.9.3)。
 
 ## [0.9.2] - 2026-10-18
 

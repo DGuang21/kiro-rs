@@ -540,7 +540,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 - `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`：`1_000_000`（静态模型声明最大输出为 `64_000`）
 - 其它 `gpt-5.*`：`272_000`
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-fable-5`：`1_000_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5.5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-haiku-5.5`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 ### 自定义模型
@@ -903,7 +903,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前同步版本：[v0.9.1](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.1)。
+当前同步版本：[v0.9.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.3)，并包含此后 master 的 [Haiku 5.5 适配](https://github.com/ZyphrZero/kiro.rs/commit/7255d98280df1abd504cbeefc89575ae2aadd0ff)。
 
 Docker 镜像：
 
@@ -989,6 +989,6 @@ git diff --check
 
 ## Fork 保留功能
 
-本分支在上游 0.9.2 基础上保留独立代理池、补货上游管理、Webhook 入库、提号统计与凭据页一键补货。支持 Legacy、KiroApp、Kiro Market、Kiro CEO 和直推 Key Webhook 平台；上游账号与事件文件保存在 `credentials.json` 同目录。
+本分支在上游 0.9.3 基础上包含后续 Haiku 5.5 适配，并保留独立代理池、补货上游管理、Webhook 入库、提号统计与凭据页一键补货。支持 Legacy、KiroApp、Kiro Market、Kiro CEO 和直推 Key Webhook 平台；上游账号与事件文件保存在 `credentials.json` 同目录。
 
 凭据管理页顶部显示总并发和正在处理请求的账号数，每两秒更新；各账号继续显示最近 60 秒 RPM 和在途请求并发。Thinking 关闭时隐藏原生与兼容格式的思考内容；工具结果后的空白续接最多额外重试一次，出现可见内容后立即流式输出，并将已观测的 Token 与 credits 累计到最终用量。内容过滤拒答与上游明确的容量终止不触发空白重试。

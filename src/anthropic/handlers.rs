@@ -3030,9 +3030,8 @@ mod tests {
             std::sync::Arc::new(crate::kiro::endpoint::ide::IdeEndpoint::new())
                 as std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
         )]);
-        let provider = std::sync::Arc::new(crate::kiro::provider::KiroProvider::with_proxy(
+        let provider = std::sync::Arc::new(crate::kiro::provider::KiroProvider::new(
             manager,
-            None,
             endpoints,
             "ide".to_string(),
         ));
