@@ -48,6 +48,12 @@ async fn main() {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
+    let balance_refresh_interval = config
+        .resolve_balance_refresh_interval(std::env::var("KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS"))
+        .unwrap_or_else(|error| {
+            tracing::error!("余额后台刷新配置无效: {}", error);
+            std::process::exit(1);
+        });
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
@@ -221,6 +227,8 @@ async fn main() {
             tracing::info!("分组注册表：自动迁移 {} 个已用分组", added);
         }
     }
+    // 让调度器能解析分组级负载均衡 / 优先级反转覆盖。
+    token_manager.set_group_manager(group_manager.clone());
 
     // 补货上游配置与事件日志（持久化到 upstreams.json / upstream_events.json）
     let upstreams_path = admin::upstream::default_config_path_in(&cache_dir);
@@ -356,6 +364,10 @@ async fn main() {
         });
     }
 
+    let custom_headers_manager = model::custom_headers::CustomHeadersManager::new(
+        config.custom_headers.clone(),
+    );
+
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -365,6 +377,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        Some(custom_headers_manager.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -382,12 +395,14 @@ async fn main() {
             });
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_quota_alerts(balance_refresh_interval)
                     .with_kiro_provider(kiro_provider.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
                     )
-                    .with_cache_meter(cache_meter.clone());
+                    .with_cache_meter(cache_meter.clone())
+                    .with_custom_headers(Some(custom_headers_manager.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
@@ -399,10 +414,9 @@ async fn main() {
                 upstream_event_log.clone(),
             );
 
-            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state
                 .service
-                .start_balance_refresher(std::time::Duration::from_secs(300));
+                .start_balance_refresher(balance_refresh_interval);
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state

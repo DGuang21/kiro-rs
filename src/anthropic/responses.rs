@@ -250,7 +250,29 @@ pub async fn post_responses(
     };
 
     // 2. 复用 Anthropic 全链路。流式请求会得到标准 Anthropic SSE。
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(State(state.clone()), Extension(key_ctx), Json(anthropic_req)).await;
+
+    // 把内层 Anthropic 响应上的自定义响应头透传到 Responses 响应。
+    let mut configured_names = state
+        .custom_headers
+        .as_ref()
+        .map(|mgr| mgr.get_active_header_names())
+        .unwrap_or_default();
+    configured_names.push(header::HeaderName::from_static("x-oneapi-request-id"));
+    configured_names.push(header::HeaderName::from_static("x-request-id"));
+
+    let trace_headers: Vec<(header::HeaderName, header::HeaderValue)> = inner
+        .headers()
+        .iter()
+        .filter(|(name, _)| configured_names.iter().any(|cfg| cfg == *name))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let attach_trace = |resp: &mut Response| {
+        for (name, val) in &trace_headers {
+            resp.headers_mut().insert(name.clone(), val.clone());
+        }
+    };
 
     let status = inner.status();
     let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
@@ -258,11 +280,13 @@ pub async fn post_responses(
         let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
             Ok(b) => b,
             Err(e) => {
-                return responses_error(
+                let mut resp = responses_error(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
                     &format!("failed to read upstream response: {e}"),
                 );
+                attach_trace(&mut resp);
+                return resp;
             }
         };
         let mut response = Response::builder()
@@ -273,32 +297,40 @@ pub async fn post_responses(
         if let Some(value) = retry_after {
             response.headers_mut().insert(header::RETRY_AFTER, value);
         }
+        attach_trace(&mut response);
         return response;
     }
 
     if want_stream {
-        return responses_streaming_response(inner.into_body(), model, tool_kinds, response_config);
+        let mut resp =
+            responses_streaming_response(inner.into_body(), model, tool_kinds, response_config);
+        attach_trace(&mut resp);
+        return resp;
     }
 
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            return responses_error(
+            let mut resp = responses_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!("failed to read upstream response: {e}"),
             );
+            attach_trace(&mut resp);
+            return resp;
         }
     };
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return responses_error(
+            let mut resp = responses_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!("failed to parse upstream response: {e}"),
             );
+            attach_trace(&mut resp);
+            return resp;
         }
     };
 
@@ -306,7 +338,9 @@ pub async fn post_responses(
     let parsed = parse_anthropic_message(&anthropic, &model);
 
     let body = build_responses_object_with_config(&parsed, &tool_kinds, &response_config);
-    (StatusCode::OK, Json(body)).into_response()
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    attach_trace(&mut resp);
+    resp
 }
 
 // ============================ 请求翻译 ============================
@@ -452,10 +486,18 @@ fn responses_to_anthropic(
         .as_ref()
         .and_then(|r| r.effort.clone())
         .filter(|e| !e.trim().is_empty())
-        .map(|effort| OutputConfig { effort });
-    let thinking = output_config.as_ref().map(|_| Thinking {
-        thinking_type: "adaptive".to_string(),
-        budget_tokens: 20_000,
+        .map(|effort| OutputConfig {
+            effort,
+            format: None,
+        });
+    let thinking = req.reasoning.and_then(|reasoning| {
+        reasoning
+            .effort
+            .filter(|effort| !effort.trim().is_empty())
+            .map(|_| Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 20_000,
+            })
     });
 
     Ok((
@@ -1113,13 +1155,11 @@ enum StreamingBlock {
         item_id: String,
         output_index: Option<i64>,
         text: String,
-        thinking_filter: super::stream::HiddenThinkingXmlFilter,
     },
     Reasoning {
         item_id: String,
         output_index: Option<i64>,
         text: String,
-        tag_filter: super::stream::ThinkingXmlTagFilter,
     },
     Tool {
         call_id: String,
@@ -1281,13 +1321,11 @@ impl ResponsesStreamContext {
                 item_id: new_msg_id(),
                 output_index: None,
                 text: String::new(),
-                thinking_filter: Default::default(),
             },
             "thinking" => StreamingBlock::Reasoning {
                 item_id: new_rs_id(),
                 output_index: None,
                 text: String::new(),
-                tag_filter: Default::default(),
             },
             "tool_use" => StreamingBlock::Tool {
                 call_id: block
@@ -1374,21 +1412,6 @@ impl ResponsesStreamContext {
         if delta.is_empty() {
             return Vec::new();
         }
-        // Final user-visible boundary: even if an earlier adapter misclassified a
-        // legacy thinking wrapper as text, never expose the private block to Codex.
-        let delta = match self.blocks.get_mut(&index) {
-            Some(StreamingBlock::Text {
-                thinking_filter, ..
-            }) => thinking_filter.filter(delta),
-            _ => return Vec::new(),
-        };
-        if delta.is_empty() {
-            return Vec::new();
-        }
-        self.emit_visible_text_delta(index, &delta)
-    }
-
-    fn emit_visible_text_delta(&mut self, index: i64, delta: &str) -> Vec<Bytes> {
         let needs_start = matches!(
             self.blocks.get(&index),
             Some(StreamingBlock::Text {
@@ -1410,13 +1433,12 @@ impl ResponsesStreamContext {
             item_id,
             output_index: Some(output_index),
             text,
-            ..
         }) = self.blocks.get_mut(&index)
         else {
             return Vec::new();
         };
         let first = text.is_empty();
-        text.push_str(&delta);
+        text.push_str(delta);
         let item_id = item_id.clone();
         let output_index = *output_index;
         let mut events = Vec::new();
@@ -1450,19 +1472,6 @@ impl ResponsesStreamContext {
         if delta.is_empty() {
             return Vec::new();
         }
-        // Reasoning remains visible as a normal Thought item, but transport XML
-        // must never become part of the summary shown by the client.
-        let delta = match self.blocks.get_mut(&index) {
-            Some(StreamingBlock::Reasoning { tag_filter, .. }) => tag_filter.filter(delta),
-            _ => return Vec::new(),
-        };
-        if delta.is_empty() {
-            return Vec::new();
-        }
-        self.emit_visible_reasoning_delta(index, &delta)
-    }
-
-    fn emit_visible_reasoning_delta(&mut self, index: i64, delta: &str) -> Vec<Bytes> {
         let needs_start = matches!(
             self.blocks.get(&index),
             Some(StreamingBlock::Reasoning {
@@ -1484,13 +1493,12 @@ impl ResponsesStreamContext {
             item_id,
             output_index: Some(output_index),
             text,
-            ..
         }) = self.blocks.get_mut(&index)
         else {
             return Vec::new();
         };
         let first = text.is_empty();
-        text.push_str(&delta);
+        text.push_str(delta);
         let item_id = item_id.clone();
         let output_index = *output_index;
         let mut events = Vec::new();
@@ -1516,33 +1524,16 @@ impl ResponsesStreamContext {
         let Some(index) = data.get("index").and_then(Value::as_i64) else {
             return Vec::new();
         };
-        let tail = match self.blocks.get_mut(&index) {
-            Some(StreamingBlock::Text {
-                thinking_filter, ..
-            }) => thinking_filter.finish(),
-            Some(StreamingBlock::Reasoning { tag_filter, .. }) => tag_filter.finish(),
-            _ => String::new(),
-        };
-        let mut events = if tail.is_empty() {
-            Vec::new()
-        } else if matches!(self.blocks.get(&index), Some(StreamingBlock::Text { .. })) {
-            self.emit_visible_text_delta(index, &tail)
-        } else {
-            self.emit_visible_reasoning_delta(index, &tail)
-        };
-
-        let completed = match self.blocks.remove(&index) {
+        match self.blocks.remove(&index) {
             Some(StreamingBlock::Text {
                 item_id,
                 output_index: Some(output_index),
                 text,
-                ..
             }) => self.finish_text(item_id, output_index, text),
             Some(StreamingBlock::Reasoning {
                 item_id,
                 output_index: Some(output_index),
                 text,
-                ..
             }) => self.finish_reasoning(item_id, output_index, text),
             Some(StreamingBlock::Tool {
                 call_id,
@@ -1555,9 +1546,7 @@ impl ResponsesStreamContext {
                 output_index,
             }) => self.finish_web_search(item_id, query, output_index),
             _ => Vec::new(),
-        };
-        events.extend(completed);
-        events
+        }
     }
 
     fn finish_text(&mut self, item_id: String, output_index: i64, text: String) -> Vec<Bytes> {
@@ -1615,10 +1604,6 @@ impl ResponsesStreamContext {
     /// It deliberately does not use an Anthropic `thinking` block because those
     /// require a provider signature when replayed by Anthropic clients.
     fn emit_reasoning_summary(&mut self, text: &str) -> Vec<Bytes> {
-        let text = super::stream::strip_thinking_xml_tags(text);
-        if text.is_empty() {
-            return Vec::new();
-        }
         let item_id = new_rs_id();
         let output_index = self.allocate_output_index();
         let item = json!({
@@ -3156,148 +3141,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_responses_hides_legacy_thinking_misclassified_as_text() {
-        let mut context = ResponsesStreamContext::new(
-            "gpt-5.6-sol".into(),
-            ToolKindMap::new(),
-            ResponsesResponseConfig::default(),
-        );
-        context.initial_events();
-
-        feed_event(
-            &mut context,
-            "content_block_start",
-            json!({
-                "type": "content_block_start", "index": 0,
-                "content_block": { "type": "thinking", "thinking": "" },
-            }),
-        );
-        let normal_reasoning = feed_event(
-            &mut context,
-            "content_block_delta",
-            json!({
-                "type": "content_block_delta", "index": 0,
-                "delta": { "type": "thinking_delta", "thinking": "normal thought" },
-            }),
-        );
-        feed_event(
-            &mut context,
-            "content_block_stop",
-            json!({ "type": "content_block_stop", "index": 0 }),
-        );
-
-        feed_event(
-            &mut context,
-            "content_block_start",
-            json!({
-                "type": "content_block_start", "index": 1,
-                "content_block": { "type": "text", "text": "" },
-            }),
-        );
-        let leaked = feed_event(
-            &mut context,
-            "content_block_delta",
-            json!({
-                "type": "content_block_delta", "index": 1,
-                "delta": { "type": "text_delta", "text":
-                    "<thinking>private plan that must not render</thinking>visible answer" },
-            }),
-        );
-        let done = feed_event(
-            &mut context,
-            "content_block_stop",
-            json!({ "type": "content_block_stop", "index": 1 }),
-        );
-
-        assert!(normal_reasoning.contains("normal thought"));
-        assert!(leaked.contains("visible answer"));
-        assert!(!leaked.contains("private plan"));
-        assert!(!leaked.contains("thinking&gt;"));
-        assert!(!leaked.contains("thinking>"));
-        assert!(!done.contains("private plan"));
-        assert_eq!(context.output[0]["type"], json!("reasoning"));
-        assert_eq!(
-            context.output[1]["content"][0]["text"],
-            json!("visible answer")
-        );
-    }
-
-    #[test]
-    fn streaming_responses_hides_split_thinking_text_and_strips_reasoning_tags() {
-        let mut context = ResponsesStreamContext::new(
-            "gpt-5.6-sol".into(),
-            ToolKindMap::new(),
-            ResponsesResponseConfig::default(),
-        );
-        context.initial_events();
-
-        feed_event(
-            &mut context,
-            "content_block_start",
-            json!({
-                "type": "content_block_start", "index": 0,
-                "content_block": { "type": "thinking", "thinking": "" },
-            }),
-        );
-        let mut reasoning = String::new();
-        for delta in ["<thi", "nking>normal thought</thin", "king>"] {
-            reasoning.push_str(&feed_event(
-                &mut context,
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta", "index": 0,
-                    "delta": { "type": "thinking_delta", "thinking": delta },
-                }),
-            ));
-        }
-        reasoning.push_str(&feed_event(
-            &mut context,
-            "content_block_stop",
-            json!({ "type": "content_block_stop", "index": 0 }),
-        ));
-
-        feed_event(
-            &mut context,
-            "content_block_start",
-            json!({
-                "type": "content_block_start", "index": 1,
-                "content_block": { "type": "text", "text": "" },
-            }),
-        );
-        let mut text = String::new();
-        for delta in ["before<thi", "nking>private plan</thin", "king>after"] {
-            text.push_str(&feed_event(
-                &mut context,
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta", "index": 1,
-                    "delta": { "type": "text_delta", "text": delta },
-                }),
-            ));
-        }
-        text.push_str(&feed_event(
-            &mut context,
-            "content_block_stop",
-            json!({ "type": "content_block_stop", "index": 1 }),
-        ));
-
-        assert!(reasoning.contains("normal thought"));
-        assert!(!reasoning.contains("thinking>"));
-        assert!(text.contains("before"));
-        assert!(text.contains("after"));
-        assert!(!text.contains("private plan"));
-        assert!(!text.contains("thinking>"));
-        assert_eq!(
-            context.output[0]["summary"][0]["text"],
-            json!("normal thought")
-        );
-        assert_eq!(
-            context.output[1]["content"][0]["text"],
-            json!("beforeafter")
-        );
-    }
-
-    #[test]
     fn streaming_tool_waits_for_complete_json_and_restores_custom_namespace() {
         let mut kinds = ToolKindMap::new();
         kinds.insert(
@@ -3546,51 +3389,6 @@ mod tests {
             .await
             .expect("translated stream must terminate after message_stop");
         assert!(end.is_none());
-    }
-
-    #[tokio::test]
-    async fn responses_http_stream_never_emits_private_thinking_from_text_delta() {
-        let upstream = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
-            "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"normal thought\"}}\n\n",
-            "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"<thi\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"nking>private plan</thin\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"king>visible answer\"}}\n\n",
-            "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
-            "event: message_stop\n",
-            "data: {\"type\":\"message_stop\"}\n\n",
-        );
-        let response = responses_streaming_response(
-            Body::from(upstream),
-            "gpt-5.6-sol".into(),
-            ToolKindMap::new(),
-            ResponsesResponseConfig::default(),
-        );
-        let bytes = to_bytes(response.into_body(), MAX_INNER_BODY)
-            .await
-            .unwrap();
-        let output = std::str::from_utf8(&bytes).unwrap();
-
-        assert!(output.contains("normal thought"));
-        assert!(output.contains("visible answer"));
-        assert!(!output.contains("private plan"));
-        assert!(!output.contains("<thinking>"));
-        assert!(!output.contains("</thinking>"));
-        assert!(output.contains("event: response.completed"));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{NoAvailableCredentialsError, UpstreamRateLimitError};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
@@ -156,6 +156,36 @@ pub(crate) async fn refresh_token(
         refresh_social_token(credentials, config, proxy).await
     }
 }
+
+fn merge_refreshed_credentials(
+    current: &mut KiroCredentials,
+    original: &KiroCredentials,
+    refreshed: &KiroCredentials,
+) -> anyhow::Result<()> {
+    if current.access_token != original.access_token
+        || current.refresh_token != original.refresh_token
+        || current.client_id != original.client_id
+        || current.client_secret != original.client_secret
+        || current.auth_method != original.auth_method
+        || current.token_endpoint != original.token_endpoint
+    {
+        return Err(RefreshSupersededError.into());
+    }
+    current.access_token = refreshed.access_token.clone();
+    current.refresh_token = refreshed.refresh_token.clone();
+    if current.expires_at == original.expires_at && refreshed.expires_at != original.expires_at {
+        current.expires_at = refreshed.expires_at.clone();
+    }
+    if current.profile_arn == original.profile_arn && refreshed.profile_arn != original.profile_arn
+    {
+        current.profile_arn = refreshed.profile_arn.clone();
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("凭据认证信息在 Token 刷新期间发生变化，请重试")]
+struct RefreshSupersededError;
 
 /// 刷新 Social Token
 async fn refresh_social_token(
@@ -1036,7 +1066,6 @@ pub(crate) async fn set_user_preference(
 
 /// 单个凭据条目的状态
 struct CredentialEntry {
-    in_flight: u32,
     /// 凭据唯一 ID
     id: u64,
     /// 凭据信息
@@ -1072,6 +1101,11 @@ struct CredentialEntry {
     last_self_heal_at: Option<DateTime<Utc>>,
     /// 当前连续自愈轮次对应的模型；None 表示 MCP/无模型请求。
     self_heal_model: Option<String>,
+    /// 当前在途处理中的请求数（用于负载均衡并发避让）
+    in_flight: Arc<AtomicU32>,
+    /// SWRR 平滑加权轮询的当前动态权重
+    current_weight: i64,
+    proxy_generation: u64,
 }
 
 impl CredentialEntry {
@@ -1085,6 +1119,7 @@ impl CredentialEntry {
         self.throttled_until = None;
         self.rpm_window.clear();
         self.clear_self_heal_streak();
+        self.current_weight = 0;
     }
 }
 
@@ -1182,6 +1217,33 @@ struct StatsEntry {
 // Admin API 公开结构
 // ============================================================================
 
+/// 单个凭据的代理使用状态，供代理自动检测与轮换使用。
+#[derive(Clone)]
+pub struct CredentialProxySnapshot {
+    /// 凭据唯一 ID
+    pub id: u64,
+    /// 实际在用的代理 URL；`None` 表示当前直连
+    pub in_use_proxy_url: Option<String>,
+    pub in_use_proxy: Option<ProxyConfig>,
+    pub recovery_proxy: Option<ProxyConfig>,
+    pub temporary_direct: bool,
+    pub generation: u64,
+    pub global_generation: u64,
+    /// 是否显式配置为直连（`proxy_url == "direct"`）
+    pub explicit_direct: bool,
+    /// 当前 `proxy_url` 是否由自动轮换写入
+    pub auto_assigned: bool,
+    /// 凭据是否已禁用（禁用的凭据不参与调度，也就无需轮换代理）
+    pub disabled: bool,
+}
+
+pub struct ProxyRotationUpdate {
+    pub id: u64,
+    pub target: Option<String>,
+    pub generation: u64,
+    pub global_generation: u64,
+}
+
 /// 凭据条目快照（用于 Admin API 读取）
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1191,6 +1253,8 @@ pub struct CredentialEntrySnapshot {
     pub id: u64,
     /// 优先级
     pub priority: u32,
+    /// 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10）
+    pub load_factor: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -1225,6 +1289,7 @@ pub struct CredentialEntrySnapshot {
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
+    pub proxy_temporary_direct: bool,
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
@@ -1265,17 +1330,6 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
-}
-
-pub struct RequestGuard {
-    manager: Arc<MultiTokenManager>,
-    id: u64,
-}
-
-impl Drop for RequestGuard {
-    fn drop(&mut self) {
-        self.manager.end_request(self.id);
-    }
 }
 
 #[derive(Clone)]
@@ -1331,6 +1385,10 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 优先级反转开关：默认 false（数值小的优先）；true 时数值大的优先
+    invert_priority: AtomicBool,
+    /// 分组注册表（用于解析分组级负载均衡覆盖）；未注入时回退全局配置
+    group_manager: RwLock<Option<crate::admin::SharedGroupManager>>,
     /// 对话 / MCP 上游域名（运行时可修改）
     api_domain: Mutex<ApiDomain>,
     /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
@@ -1345,8 +1403,10 @@ pub struct MultiTokenManager {
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
     account_rpm_limit: AtomicU32,
-    /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
+    /// 是否识别封禁文案并立即禁用（运行时可修改）
     suspended_detection_enabled: AtomicBool,
+    /// 自定义封禁文案关键词（运行时可修改，大小写不敏感匹配）
+    suspended_ban_keywords: RwLock<Vec<String>>,
     /// 全账号自愈总开关（运行时可修改）
     self_heal_enabled: AtomicBool,
     /// 两次自愈的最小冷却间隔（秒，运行时可修改）
@@ -1355,6 +1415,10 @@ pub struct MultiTokenManager {
     self_heal_max_consecutive_rounds: AtomicU32,
     /// 月度额度重置后自动恢复 QuotaExceeded 凭据（运行时可修改）
     quota_reset_recovery_enabled: AtomicBool,
+    /// 凭据代理自动检测与轮换开关（运行时可修改）
+    proxy_auto_rotate_enabled: AtomicBool,
+    /// 无可用代理时是否回退直连（运行时可修改）
+    proxy_direct_fallback_enabled: AtomicBool,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1369,6 +1433,7 @@ pub struct MultiTokenManager {
     model_cache_generations: Mutex<HashMap<u64, u64>>,
     /// 全局代理变化时递增，阻止所有在途旧请求回填缓存。
     model_cache_epoch: AtomicU64,
+    proxy_generation: AtomicU64,
     /// 测试替身：替换 ListAvailableModels 的上游请求，使模型缓存相关测试不走网络。
     #[cfg(test)]
     test_models_fetcher: Mutex<Option<TestModelsFetcher>>,
@@ -1389,6 +1454,28 @@ const RPM_WINDOW_SECS: u64 = 60;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
+/// 在途请求引用计数守卫
+///
+/// 当凭据被调度选中发起请求时持有该守卫，Drop 时自动递减 `in_flight` 并发计数。
+/// 配合 `Arc<InFlightGuard>` 放入 [`CallContext`] 内，可在多次克隆时共享同一生命周期，
+/// 直到该次请求的所有上下文副本均被释放（包括流式响应全部 chunk 发送完毕）。
+pub struct InFlightGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl InFlightGuard {
+    pub fn new(counter: Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// API 调用上下文
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
@@ -1401,6 +1488,8 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 在途请求守卫（Drop 时自动递减凭据的 in_flight 并发计数）
+    pub _in_flight: Option<Arc<InFlightGuard>>,
 }
 
 pub struct IdcReloginCredentials {
@@ -1425,6 +1514,20 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
     }
 }
 
+/// 计算用于 `min_by_key` 的优先级排序键
+///
+/// 当 invert 为 false 时返回 priority 原值（数值越小越优先）；为 true 时返回
+/// `u32::MAX - priority`（数值越大，计算值越小，因而越优先）。次级比较键（如 id）
+/// 不受影响。
+#[inline]
+pub fn priority_key(priority: u32, invert: bool) -> u32 {
+    if invert {
+        u32::MAX - priority
+    } else {
+        priority
+    }
+}
+
 fn credential_matches_request(
     credentials: &KiroCredentials,
     model: Option<&str>,
@@ -1446,6 +1549,19 @@ fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
+}
+
+/// 规范化自定义封禁关键词：去首尾空白、丢弃空串、去重。
+/// 空串会让 `contains` 恒为真，把每个失败请求都判成封号。
+fn normalize_ban_keywords(keywords: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(keywords.len());
+    for kw in keywords {
+        let kw = kw.trim();
+        if !kw.is_empty() && !out.iter().any(|k| k.eq_ignore_ascii_case(kw)) {
+            out.push(kw.to_string());
+        }
+    }
+    out
 }
 
 impl MultiTokenManager {
@@ -1517,7 +1633,6 @@ impl MultiTokenManager {
                     .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                     .map(|value| value.with_timezone(&Utc));
                 CredentialEntry {
-                    in_flight: 0,
                     id,
                     credentials: cred.clone(),
                     failure_count: 0,
@@ -1533,6 +1648,9 @@ impl MultiTokenManager {
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
                     self_heal_model: cred.self_heal_model.clone(),
+                    in_flight: Arc::new(AtomicU32::new(0)),
+                    current_weight: 0,
+                    proxy_generation: 0,
                 }
             })
             .collect();
@@ -1569,11 +1687,12 @@ impl MultiTokenManager {
             anyhow::bail!("检测到重复的凭据 ID: {:?}", duplicate_ids);
         }
 
-        // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
+        let invert_priority = config.invert_priority;
+        // 选择初始凭据：根据 invert_priority 选择优先级最高（priority 最小或最大）的可用凭据
         let initial_id = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| (e.credentials.priority, e.id))
+            .min_by_key(|e| (priority_key(e.credentials.priority, invert_priority), e.id))
             .map(|e| e.id)
             .unwrap_or(0);
 
@@ -1589,10 +1708,13 @@ impl MultiTokenManager {
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
+        let suspended_ban_keywords = normalize_ban_keywords(config.suspended_ban_keywords.clone());
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let quota_reset_recovery_enabled = config.quota_reset_recovery_enabled;
+        let proxy_auto_rotate_enabled = config.proxy_auto_rotate_enabled;
+        let proxy_direct_fallback_enabled = config.proxy_direct_fallback_enabled;
         let manager = Self {
             max_retries_per_credential: AtomicUsize::new(config.max_retries_per_credential),
             max_total_retries: AtomicUsize::new(config.max_total_retries),
@@ -1608,6 +1730,8 @@ impl MultiTokenManager {
             runtime_config_update_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            invert_priority: AtomicBool::new(invert_priority),
+            group_manager: RwLock::new(None),
             api_domain: Mutex::new(api_domain),
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
@@ -1616,10 +1740,13 @@ impl MultiTokenManager {
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
+            suspended_ban_keywords: RwLock::new(suspended_ban_keywords),
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
             quota_reset_recovery_enabled: AtomicBool::new(quota_reset_recovery_enabled),
+            proxy_auto_rotate_enabled: AtomicBool::new(proxy_auto_rotate_enabled),
+            proxy_direct_fallback_enabled: AtomicBool::new(proxy_direct_fallback_enabled),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             model_cache: Mutex::new(HashMap::new()),
@@ -1627,6 +1754,7 @@ impl MultiTokenManager {
             model_refresh_semaphore: Semaphore::new(4),
             model_cache_generations: Mutex::new(HashMap::new()),
             model_cache_epoch: AtomicU64::new(0),
+            proxy_generation: AtomicU64::new(0),
             #[cfg(test)]
             test_models_fetcher: Mutex::new(None),
         };
@@ -1691,7 +1819,11 @@ impl MultiTokenManager {
 
     /// 设置全局代理配置（运行时修改，可传 None 清除）
     pub fn set_global_proxy(&self, proxy: Option<ProxyConfig>) {
-        *self.proxy.lock() = proxy;
+        {
+            let mut current = self.proxy.lock();
+            *current = proxy;
+            self.proxy_generation.fetch_add(1, Ordering::SeqCst);
+        }
         self.invalidate_all_model_caches();
     }
 
@@ -2141,94 +2273,160 @@ impl MultiTokenManager {
             .any(|entry| self.entry_available_for_request(entry, model, group, now))
     }
 
+    /// 检查指定模型和分组下是否有可用的凭据（不考虑滑动窗口 RPM 限流）。
+    /// 如果全部被自动禁用但满足自愈条件，会自动尝试一次自愈。
+    pub fn has_available_credentials(&self, model: Option<&str>, group: Option<&str>) -> bool {
+        let has_candidate = |entries: &[CredentialEntry]| {
+            entries.iter().any(|entry| {
+                !entry.disabled
+                    && credential_matches_request(&entry.credentials, model, group)
+                    && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
+            })
+        };
+
+        {
+            let entries = self.entries.lock();
+            if has_candidate(&entries) {
+                return true;
+            }
+        }
+
+        if self.try_self_heal(model, group) {
+            let entries = self.entries.lock();
+            return has_candidate(&entries);
+        }
+
+        false
+    }
+
+    /// 获取指定凭据的在途并发计数（测试 / 诊断用）
+    #[allow(dead_code)]
+    pub fn get_in_flight(&self, id: u64) -> u32 {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.in_flight.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// 为指定凭据创建在途请求守卫（成功拿到调用上下文后调用）。
+    fn acquire_in_flight_guard(&self, id: u64) -> Option<InFlightGuard> {
+        let entries = self.entries.lock();
+        let entry = entries.iter().find(|e| e.id == id)?;
+        Some(InFlightGuard::new(Arc::clone(&entry.in_flight)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_context_for_test_guard(&self, id: u64) -> Arc<InFlightGuard> {
+        Arc::new(self.acquire_in_flight_guard(id).unwrap())
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：在可用凭据中均匀随机选择一个
+    /// - priority 模式：选择优先级最高（`priority_key` 最小）的可用凭据
+    /// - balanced 模式：在途并发避让 + SWRR 平滑加权轮询（按 `load_factor` 分配流量）
     ///
     /// 会话粘性由调用方在此之前处理（见 [`Self::sticky_candidate`]），这里只负责
     /// 粘性未命中 / 无会话时的选号。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(
+    #[cfg(test)]
+    pub fn select_next_credential(
         &self,
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
-        self.select_next_credential_excluding(model, group, &HashSet::new())
+        self.select_next_credential_impl(model, group, true, false, &HashSet::new())
+            .map(|(id, credentials, _)| (id, credentials))
     }
 
-    fn select_next_credential_excluding(
+    fn select_next_credential_impl(
         &self,
         model: Option<&str>,
         group: Option<&str>,
+        update_state: bool,
+        claim_in_flight: bool,
         skip: &HashSet<u64>,
-    ) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
+    ) -> Option<(u64, KiroCredentials, Option<Arc<InFlightGuard>>)> {
+        let mut entries = self.entries.lock();
         let now = Instant::now();
-
-        // 过滤可用凭据（已排除模型缓存明确不支持的凭据）
-        let available: Vec<&CredentialEntry> = entries
+        let (mode, invert) = self.resolve_load_balancing_for_group(group);
+        let mut candidates: Vec<(usize, CachedModelSupport)> = entries
             .iter()
-            .filter(|e| {
+            .enumerate()
+            .filter(|(_, e)| {
                 !skip.contains(&e.id) && self.entry_available_for_request(e, model, group, now)
             })
+            .map(|(idx, e)| (idx, self.cached_model_support(e.id, model)))
             .collect();
-
-        if available.is_empty() {
+        if candidates.is_empty() {
             return None;
         }
-
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
-
-        let entry = match mode {
-            "balanced" => {
-                // 均匀随机，不按历史 success_count / 模型缓存状态排序：
-                // - 按 success_count 取最小会让新加入的凭据（计数为 0）独占流量，
-                //   直到追平老凭据的累计值；
-                // - 优先模型缓存 Confirmed 会让缓存为 Unknown 的凭据（运行时新增、
-                //   缓存被清空后）在有 Confirmed 凭据可用时永远选不到，缓存也就永远
-                //   不会因为被使用而变成 Confirmed。
-                available[fastrand::usize(..available.len())]
-            }
-            "priority-balanced" => {
-                // 优先级负载均衡：先取可用集合里最高优先级层（priority 值最小），
-                // 仅在该层内做 least-used 均衡。平局再按 id 保证确定性。
-                // 该层全部不可用时，min(priority) 自动落到下一层，实现逐层降级。
-                let entry = available
+        if matches!(mode.as_str(), "priority-balanced" | "priority-random") {
+            let top = candidates
+                .iter()
+                .map(|(idx, _)| priority_key(entries[*idx].credentials.priority, invert))
+                .min()?;
+            candidates
+                .retain(|(idx, _)| priority_key(entries[*idx].credentials.priority, invert) == top);
+        }
+        let best_idx = match mode.as_str() {
+            "balanced" | "priority-balanced" => {
+                let min_busy = candidates
                     .iter()
-                    .min_by_key(|e| (e.credentials.priority, e.success_count, e.id))?;
-
-                *entry
-            }
-            "priority-random" => {
-                // 优先级随机：先取可用集合里最高优先级层（priority 值最小），
-                // 在该层内随机选择一个账号；该层全部不可用时，min(priority) 自动
-                // 落到下一层，继续在下一层内随机选择，实现逐层随机降级。
-                // 模型缓存预热状态不参与分层或排序，避免随机池压缩为单个账号。
-                // Unsupported 已在 entry_available_for_request 过滤，Unknown 只是尚未
-                // 探测，交给请求本身去发现，失败由 failover 重试兜住。
-                let top_tier = available.iter().map(|e| e.credentials.priority).min()?;
-                let tier: Vec<_> = available
+                    .map(|(idx, _)| entries[*idx].in_flight.load(Ordering::Relaxed))
+                    .min()?;
+                candidates
+                    .retain(|(idx, _)| entries[*idx].in_flight.load(Ordering::Relaxed) == min_busy);
+                let total_weight: i64 = candidates
                     .iter()
-                    .filter(|e| e.credentials.priority == top_tier)
-                    .collect();
-                let entry = tier[fastrand::usize(..tier.len())];
-
-                *entry
+                    .map(|(idx, _)| entries[*idx].credentials.effective_load_factor() as i64)
+                    .sum();
+                if update_state {
+                    for (idx, _) in &candidates {
+                        entries[*idx].current_weight +=
+                            entries[*idx].credentials.effective_load_factor() as i64;
+                    }
+                }
+                let &(idx, _) = candidates.iter().max_by_key(|(idx, support)| {
+                    let e = &entries[*idx];
+                    let weight = e.current_weight
+                        + if update_state {
+                            0
+                        } else {
+                            e.credentials.effective_load_factor() as i64
+                        };
+                    (
+                        weight,
+                        std::cmp::Reverse(usize::from(*support != CachedModelSupport::Confirmed)),
+                        std::cmp::Reverse(priority_key(e.credentials.priority, invert)),
+                        std::cmp::Reverse(e.id),
+                    )
+                })?;
+                if update_state {
+                    entries[idx].current_weight -= total_weight;
+                }
+                idx
             }
+            "priority-random" => candidates[fastrand::usize(..candidates.len())].0,
             _ => {
-                // priority 模式（默认）：严格选择数字最小的有效凭据。
-                // 同优先级按 ID 升序固定顺序，保证后端调度与前端预览一致。
-                available
+                candidates
                     .iter()
-                    .copied()
-                    .min_by_key(|e| (e.credentials.priority, e.id))?
+                    .min_by_key(|(idx, _)| {
+                        (
+                            priority_key(entries[*idx].credentials.priority, invert),
+                            entries[*idx].id,
+                        )
+                    })?
+                    .0
             }
         };
-        Some((entry.id, entry.credentials.clone()))
+        let entry = &entries[best_idx];
+        let guard =
+            claim_in_flight.then(|| Arc::new(InFlightGuard::new(Arc::clone(&entry.in_flight))));
+        Some((entry.id, entry.credentials.clone(), guard))
     }
 
     /// 获取 API 调用上下文
@@ -2368,44 +2566,91 @@ impl MultiTokenManager {
 
         loop {
             if attempt_count >= max_attempts {
-                anyhow::bail!(
+                return Err(NoAvailableCredentialsError::new(format!(
                     "所有凭据均无法获取有效 Token（可用: {}/{}）",
                     self.available_count(),
                     total
-                );
+                ))
+                .into());
             }
 
-            let (id, credentials, is_balanced, route) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() != "priority";
+            let (id, credentials, in_flight, is_balanced, route) = {
+                let (mode, _invert) = self.resolve_load_balancing_for_group(group);
+                let is_balanced = mode.as_str() != "priority";
 
                 // 会话粘性优先：绑定凭据仍可用就沿用，保住上游按账号隔离的 prompt cache。
                 // 粘性未命中时两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
                 // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
                 let (sticky_pick, route) = self.sticky_candidate(session, model, group, skip);
                 let mut best = sticky_pick
-                    .or_else(|| self.select_next_credential_excluding(model, group, skip));
+                    .map(|(id, credentials)| {
+                        let guard = if update_current {
+                            self.acquire_in_flight_guard(id).map(Arc::new)
+                        } else {
+                            None
+                        };
+                        (id, credentials, guard)
+                    })
+                    .or_else(|| {
+                        self.select_next_credential_impl(
+                            model,
+                            group,
+                            update_current,
+                            update_current,
+                            skip,
+                        )
+                    });
 
                 // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                 // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
                 if best.is_none() && skip.is_empty() && self.try_self_heal(model, group) {
-                    best = self.select_next_credential_excluding(model, group, skip);
+                    best = self.select_next_credential_impl(
+                        model,
+                        group,
+                        update_current,
+                        update_current,
+                        skip,
+                    );
                 }
 
-                let (id, credentials) = if let Some((new_id, new_creds)) = best {
+                let (id, credentials, in_flight) = if let Some((new_id, new_creds, guard)) = best {
                     if update_current {
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
                     }
-                    (new_id, new_creds)
+                    (new_id, new_creds, guard)
                 } else {
                     if !skip.is_empty() {
                         anyhow::bail!("本次请求的凭据尝试预算已耗尽");
                     }
                     let entries = self.entries.lock();
                     // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
-                    // 让调用方知道这是限流而不是凭据耗尽。
+                    // 让调用方知道这是限流而不是凭据耗尽；标成本地限流，trace 和日志里不算上游 429。
                     if let Some(retry_after) =
                         self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                    {
+                        return Err(UpstreamRateLimitError::local_rpm_limit(retry_after).into());
+                    }
+                    let now = Instant::now();
+                    if let Some(retry_after) = entries
+                        .iter()
+                        .filter(|entry| {
+                            !entry.disabled
+                                && credential_matches_request(&entry.credentials, model, group)
+                                && self.cached_model_support(entry.id, model)
+                                    != CachedModelSupport::Unsupported
+                        })
+                        .filter_map(|entry| {
+                            entry
+                                .throttled_until
+                                .and_then(|until| until.checked_duration_since(now))
+                        })
+                        .map(|duration| {
+                            duration
+                                .as_secs()
+                                .saturating_add(u64::from(duration.subsec_nanos() > 0))
+                        })
+                        .min()
                     {
                         return Err(
                             UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
@@ -2415,30 +2660,43 @@ impl MultiTokenManager {
                     // 因为 available_count() 会尝试获取 entries 锁，
                     // 而此时我们已经持有该锁，会导致死锁
                     let available = entries.iter().filter(|e| !e.disabled).count();
-                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                    return Err(NoAvailableCredentialsError::new(format!(
+                        "所有凭据均已禁用（{}/{}）",
+                        available, total
+                    ))
+                    .into());
                 };
 
-                (id, credentials, is_balanced, route)
+                (id, credentials, in_flight, is_balanced, route)
             };
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
+                Ok(mut ctx) => {
                     // 仅真实业务请求计入 RPM 窗口；Admin 只读模型发现不消耗额度。
                     if update_current && !self.record_request(id) {
                         // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
                         continue;
                     }
+                    ctx._in_flight = in_flight;
                     return Ok((ctx, is_balanced, route));
                 }
                 Err(e) => {
+                    if e.is::<RefreshSupersededError>() {
+                        attempt_count += 1;
+                        continue;
+                    }
                     let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
                         // 从源文件加载到了轮换后的 Token，不计失败次数，直接重试。
                         continue;
                     };
                     attempt_count += 1;
                     if !has_available {
-                        anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                        return Err(NoAvailableCredentialsError::new(format!(
+                            "所有凭据均已禁用（0/{}）",
+                            total
+                        ))
+                        .into());
                     }
                 }
             }
@@ -2481,11 +2739,15 @@ impl MultiTokenManager {
         let mut current_id = self.current_id.lock();
 
         // 选择优先级最高的未禁用凭据（不排除当前凭据）
-        if let Some(best) = entries
-            .iter()
-            .filter(|e| !e.disabled)
-            .min_by_key(|e| (e.credentials.priority, e.id))
-        {
+        if let Some(best) = entries.iter().filter(|e| !e.disabled).min_by_key(|e| {
+            (
+                priority_key(
+                    e.credentials.priority,
+                    self.invert_priority.load(Ordering::Relaxed),
+                ),
+                e.id,
+            )
+        }) {
             if best.id != *current_id {
                 tracing::info!(
                     "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
@@ -2520,6 +2782,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                _in_flight: None,
             });
         }
 
@@ -2551,20 +2814,26 @@ impl MultiTokenManager {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
                 }
 
-                // 更新凭据
-                {
+                let merged = {
                     let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
-                }
+                    let entry = entries
+                        .iter_mut()
+                        .find(|entry| entry.id == id)
+                        .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                    merge_refreshed_credentials(
+                        &mut entry.credentials,
+                        &current_creds,
+                        &new_creds,
+                    )?;
+                    entry.credentials.clone()
+                };
 
                 // 回写凭据到文件（仅多凭据格式），失败只记录警告
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
                 }
 
-                new_creds
+                merged
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
                 tracing::debug!("Token 已被其他请求刷新，跳过刷新");
@@ -2590,6 +2859,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            _in_flight: None,
         })
     }
 
@@ -2604,17 +2874,14 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
         // 仅多凭据格式才回写
         if !self.is_multiple_format.load(Ordering::Relaxed) {
             return Ok(false);
         }
 
-        let path = match &self.credentials_path {
-            Some(p) => p,
-            None => return Ok(false),
-        };
+        if self.credentials_path.is_none() {
+            return Ok(false);
+        }
 
         // 持 persist_lock 覆盖「快照 + 序列化 + 写盘」整个临界区：并发 persist 严格串行，
         // 最后写盘者必在其临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token
@@ -2629,6 +2896,21 @@ impl MultiTokenManager {
                 .iter()
                 .map(CredentialEntry::credentials_snapshot)
                 .collect()
+        };
+
+        self.persist_credentials_snapshot(&credentials)
+    }
+
+    fn persist_credentials_snapshot(
+        &self,
+        credentials: &[KiroCredentials],
+    ) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        if !self.is_multiple_format.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let Some(path) = &self.credentials_path else {
+            return Ok(false);
         };
 
         // 序列化为 pretty JSON
@@ -2972,7 +3254,15 @@ impl MultiTokenManager {
                     .filter(|entry| {
                         self.entry_available_for_request(entry, model, group, Instant::now())
                     })
-                    .min_by_key(|e| (e.credentials.priority, e.id))
+                    .min_by_key(|e| {
+                        (
+                            priority_key(
+                                e.credentials.priority,
+                                self.invert_priority.load(Ordering::Relaxed),
+                            ),
+                            e.id,
+                        )
+                    })
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -3047,7 +3337,15 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| (e.credentials.priority, e.id))
+                .min_by_key(|e| {
+                    (
+                        priority_key(
+                            e.credentials.priority,
+                            self.invert_priority.load(Ordering::Relaxed),
+                        ),
+                        e.id,
+                    )
+                })
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3068,9 +3366,78 @@ impl MultiTokenManager {
         result
     }
 
-    /// 是否启用 403 封禁文案识别（provider 调用，决定 403 是否走 report_suspended）。
+    /// 批量将指定凭据标记为封禁（Suspended）
+    ///
+    /// 遍历指定凭据列表，将其 disabled 置为 true，disabled_reason 置为 Suspended，
+    /// 清空自愈连击并设 failure_count 为最大值。
+    /// 若当前选中的凭据被标记，自动切换到下一个可用凭据。
+    /// 最后持久化保存凭据到磁盘。
+    /// 返回本次实际被变更（此前不是 Suspended）的凭据 ID 列表。
+    pub fn batch_mark_suspended(&self, ids: &[u64]) -> anyhow::Result<Vec<u64>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut updated = Vec::new();
+        let mut switch_needed = false;
+        {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+            for &id in ids {
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    if entry.disabled && entry.disabled_reason == Some(DisabledReason::Suspended) {
+                        continue;
+                    }
+                    entry.disabled = true;
+                    entry.disabled_reason = Some(DisabledReason::Suspended);
+                    entry.clear_self_heal_streak();
+                    entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+                    entry.last_used_at = Some(Utc::now().to_rfc3339());
+                    updated.push(id);
+                    if *current_id == id {
+                        switch_needed = true;
+                    }
+                }
+            }
+            if switch_needed {
+                let now = Instant::now();
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|entry| self.entry_available_for_request(entry, None, None, now))
+                    .min_by_key(|e| (e.credentials.priority, e.id))
+                {
+                    *current_id = next.id;
+                    tracing::info!("封号排查：当前凭据已被封禁，已切换到凭据 #{}", next.id);
+                }
+            }
+        }
+        if !updated.is_empty() {
+            self.persist_credentials()?;
+            self.save_stats_debounced();
+        }
+        Ok(updated)
+    }
+
+    /// 是否启用封禁文案识别（provider 调用，决定是否走 report_suspended）。
     pub fn get_suspended_detection_enabled(&self) -> bool {
         self.suspended_detection_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 获取自定义封禁关键词列表（Admin API 读取用）。
+    pub fn get_suspended_ban_keywords(&self) -> Vec<String> {
+        self.suspended_ban_keywords.read().clone()
+    }
+
+    /// 检查响应体是否命中任一自定义封禁关键词（大小写不敏感）。
+    pub fn matches_suspended_ban_keywords(&self, body: &str) -> bool {
+        let keywords = self.suspended_ban_keywords.read();
+        if keywords.is_empty() {
+            return false;
+        }
+        let lower = body.to_ascii_lowercase();
+        keywords
+            .iter()
+            .filter(|kw| !kw.is_empty())
+            .any(|kw| lower.contains(&kw.to_ascii_lowercase()))
     }
 
     /// 受控的凭据自愈。
@@ -3215,7 +3582,15 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| (e.credentials.priority, e.id))
+                .min_by_key(|e| {
+                    (
+                        priority_key(
+                            e.credentials.priority,
+                            self.invert_priority.load(Ordering::Relaxed),
+                        ),
+                        e.id,
+                    )
+                })
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3278,11 +3653,16 @@ impl MultiTokenManager {
                     refresh_failure_count
                 );
 
-                let has_available = if let Some(next) = entries
-                    .iter()
-                    .filter(|e| !e.disabled)
-                    .min_by_key(|e| (e.credentials.priority, e.id))
-                {
+                let has_available = if let Some(next) =
+                    entries.iter().filter(|e| !e.disabled).min_by_key(|e| {
+                        (
+                            priority_key(
+                                e.credentials.priority,
+                                self.invert_priority.load(Ordering::Relaxed),
+                            ),
+                            e.id,
+                        )
+                    }) {
                     *current_id = next.id;
                     tracing::info!(
                         "已切换到凭据 #{}（优先级 {}）",
@@ -3334,11 +3714,15 @@ impl MultiTokenManager {
                 id
             );
 
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| (e.credentials.priority, e.id))
-            {
+            if let Some(next) = entries.iter().filter(|e| !e.disabled).min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            }) {
                 *current_id = next.id;
                 tracing::info!(
                     "已切换到凭据 #{}（优先级 {}）",
@@ -3369,7 +3753,15 @@ impl MultiTokenManager {
         if let Some(next) = entries
             .iter()
             .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| (e.credentials.priority, e.id))
+            .min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            })
         {
             *current_id = next.id;
             tracing::info!(
@@ -3424,26 +3816,6 @@ impl MultiTokenManager {
                 .as_deref()
                 == Some(api_key_hash.as_str())
         })
-    }
-
-    pub fn begin_request(self: &Arc<Self>, id: u64) -> RequestGuard {
-        {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.in_flight = entry.in_flight.saturating_add(1);
-            }
-        }
-        RequestGuard {
-            manager: Arc::clone(self),
-            id,
-        }
-    }
-
-    fn end_request(&self, id: u64) {
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            entry.in_flight = entry.in_flight.saturating_sub(1);
-        }
     }
 
     pub fn get_max_retries_per_credential(&self) -> usize {
@@ -3518,13 +3890,17 @@ impl MultiTokenManager {
             .count();
 
         ManagerSnapshot {
-            active_concurrency: entries.iter().map(|e| e.in_flight as u64).sum(),
+            active_concurrency: entries
+                .iter()
+                .map(|e| e.in_flight.load(Ordering::Relaxed) as u64)
+                .sum(),
             entries: entries
                 .iter()
                 .map(|e| CredentialEntrySnapshot {
-                    in_flight: e.in_flight,
+                    in_flight: e.in_flight.load(Ordering::Relaxed),
                     id: e.id,
                     priority: e.credentials.priority,
+                    load_factor: e.credentials.effective_load_factor(),
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
@@ -3572,6 +3948,7 @@ impl MultiTokenManager {
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
+                    proxy_temporary_direct: e.credentials.proxy_temporary_direct,
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|reason| reason.as_str().to_string()),
@@ -3601,6 +3978,7 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
             entry.disabled = disabled;
             if !disabled {
                 // 启用时重置失败计数
@@ -3801,11 +4179,13 @@ impl MultiTokenManager {
                         .find(|e| e.id == target_id)
                         .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", target_id))?;
                     entry.success_count = 0;
+                    entry.current_weight = 0;
                     count = 1;
                 }
                 None => {
                     for entry in entries.iter_mut() {
                         entry.success_count = 0;
+                        entry.current_weight = 0;
                         count += 1;
                     }
                 }
@@ -3922,9 +4302,15 @@ impl MultiTokenManager {
                             .await?;
                     {
                         let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
+                        let entry = entries
+                            .iter_mut()
+                            .find(|entry| entry.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                        merge_refreshed_credentials(
+                            &mut entry.credentials,
+                            &current_creds,
+                            &new_creds,
+                        )?;
                     }
                     // 持久化失败只记录警告，不影响本次请求
                     if let Err(e) = self.persist_credentials() {
@@ -4071,9 +4457,15 @@ impl MultiTokenManager {
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
                 {
                     let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
+                    let entry = entries
+                        .iter_mut()
+                        .find(|entry| entry.id == id)
+                        .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                    merge_refreshed_credentials(
+                        &mut entry.credentials,
+                        &current_creds,
+                        &new_creds,
+                    )?;
                 }
                 // 持久化失败只记录警告，不影响本次请求
                 if let Err(e) = self.persist_credentials() {
@@ -4186,9 +4578,15 @@ impl MultiTokenManager {
                             .await?;
                     {
                         let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
+                        let entry = entries
+                            .iter_mut()
+                            .find(|entry| entry.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                        merge_refreshed_credentials(
+                            &mut entry.credentials,
+                            &current_creds,
+                            &new_creds,
+                        )?;
                     }
                     if let Err(e) = self.persist_credentials() {
                         tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
@@ -4402,7 +4800,6 @@ impl MultiTokenManager {
                 }
             }
             entries.push(CredentialEntry {
-                in_flight: 0,
                 id: new_id,
                 credentials: validated_cred,
                 failure_count: 0,
@@ -4418,6 +4815,9 @@ impl MultiTokenManager {
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
                 self_heal_model: None,
+                in_flight: Arc::new(AtomicU32::new(0)),
+                current_weight: 0,
+                proxy_generation: 0,
             });
         }
 
@@ -4452,6 +4852,7 @@ impl MultiTokenManager {
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
         metadata: Option<crate::kiro::model::credentials::CredentialMetadata>,
+        load_factor: Option<u32>,
     ) -> anyhow::Result<()> {
         let invalidate_models =
             proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
@@ -4462,11 +4863,20 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
 
+            if invalidate_models {
+                entry.proxy_generation = entry.proxy_generation.wrapping_add(1);
+                entry.credentials.proxy_temporary_direct = false;
+                entry.credentials.proxy_auto_assigned = false;
+            }
+
             if let Some(v) = email {
                 entry.credentials.email = v.filter(|s| !s.is_empty());
             }
             if let Some(v) = proxy_url {
                 entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
+                // 手动改代理视为用户接管：清除自动轮换标记，避免后续自动轮换
+                // 把该凭据当成「自己写进去的」而回收改写
+                entry.credentials.proxy_auto_assigned = false;
             }
             if let Some(v) = proxy_username {
                 entry.credentials.proxy_username = v.filter(|s| !s.is_empty());
@@ -4487,6 +4897,10 @@ impl MultiTokenManager {
             }
             if let Some(v) = metadata {
                 entry.credentials.metadata = v;
+            }
+            if let Some(lf) = load_factor {
+                entry.credentials.load_factor = lf.max(1);
+                entry.current_weight = 0;
             }
         }
         if invalidate_models {
@@ -4785,10 +5199,12 @@ impl MultiTokenManager {
 
             // 更新 entries 中对应凭据
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
-                entry.refresh_failure_count = 0;
-            }
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+            merge_refreshed_credentials(&mut entry.credentials, &credentials, &new_creds)?;
+            entry.refresh_failure_count = 0;
         }
         self.invalidate_model_cache(id);
 
@@ -4827,38 +5243,110 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
-        let mode = mode.to_string();
-        self.update_config_file(move |config| config.load_balancing_mode = mode)
+    /// 注入分组注册表，用于解析分组级负载均衡覆盖。
+    pub fn set_group_manager(&self, group_manager: crate::admin::SharedGroupManager) {
+        let mut gm = self.group_manager.write();
+        *gm = Some(group_manager);
+    }
+
+    /// 解析指定请求分组的负载均衡模式与优先级反转配置。
+    ///
+    /// 分组有独立配置则使用分组级覆盖，否则回退到全局配置。
+    pub fn resolve_load_balancing_for_group(&self, group: Option<&str>) -> (String, bool) {
+        let global_mode = self.load_balancing_mode.lock().clone();
+        let global_invert = self.invert_priority.load(Ordering::Relaxed);
+        let Some(g) = group else {
+            return (global_mode, global_invert);
+        };
+        if let Some(mgr) = self.group_manager.read().as_ref() {
+            let (group_mode, group_invert) = mgr.resolve_load_balancing(g);
+            let mode = group_mode.unwrap_or(global_mode);
+            let invert = group_invert.unwrap_or(global_invert);
+            (mode, invert)
+        } else {
+            (global_mode, global_invert)
+        }
+    }
+
+    /// 获取优先级反转设置（Admin API）
+    pub fn get_invert_priority(&self) -> bool {
+        self.invert_priority.load(Ordering::Relaxed)
     }
 
     /// 设置负载均衡模式（Admin API）
+    #[allow(dead_code)]
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        // 验证模式值
+        self.update_load_balancing_settings(Some(&mode), None)
+    }
+
+    /// 设置优先级反转（Admin API）
+    #[allow(dead_code)]
+    pub fn set_invert_priority(&self, invert: bool) -> anyhow::Result<()> {
+        self.update_load_balancing_settings(None, Some(invert))
+    }
+
+    /// 统一更新负载均衡设置（模式与优先级反转），运行时生效并持久化。
+    pub fn update_load_balancing_settings(
+        &self,
+        mode: Option<&str>,
+        invert_priority: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let prev_mode = self.get_load_balancing_mode();
+        let prev_invert = self.get_invert_priority();
+
+        let new_mode = mode
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| prev_mode.clone());
         if !matches!(
-            mode.as_str(),
+            new_mode.as_str(),
             "priority" | "balanced" | "priority-balanced" | "priority-random"
         ) {
-            anyhow::bail!("无效的负载均衡模式: {}", mode);
+            anyhow::bail!("无效的负载均衡模式: {}", new_mode);
         }
+        let new_invert = invert_priority.unwrap_or(prev_invert);
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
+        if new_mode == prev_mode && new_invert == prev_invert {
             return Ok(());
         }
 
-        *self.load_balancing_mode.lock() = mode.clone();
+        *self.load_balancing_mode.lock() = new_mode.clone();
+        self.invert_priority.store(new_invert, Ordering::Relaxed);
 
-        if let Err(err) = self.persist_load_balancing_mode(&mode) {
-            *self.load_balancing_mode.lock() = previous_mode;
+        let nm = new_mode.clone();
+        if let Err(err) = self.update_config_file(move |config| {
+            config.load_balancing_mode = nm;
+            config.invert_priority = new_invert;
+        }) {
+            *self.load_balancing_mode.lock() = prev_mode;
+            self.invert_priority.store(prev_invert, Ordering::Relaxed);
             return Err(err);
         }
 
-        if mode == "priority" {
-            self.select_highest_priority();
-        }
+        self.select_highest_priority();
 
-        tracing::info!("负载均衡模式已设置为: {}", mode);
+        tracing::info!(
+            "负载均衡配置已更新: mode={}, invert_priority={}",
+            new_mode,
+            new_invert
+        );
+        Ok(())
+    }
+
+    /// 设置凭据负载因子（均衡模式下的调度权重，>= 1，Admin API）
+    pub fn set_load_factor(&self, id: u64, load_factor: u32) -> anyhow::Result<()> {
+        let val = load_factor.max(1);
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.load_factor = val;
+            entry.current_weight = 0;
+        }
+        self.persist_credentials()?;
         Ok(())
     }
 
@@ -5107,6 +5595,7 @@ impl MultiTokenManager {
     pub fn set_self_heal_config(
         &self,
         suspended_detection_enabled: Option<bool>,
+        suspended_ban_keywords: Option<Vec<String>>,
         self_heal_enabled: Option<bool>,
         self_heal_min_interval_secs: Option<u64>,
         self_heal_max_consecutive_rounds: Option<u32>,
@@ -5127,12 +5616,17 @@ impl MultiTokenManager {
         let _update_guard = self.runtime_config_update_lock.lock();
 
         let prev = self.get_self_heal_config();
+        let prev_keywords = self.get_suspended_ban_keywords();
         let new_suspend_detect = suspended_detection_enabled.unwrap_or(prev.0);
+        let new_keywords = suspended_ban_keywords
+            .map(normalize_ban_keywords)
+            .unwrap_or_else(|| prev_keywords.clone());
         let new_enabled = self_heal_enabled.unwrap_or(prev.1);
         let new_interval = self_heal_min_interval_secs.unwrap_or(prev.2);
         let new_max_rounds = self_heal_max_consecutive_rounds.unwrap_or(prev.3);
 
         if new_suspend_detect == prev.0
+            && new_keywords == prev_keywords
             && new_enabled == prev.1
             && new_interval == prev.2
             && new_max_rounds == prev.3
@@ -5142,6 +5636,7 @@ impl MultiTokenManager {
 
         self.suspended_detection_enabled
             .store(new_suspend_detect, Ordering::Relaxed);
+        *self.suspended_ban_keywords.write() = new_keywords.clone();
         self.self_heal_enabled.store(new_enabled, Ordering::Relaxed);
         self.self_heal_min_interval_secs
             .store(new_interval, Ordering::Relaxed);
@@ -5150,6 +5645,7 @@ impl MultiTokenManager {
 
         if let Err(err) = self.persist_self_heal_config(
             new_suspend_detect,
+            new_keywords.clone(),
             new_enabled,
             new_interval,
             new_max_rounds,
@@ -5157,6 +5653,7 @@ impl MultiTokenManager {
             // 回滚内存值
             self.suspended_detection_enabled
                 .store(prev.0, Ordering::Relaxed);
+            *self.suspended_ban_keywords.write() = prev_keywords;
             self.self_heal_enabled.store(prev.1, Ordering::Relaxed);
             self.self_heal_min_interval_secs
                 .store(prev.2, Ordering::Relaxed);
@@ -5166,8 +5663,9 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "自愈治理配置已更新: suspended_detection_enabled={}, self_heal_enabled={}, min_interval_secs={}, max_rounds={}",
+            "自愈治理配置已更新: suspended_detection_enabled={}, suspended_ban_keywords={:?}, self_heal_enabled={}, min_interval_secs={}, max_rounds={}",
             new_suspend_detect,
+            new_keywords,
             new_enabled,
             new_interval,
             new_max_rounds
@@ -5178,16 +5676,196 @@ impl MultiTokenManager {
     fn persist_self_heal_config(
         &self,
         suspended_detection_enabled: bool,
+        suspended_ban_keywords: Vec<String>,
         self_heal_enabled: bool,
         self_heal_min_interval_secs: u64,
         self_heal_max_consecutive_rounds: u32,
     ) -> anyhow::Result<()> {
         self.update_config_file(move |config| {
             config.suspended_detection_enabled = suspended_detection_enabled;
+            config.suspended_ban_keywords = suspended_ban_keywords;
             config.self_heal_enabled = self_heal_enabled;
             config.self_heal_min_interval_secs = self_heal_min_interval_secs;
             config.self_heal_max_consecutive_rounds = self_heal_max_consecutive_rounds;
         })
+    }
+
+    /// 读取代理故障转移配置（Admin API）。
+    ///
+    /// 返回：(自动检测与轮换开关, 无可用代理时回退直连开关)。
+    pub fn get_proxy_failover_config(&self) -> (bool, bool) {
+        (
+            self.proxy_auto_rotate_enabled.load(Ordering::Relaxed),
+            self.proxy_direct_fallback_enabled.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 更新代理故障转移配置（Admin API）。任一参数传 `None` 表示不修改该字段。
+    ///
+    /// 运行时立即生效并持久化到 config.json。持久化失败时回滚内存值。
+    pub fn set_proxy_failover_config(
+        &self,
+        auto_rotate_enabled: Option<bool>,
+        direct_fallback_enabled: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_rotate, prev_fallback) = self.get_proxy_failover_config();
+        let new_rotate = auto_rotate_enabled.unwrap_or(prev_rotate);
+        let new_fallback = direct_fallback_enabled.unwrap_or(prev_fallback);
+
+        if new_rotate == prev_rotate && new_fallback == prev_fallback {
+            return Ok(());
+        }
+
+        self.proxy_auto_rotate_enabled
+            .store(new_rotate, Ordering::Relaxed);
+        self.proxy_direct_fallback_enabled
+            .store(new_fallback, Ordering::Relaxed);
+
+        if let Err(err) = self.update_config_file(move |config| {
+            config.proxy_auto_rotate_enabled = new_rotate;
+            config.proxy_direct_fallback_enabled = new_fallback;
+        }) {
+            self.proxy_auto_rotate_enabled
+                .store(prev_rotate, Ordering::Relaxed);
+            self.proxy_direct_fallback_enabled
+                .store(prev_fallback, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "代理故障转移配置已更新: auto_rotate_enabled={}, direct_fallback_enabled={}",
+            new_rotate,
+            new_fallback
+        );
+        Ok(())
+    }
+
+    /// 导出各凭据的代理使用状态（代理自动检测与轮换专用）。
+    ///
+    /// `in_use_proxy_url` 已按「凭据代理 > 全局代理 > 直连」的优先级折算，调用方
+    /// 无需再关心回退规则。
+    pub fn credential_proxy_snapshot(&self) -> Vec<CredentialProxySnapshot> {
+        let (global_proxy, global_generation) = {
+            let proxy = self.proxy.lock();
+            (proxy.clone(), self.proxy_generation.load(Ordering::SeqCst))
+        };
+        self.entries
+            .lock()
+            .iter()
+            .map(|entry| CredentialProxySnapshot {
+                id: entry.id,
+                in_use_proxy_url: entry
+                    .credentials
+                    .effective_proxy(global_proxy.as_ref())
+                    .map(|proxy| proxy.url),
+                in_use_proxy: entry.credentials.effective_proxy(global_proxy.as_ref()),
+                recovery_proxy: entry
+                    .credentials
+                    .proxy_temporary_direct
+                    .then(|| entry.credentials.configured_proxy(global_proxy.as_ref()))
+                    .flatten(),
+                temporary_direct: entry.credentials.proxy_temporary_direct,
+                generation: entry.proxy_generation,
+                global_generation,
+                explicit_direct: entry.credentials.is_explicit_direct()
+                    || entry.credentials.proxy_temporary_direct,
+                auto_assigned: entry.credentials.proxy_auto_assigned,
+                disabled: entry.disabled,
+            })
+            .collect()
+    }
+
+    /// 批量改写凭据的 `proxy_url` 并置位 `proxy_auto_assigned`（代理自动轮换专用）。
+    ///
+    /// 先校验快照版本，再在同一事务内更新并持久化；写盘失败时恢复原始配置。
+    /// `direct` 保留原代理和认证信息，`None` 在临时直连时恢复原代理。
+    pub fn apply_proxy_rotation(&self, updates: &[ProxyRotationUpdate]) -> anyhow::Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut changed_ids = Vec::new();
+        let _persist_guard = self.persist_lock.lock();
+        let _global_proxy_guard = self.proxy.lock();
+        let mut entries = self.entries.lock();
+        for update in updates {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == update.id)
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已不存在", update.id))?;
+            if entry.disabled
+                || entry.proxy_generation != update.generation
+                || self.proxy_generation.load(Ordering::SeqCst) != update.global_generation
+            {
+                anyhow::bail!("凭据 #{} 或全局代理已变化，请重新执行轮换", update.id);
+            }
+        }
+        let mut previous = Vec::new();
+        for update in updates {
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == update.id) else {
+                continue;
+            };
+            let normalized = update.target.clone().filter(|value| !value.is_empty());
+            let fallback = normalized.as_deref() == Some(KiroCredentials::PROXY_DIRECT);
+            let restore = normalized.is_none() && entry.credentials.proxy_temporary_direct;
+            let unchanged = if fallback {
+                entry.credentials.proxy_temporary_direct
+            } else {
+                !restore
+                    && !entry.credentials.proxy_temporary_direct
+                    && entry.credentials.proxy_url == normalized
+                    && entry.credentials.proxy_auto_assigned
+                    && entry.credentials.proxy_username.is_none()
+                    && entry.credentials.proxy_password.is_none()
+            };
+            if unchanged {
+                continue;
+            }
+            previous.push((update.id, entry.credentials.clone()));
+            if fallback {
+                entry.credentials.proxy_temporary_direct = true;
+                entry.credentials.proxy_auto_assigned = true;
+            } else if restore {
+                entry.credentials.proxy_temporary_direct = false;
+                entry.credentials.proxy_auto_assigned = false;
+            } else {
+                entry.credentials.proxy_url = normalized;
+                entry.credentials.proxy_username = None;
+                entry.credentials.proxy_password = None;
+                entry.credentials.proxy_auto_assigned = true;
+                entry.credentials.proxy_temporary_direct = false;
+            }
+            changed_ids.push(update.id);
+        }
+
+        if changed_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let credentials: Vec<_> = entries
+            .iter()
+            .map(CredentialEntry::credentials_snapshot)
+            .collect();
+        if let Err(error) = self.persist_credentials_snapshot(&credentials) {
+            for (id, credentials) in previous.into_iter().rev() {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                    entry.credentials = credentials;
+                }
+            }
+            return Err(error);
+        }
+        for id in &changed_ids {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == *id) {
+                entry.proxy_generation = entry.proxy_generation.wrapping_add(1);
+            }
+        }
+        drop(entries);
+        for id in &changed_ids {
+            self.invalidate_model_cache(*id);
+        }
+        Ok(changed_ids.len())
     }
 }
 
@@ -5203,6 +5881,207 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn refresh_merge_preserves_concurrent_proxy_changes() {
+        let original = KiroCredentials {
+            refresh_token: Some("old-refresh".into()),
+            access_token: Some("old-access".into()),
+            proxy_url: Some("http://localhost:1234".into()),
+            proxy_username: Some("user".into()),
+            proxy_password: Some("password".into()),
+            ..Default::default()
+        };
+        let mut refreshed = original.clone();
+        refreshed.access_token = Some("new-access".into());
+        refreshed.refresh_token = Some("new-refresh".into());
+        let mut current = original.clone();
+        current.proxy_temporary_direct = true;
+        current.email = Some("updated@example.test".into());
+        merge_refreshed_credentials(&mut current, &original, &refreshed).unwrap();
+        assert!(current.proxy_temporary_direct);
+        assert_eq!(current.proxy_password.as_deref(), Some("password"));
+        assert_eq!(current.email.as_deref(), Some("updated@example.test"));
+        assert_eq!(current.access_token.as_deref(), Some("new-access"));
+        assert_eq!(current.refresh_token.as_deref(), Some("new-refresh"));
+
+        let mut replaced = original.clone();
+        replaced.refresh_token = Some("manually-replaced".into());
+        assert!(merge_refreshed_credentials(&mut replaced, &original, &refreshed).is_err());
+        assert_eq!(replaced.refresh_token.as_deref(), Some("manually-replaced"));
+        assert_eq!(replaced.access_token.as_deref(), Some("old-access"));
+    }
+
+    #[tokio::test]
+    async fn active_guard_remains_valid_during_health_reset() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("review-dummy-token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let context = manager.acquire_context(None, None).await.unwrap();
+        let credential_id = context.id;
+        assert_eq!(manager.get_in_flight(credential_id), 1);
+        manager.reset_and_enable(credential_id).unwrap();
+        assert_eq!(manager.get_in_flight(credential_id), 1);
+        drop(context);
+        assert_eq!(manager.get_in_flight(credential_id), 0);
+    }
+
+    #[test]
+    fn balanced_selection_claims_credential_before_releasing_lock() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let (first, _, first_guard) = manager
+            .select_next_credential_impl(None, None, true, true, &HashSet::new())
+            .unwrap();
+        let (second, _, second_guard) = manager
+            .select_next_credential_impl(None, None, true, true, &HashSet::new())
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(manager.get_in_flight(first), 1);
+        drop(first_guard);
+        drop(second_guard);
+        assert_eq!(manager.get_in_flight(first), 0);
+    }
+
+    #[test]
+    fn proxy_rotation_persistence_failure_restores_original_configuration() {
+        let credential = KiroCredentials {
+            id: Some(1),
+            machine_id: Some("0".repeat(64)),
+            proxy_url: Some("http://localhost:1234".into()),
+            proxy_username: Some("test-user".into()),
+            proxy_password: Some("test-password".into()),
+            ..Default::default()
+        };
+        let path = std::env::temp_dir()
+            .join(format!("missing-{}", uuid::Uuid::new_v4()))
+            .join("credentials.json");
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, Some(path), true)
+                .unwrap();
+        let snapshot = manager.credential_proxy_snapshot().remove(0);
+        let update = ProxyRotationUpdate {
+            id: 1,
+            target: Some(KiroCredentials::PROXY_DIRECT.to_string()),
+            generation: snapshot.generation,
+            global_generation: snapshot.global_generation,
+        };
+        assert!(manager.apply_proxy_rotation(&[update]).is_err());
+        let restored = manager.clone_credential(1).unwrap();
+        assert_eq!(restored.proxy_url.as_deref(), Some("http://localhost:1234"));
+        assert_eq!(restored.proxy_username.as_deref(), Some("test-user"));
+        assert_eq!(restored.proxy_password.as_deref(), Some("test-password"));
+        assert!(!restored.proxy_temporary_direct);
+    }
+
+    #[test]
+    fn temporary_direct_preserves_authentication_for_recovery_and_restart() {
+        let credential = KiroCredentials {
+            id: Some(1),
+            proxy_url: Some("http://localhost:1234".into()),
+            proxy_username: Some("test-user".into()),
+            proxy_password: Some("test-password".into()),
+            ..Default::default()
+        };
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        let snapshot = manager.credential_proxy_snapshot().remove(0);
+        manager
+            .apply_proxy_rotation(&[ProxyRotationUpdate {
+                id: 1,
+                target: Some(KiroCredentials::PROXY_DIRECT.to_string()),
+                generation: snapshot.generation,
+                global_generation: snapshot.global_generation,
+            }])
+            .unwrap();
+        let snapshot = manager.credential_proxy_snapshot().remove(0);
+        assert!(snapshot.temporary_direct);
+        assert!(snapshot.in_use_proxy.is_none());
+        assert_eq!(
+            snapshot.recovery_proxy.unwrap().username.as_deref(),
+            Some("test-user")
+        );
+        let persisted = serde_json::to_string(&manager.clone_credential(1).unwrap()).unwrap();
+        let reloaded: KiroCredentials = serde_json::from_str(&persisted).unwrap();
+        assert!(reloaded.effective_proxy(None).is_none());
+        assert_eq!(
+            reloaded.configured_proxy(None).unwrap().password.as_deref(),
+            Some("test-password")
+        );
+        let snapshot = manager.credential_proxy_snapshot().remove(0);
+        manager
+            .apply_proxy_rotation(&[ProxyRotationUpdate {
+                id: 1,
+                target: None,
+                generation: snapshot.generation,
+                global_generation: snapshot.global_generation,
+            }])
+            .unwrap();
+        let restored = manager.clone_credential(1).unwrap();
+        assert_eq!(
+            restored.effective_proxy(None).unwrap().username.as_deref(),
+            Some("test-user")
+        );
+        assert!(!restored.proxy_temporary_direct);
+    }
+
+    #[test]
+    fn proxy_rotation_rejects_stale_manual_or_global_proxy_updates() {
+        let credential = KiroCredentials {
+            id: Some(1),
+            proxy_url: Some("http://localhost:1234".into()),
+            ..Default::default()
+        };
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        let original = manager.credential_proxy_snapshot().remove(0);
+        manager
+            .update_credential(
+                1,
+                None,
+                Some(Some("http://localhost:5678".into())),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let stale = ProxyRotationUpdate {
+            id: 1,
+            target: Some("direct".into()),
+            generation: original.generation,
+            global_generation: original.global_generation,
+        };
+        assert!(manager.apply_proxy_rotation(&[stale]).is_err());
+        assert_eq!(
+            manager.clone_credential(1).unwrap().proxy_url.as_deref(),
+            Some("http://localhost:5678")
+        );
+        let current = manager.credential_proxy_snapshot().remove(0);
+        manager.set_global_proxy(Some(ProxyConfig::new("http://localhost:9012")));
+        let stale = ProxyRotationUpdate {
+            id: 1,
+            target: Some("direct".into()),
+            generation: current.generation,
+            global_generation: current.global_generation,
+        };
+        assert!(manager.apply_proxy_rotation(&[stale]).is_err());
+    }
 
     /// 构造一个仅含单凭据、可配置 RPM 限流的测试用 manager。
     fn rpm_test_manager(enabled: bool, limit: u32) -> MultiTokenManager {
@@ -5305,6 +6184,7 @@ mod tests {
             .downcast_ref::<UpstreamRateLimitError>()
             .expect("RPM 已耗尽应返回类型化限流错误，以便 HTTP 层映射为 429");
         assert!(rate_limit.retry_after().is_some());
+        assert!(rate_limit.is_local(), "网关自己的 RPM 限流不能记成上游限流");
     }
 
     #[test]
@@ -6356,7 +7236,7 @@ mod tests {
         let enabled = std::thread::spawn(move || {
             enabled_barrier.wait();
             enabled_manager
-                .set_self_heal_config(None, Some(false), None, None)
+                .set_self_heal_config(None, None, Some(false), None, None)
                 .unwrap();
         });
         let interval_manager = Arc::clone(&manager);
@@ -6364,7 +7244,7 @@ mod tests {
         let interval = std::thread::spawn(move || {
             interval_barrier.wait();
             interval_manager
-                .set_self_heal_config(None, None, Some(123), None)
+                .set_self_heal_config(None, None, None, Some(123), None)
                 .unwrap();
         });
         barrier.wait();
@@ -6656,6 +7536,8 @@ mod tests {
             access_token: Some("second-token".to_string()),
             expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
             priority: 1,
+            // 更高负载因子：只读选择（不推进 SWRR 状态）会选中 #2
+            load_factor: 20,
             ..KiroCredentials::default()
         };
         let manager =
@@ -6663,7 +7545,7 @@ mod tests {
 
         assert_eq!(manager.snapshot().current_id, 1);
 
-        // balanced 随机选号：多次只读选择，其中必然会选到 #2，但 current_id 始终不动
+        // balanced 只读选号可选中 #2，但 current_id 始终不动
         let mut picked_other = false;
         for _ in 0..64 {
             let (context, is_balanced, _) = manager
@@ -6770,6 +7652,33 @@ mod tests {
             "错误应提示所有凭据禁用，实际: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_multi_token_manager_has_available_credentials() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert!(manager.has_available_credentials(None, None));
+
+        manager.report_quota_exhausted(1);
+        assert!(manager.has_available_credentials(None, None));
+
+        manager.report_quota_exhausted(2);
+        assert!(!manager.has_available_credentials(None, None));
+    }
+
+    #[tokio::test]
+    async fn temporarily_throttled_credentials_return_rate_limit_not_authentication_error() {
+        let manager = rpm_test_manager(false, 0);
+        manager.report_account_throttled_for_request(1, StdDuration::from_secs(60), None, None);
+        assert!(manager.has_available_credentials(None, None));
+        let error = manager.acquire_context(None, None).await.err().unwrap();
+        assert!(error.downcast_ref::<UpstreamRateLimitError>().is_some());
     }
 
     #[test]
@@ -7045,7 +7954,10 @@ mod tests {
     fn test_builder_id_unsupported_is_definitive() {
         let body = r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"AWS Builder ID is not supported for this operation."}"#;
         assert!(is_builder_id_unsupported(403, body));
-        assert!(!is_builder_id_unsupported(403, r#"{"message":"Invalid token"}"#));
+        assert!(!is_builder_id_unsupported(
+            403,
+            r#"{"message":"Invalid token"}"#
+        ));
         assert!(!is_builder_id_unsupported(500, body));
     }
 
@@ -7786,6 +8698,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -7815,7 +8728,7 @@ mod tests {
         };
 
         manager
-            .update_credential(1, None, None, None, None, None, None, Some(metadata))
+            .update_credential(1, None, None, None, None, None, None, Some(metadata), None)
             .unwrap();
 
         let snapshot = manager.snapshot();
@@ -8527,233 +9440,535 @@ mod tests {
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
     }
 
-    #[test]
-    fn request_guard_tracks_concurrency_until_drop() {
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                Config::default(),
-                vec![grouped_cred("guard-test", &[])],
-                None,
-                None,
-                false,
-            )
-            .unwrap(),
-        );
-
-        let guard = manager.begin_request(1);
-        let active = manager.snapshot();
-        assert_eq!(active.active_concurrency, 1);
-        assert_eq!(active.entries[0].in_flight, 1);
-
-        drop(guard);
-        let idle = manager.snapshot();
-        assert_eq!(idle.active_concurrency, 0);
-        assert_eq!(idle.entries[0].in_flight, 0);
-    }
-
-    #[test]
-    fn test_priority_balanced_balances_within_top_tier_then_falls_back() {
+    fn suspended_test_manager() -> MultiTokenManager {
         let mut config = Config::default();
-        config.load_balancing_mode = "priority-balanced".to_string();
-        // 高优先级层 priority=0：A(id1),B(id2)；低优先级层 priority=5：C(id3)
-        let mut a = grouped_cred("a", &[]);
-        a.priority = 0;
-        let mut b = grouped_cred("b", &[]);
-        b.priority = 0;
-        let mut c = grouped_cred("c", &[]);
-        c.priority = 5;
-        let manager = MultiTokenManager::new(config, vec![a, b, c], None, None, false).unwrap();
-
-        // 初始平局(success_count 均为 0)：按 id 取更小的 A(id1)
-        assert_eq!(
-            manager.select_next_credential(None, None).map(|(id, _)| id),
-            Some(1)
-        );
-
-        // A 成功一次 → 顶层内 least-used 转向 B(id2)，仍不会跨到低优先级 C
-        manager.report_success(1);
-        assert_eq!(
-            manager.select_next_credential(None, None).map(|(id, _)| id),
-            Some(2),
-            "顶层内应转向 success_count 更小的 B，绝不选低优先级 C"
-        );
-
-        // 顶层两个账号全部禁用 → min(priority) 落到低优先级层，选到 C(id3)
-        manager.set_disabled(1, true).unwrap();
-        manager.set_disabled(2, true).unwrap();
-        assert_eq!(
-            manager.select_next_credential(None, None).map(|(id, _)| id),
-            Some(3),
-            "顶层耗尽后应降级到低优先级层"
-        );
-    }
-
-    #[test]
-    fn test_priority_balanced_falls_back_on_throttle_and_recovers() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "priority-balanced".to_string();
-        let mut hi = grouped_cred("hi", &[]);
-        hi.priority = 0;
-        let mut lo = grouped_cred("lo", &[]);
-        lo.priority = 9;
-        let manager = MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap();
-
-        // 正常时选顶层 hi(id1)
-        assert_eq!(
-            manager.select_next_credential(None, None).map(|(id, _)| id),
-            Some(1)
-        );
-
-        // 顶层冷却 → 降级到 lo(id2)
-        manager.report_account_throttled_for_request(1, StdDuration::from_secs(600), None, None);
-        assert_eq!(
-            manager.select_next_credential(None, None).map(|(id, _)| id),
-            Some(2),
-            "顶层冷却期间应降级到低优先级层"
-        );
-
-        // 手动解除冷却 → 回到顶层 hi(id1)
-        manager.clear_throttle(1).unwrap();
-        assert_eq!(
-            manager.select_next_credential(None, None).map(|(id, _)| id),
-            Some(1),
-            "冷却解除后应回到最高优先级层"
-        );
-    }
-
-    #[test]
-    fn test_priority_random_stays_in_top_tier_and_covers_all() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "priority-random".to_string();
-        // 顶层 priority=0：A(id1),B(id2),C(id3)；低层 priority=5：D(id4)
-        let mut a = grouped_cred("a", &[]);
-        a.priority = 0;
-        let mut b = grouped_cred("b", &[]);
-        b.priority = 0;
-        let mut c = grouped_cred("c", &[]);
-        c.priority = 0;
-        let mut d = grouped_cred("d", &[]);
-        d.priority = 5;
-        let manager = MultiTokenManager::new(config, vec![a, b, c, d], None, None, false).unwrap();
-
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..200 {
-            let id = manager.select_next_credential(None, None).map(|(id, _)| id);
-            assert!(
-                matches!(id, Some(1) | Some(2) | Some(3)),
-                "priority-random 必须只在顶层内选择，绝不选低优先级 D(id4)，实际={:?}",
-                id
-            );
-            if let Some(id) = id {
-                seen.insert(id);
-            }
-        }
-        // 200 次抽样几乎必然覆盖顶层三个账号（每个漏选概率 (2/3)^200，可忽略）
-        assert_eq!(
-            seen.len(),
-            3,
-            "顶层三个账号都应被随机选到过，实际={:?}",
-            seen
-        );
-    }
-
-    #[test]
-    fn test_priority_random_falls_back_when_top_tier_exhausted() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "priority-random".to_string();
-        let mut a = grouped_cred("a", &[]);
-        a.priority = 0;
-        let mut b = grouped_cred("b", &[]);
-        b.priority = 0;
-        let mut d = grouped_cred("d", &[]);
-        d.priority = 5;
-        let manager = MultiTokenManager::new(config, vec![a, b, d], None, None, false).unwrap();
-
-        // 顶层两个账号：禁用 A、冷却 B → 顶层耗尽，只剩低层 D(id3)
-        manager.set_disabled(1, true).unwrap();
-        manager.report_account_throttled_for_request(2, StdDuration::from_secs(600), None, None);
-        for _ in 0..50 {
-            assert_eq!(
-                manager.select_next_credential(None, None).map(|(id, _)| id),
-                Some(3),
-                "顶层耗尽后应降级到低优先级层 D"
-            );
-        }
-    }
-
-    #[test]
-    fn test_select_excluding_falls_back_to_next_tier_without_global_state() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "priority-random".to_string();
-        let mut a = grouped_cred("a", &[]);
-        a.priority = 0;
-        let mut b = grouped_cred("b", &[]);
-        b.priority = 0;
-        let mut d = grouped_cred("d", &[]);
-        d.priority = 5;
-        let manager = MultiTokenManager::new(config, vec![a, b, d], None, None, false).unwrap();
-
-        // 排除顶层其中一个：仍应留在顶层（另一个 priority=0 的号还没用尽配额）
-        let skip_one: HashSet<u64> = [1].into_iter().collect();
-        for _ in 0..50 {
-            assert_eq!(
-                manager
-                    .select_next_credential_excluding(None, None, &skip_one)
-                    .map(|(id, _)| id),
-                Some(2),
-                "顶层还有未用尽配额的账号时不应降级"
-            );
-        }
-
-        // 顶层两个都用尽本请求配额 → 降级到 priority=5 的 D(id3)
-        let skip_tier: HashSet<u64> = [1, 2].into_iter().collect();
-        assert_eq!(
-            manager
-                .select_next_credential_excluding(None, None, &skip_tier)
-                .map(|(id, _)| id),
-            Some(3),
-            "顶层在本次请求内全部用尽配额后应降级到优先级 5"
-        );
-
-        // 关键：排除只作用于本次请求，全局可用性未被污染
-        let snapshot = manager.snapshot();
-        assert!(
-            snapshot.entries.iter().all(|c| !c.disabled),
-            "本请求内的排除不得禁用任何凭据"
-        );
-        for _ in 0..50 {
-            let id = manager.select_next_credential(None, None).map(|(id, _)| id);
-            assert!(
-                matches!(id, Some(1) | Some(2)),
-                "不带排除集合时（其它并发请求）仍应选顶层账号，实际={:?}",
-                id
-            );
-        }
+        config.suspended_ban_keywords =
+            vec!["custom locked".to_string(), "banned account".to_string()];
+        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false).unwrap()
     }
 
     #[tokio::test]
-    async fn test_acquire_context_excluding_reports_request_scoped_exhaustion() {
+    async fn test_balanced_mode_avoids_in_flight_busy_credential() {
         let mut config = Config::default();
-        config.load_balancing_mode = "priority-random".to_string();
-        let mut a = grouped_cred("a", &[]);
-        a.priority = 0;
-        let manager = MultiTokenManager::new(config, vec![a], None, None, false).unwrap();
+        config.load_balancing_mode = "balanced".to_string();
 
-        let skip: HashSet<u64> = [1].into_iter().collect();
-        // CallContext 未实现 Debug，无法用 expect_err
-        let message = match manager.acquire_context_excluding(None, None, &skip).await {
-            Ok(_) => panic!("全部候选被排除后应失败"),
-            Err(error) => error.to_string(),
+        let mut first = KiroCredentials::default();
+        first.access_token = Some("first-token".to_string());
+        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        first.priority = 0;
+
+        let mut second = KiroCredentials::default();
+        second.access_token = Some("second-token".to_string());
+        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        second.priority = 0;
+
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        assert_eq!(manager.get_in_flight(1), 0);
+        assert_eq!(manager.get_in_flight(2), 0);
+
+        // 第一个请求选中凭据 #1 并在途处理
+        let ctx1 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx1.id, 1);
+        assert_eq!(manager.get_in_flight(1), 1);
+        assert_eq!(manager.get_in_flight(2), 0);
+
+        // 并发第二个请求到达：应避让在途的 #1，选择空闲的 #2
+        let ctx2 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx2.id, 2);
+        assert_eq!(manager.get_in_flight(1), 1);
+        assert_eq!(manager.get_in_flight(2), 1);
+
+        // 克隆 ctx1（模拟流式传输处理）：在途计数不应重复递增
+        let ctx1_clone = ctx1.clone();
+        assert_eq!(manager.get_in_flight(1), 1);
+
+        // 释放 ctx1 主体，但仍持有 ctx1_clone：在途计数仍为 1
+        drop(ctx1);
+        assert_eq!(manager.get_in_flight(1), 1);
+
+        // 释放 ctx1_clone：在途计数归 0
+        drop(ctx1_clone);
+        assert_eq!(manager.get_in_flight(1), 0);
+
+        drop(ctx2);
+        assert_eq!(manager.get_in_flight(2), 0);
+    }
+
+    #[test]
+    fn test_swrr_load_factor_distribution_and_ratio() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = grouped_cred("token-1", &[]);
+        cred1.id = Some(1);
+        cred1.load_factor = 3;
+
+        let mut cred2 = grouped_cred("token-2", &[]);
+        cred2.id = Some(2);
+        cred2.load_factor = 1;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 连续调度 40 次，比例应严格为 3:1 (30:10)
+        let mut count1 = 0;
+        let mut count2 = 0;
+        for _ in 0..40 {
+            let pick = manager.select_next_credential(None, None).unwrap();
+            if pick.0 == 1 {
+                count1 += 1;
+            } else if pick.0 == 2 {
+                count2 += 1;
+            }
+        }
+
+        assert_eq!(count1, 30, "负载因子为 3 的账号应获得 3/4 流量");
+        assert_eq!(count2, 10, "负载因子为 1 的账号应获得 1/4 流量");
+    }
+
+    #[test]
+    fn test_swrr_smooth_interleaving_and_no_catchup_starvation() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut old_cred = grouped_cred("token-old", &[]);
+        old_cred.id = Some(1);
+        old_cred.load_factor = 2;
+
+        let mut new_cred1 = grouped_cred("token-new1", &[]);
+        new_cred1.id = Some(2);
+        new_cred1.load_factor = 1;
+
+        let mut new_cred2 = grouped_cred("token-new2", &[]);
+        new_cred2.id = Some(3);
+        new_cred2.load_factor = 1;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![old_cred, new_cred1, new_cred2],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        for _ in 0..800 {
+            manager.report_success(1);
+        }
+        let picks: Vec<u64> = (0..4)
+            .map(|_| manager.select_next_credential(None, None).unwrap().0)
+            .collect();
+        assert_eq!(
+            picks,
+            vec![1, 2, 3, 1],
+            "老号与新号应立即平滑按权重交替调度"
+        );
+    }
+
+    #[test]
+    fn test_suspended_custom_ban_keywords() {
+        let manager = suspended_test_manager();
+        assert!(manager.matches_suspended_ban_keywords("Your CUSTOM LOCKED message"));
+        assert!(manager.matches_suspended_ban_keywords("prefix banned account suffix"));
+        assert!(!manager.matches_suspended_ban_keywords("unrelated error"));
+
+        // 动态更新关键词
+        manager
+            .set_self_heal_config(
+                None,
+                Some(vec!["new ban phrase".to_string()]),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(!manager.matches_suspended_ban_keywords("Your CUSTOM LOCKED message"));
+        assert!(manager.matches_suspended_ban_keywords("error: new ban phrase"));
+
+        // 空白关键词会被丢弃，不能让任意响应命中
+        manager
+            .set_self_heal_config(
+                None,
+                Some(vec!["".to_string(), "   ".to_string()]),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_suspended_ban_keywords().is_empty());
+        assert!(!manager.matches_suspended_ban_keywords("unrelated error"));
+    }
+
+    #[test]
+    fn test_batch_mark_suspended() {
+        let cred1 = KiroCredentials {
+            id: Some(1),
+            disabled: false,
+            disabled_reason: None,
+            ..Default::default()
         };
-        assert!(
-            message.contains("本次请求的凭据尝试预算已耗尽"),
-            "错误信息应指向本请求配额用尽，实际={}",
-            message
+
+        let cred2 = KiroCredentials {
+            id: Some(2),
+            disabled: true,
+            disabled_reason: Some("TooManyFailures".to_string()),
+            ..Default::default()
+        };
+
+        let cred3 = KiroCredentials {
+            id: Some(3),
+            disabled: true,
+            disabled_reason: Some("Suspended".to_string()),
+            ..Default::default()
+        };
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1, cred2, cred3],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 批量将 1, 2, 3 标记为 Suspended
+        let updated = manager.batch_mark_suspended(&[1, 2, 3]).unwrap();
+        // 3 原本就是 Suspended，因此只有 1 和 2 会被新更新
+        assert_eq!(updated, vec![1, 2]);
+
+        let entries = manager.entries.lock();
+        let e1 = entries.iter().find(|e| e.id == 1).unwrap();
+        let e2 = entries.iter().find(|e| e.id == 2).unwrap();
+        let e3 = entries.iter().find(|e| e.id == 3).unwrap();
+
+        assert!(e1.disabled);
+        assert_eq!(e1.disabled_reason, Some(DisabledReason::Suspended));
+        assert!(e2.disabled);
+        assert_eq!(e2.disabled_reason, Some(DisabledReason::Suspended));
+        assert!(e3.disabled);
+        assert_eq!(e3.disabled_reason, Some(DisabledReason::Suspended));
+    }
+
+    #[test]
+    fn test_set_load_factor_updates_behavior() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = grouped_cred("token-1", &[]);
+        cred1.id = Some(1);
+        cred1.load_factor = 1;
+
+        let mut cred2 = grouped_cred("token-2", &[]);
+        cred2.id = Some(2);
+        cred2.load_factor = 1;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.set_load_factor(2, 3).unwrap();
+
+        let mut count1 = 0;
+        let mut count2 = 0;
+        for _ in 0..40 {
+            let pick = manager.select_next_credential(None, None).unwrap();
+            if pick.0 == 1 {
+                count1 += 1;
+            } else if pick.0 == 2 {
+                count2 += 1;
+            }
+        }
+        assert_eq!(count1, 10);
+        assert_eq!(count2, 30);
+    }
+
+    #[test]
+    fn test_priority_key_calculation() {
+        assert_eq!(priority_key(0, false), 0);
+        assert_eq!(priority_key(10, false), 10);
+        assert_eq!(priority_key(100, false), 100);
+
+        assert_eq!(priority_key(0, true), u32::MAX);
+        assert_eq!(priority_key(10, true), u32::MAX - 10);
+        assert_eq!(priority_key(100, true), u32::MAX - 100);
+
+        assert!(priority_key(100, true) < priority_key(10, true));
+        assert!(priority_key(10, true) < priority_key(0, true));
+    }
+
+    #[test]
+    fn test_set_invert_priority_persists_and_switches_credential() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-invert-priority-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &config_path,
+            r#"{"loadBalancingMode":"priority","invertPriority":false}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let mut cred1 = grouped_cred("c1", &[]);
+        cred1.priority = 0;
+        let mut cred2 = grouped_cred("c2", &[]);
+        cred2.priority = 100;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 1);
+        assert!(!manager.get_invert_priority());
+
+        manager.set_invert_priority(true).unwrap();
+        assert_eq!(manager.snapshot().current_id, 2);
+        assert!(manager.get_invert_priority());
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert!(persisted.invert_priority);
+
+        manager.set_invert_priority(false).unwrap();
+        assert_eq!(manager.snapshot().current_id, 1);
+        assert!(!manager.get_invert_priority());
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_update_load_balancing_settings() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-lb-settings-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &config_path,
+            r#"{"loadBalancingMode":"priority","invertPriority":false}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let mut cred1 = grouped_cred("c1", &[]);
+        cred1.priority = 10;
+        let mut cred2 = grouped_cred("c2", &[]);
+        cred2.priority = 50;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        manager
+            .update_load_balancing_settings(Some("balanced"), Some(true))
+            .unwrap();
+
+        assert_eq!(manager.get_load_balancing_mode(), "balanced");
+        assert!(manager.get_invert_priority());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "balanced");
+        assert!(persisted.invert_priority);
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_with_invert_priority_selects_largest() {
+        let mut config = Config::default();
+        config.invert_priority = true;
+
+        let mut low = grouped_cred("low", &[]);
+        low.priority = 10;
+        let mut mid = grouped_cred("mid", &[]);
+        mid.priority = 50;
+        let mut high = grouped_cred("high", &[]);
+        high.priority = 100;
+
+        let manager =
+            MultiTokenManager::new(config, vec![low, mid, high], None, None, false).unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 3);
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx.id, 3);
+
+        manager.set_disabled(3, true).unwrap();
+        let ctx2 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx2.id, 2);
+
+        manager.set_disabled(3, false).unwrap();
+        let ctx3 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx3.id, 3);
+
+        manager.set_invert_priority(false).unwrap();
+        assert_eq!(manager.snapshot().current_id, 1);
+        let ctx4 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx4.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_group_level_load_balancing_and_invert_priority() {
+        let group_mgr = Arc::new(crate::admin::GroupManager::new());
+        group_mgr
+            .create_with_dispatch("group_inherit".into(), None, None, None)
+            .unwrap();
+        group_mgr
+            .create_with_dispatch("group_inverted".into(), None, None, Some(true))
+            .unwrap();
+        group_mgr
+            .create_with_dispatch(
+                "group_normal".into(),
+                None,
+                Some("priority".into()),
+                Some(false),
+            )
+            .unwrap();
+        group_mgr
+            .create_with_dispatch("group_balanced".into(), None, Some("balanced".into()), None)
+            .unwrap();
+
+        let mut c1 = grouped_cred(
+            "c1",
+            &[
+                "group_inherit",
+                "group_inverted",
+                "group_normal",
+                "group_balanced",
+            ],
         );
-        assert!(
-            !message.contains("所有凭据均已禁用"),
-            "不应误报为全局禁用，实际={}",
-            message
+        c1.priority = 10;
+        let mut c2 = grouped_cred(
+            "c2",
+            &[
+                "group_inherit",
+                "group_inverted",
+                "group_normal",
+                "group_balanced",
+            ],
         );
+        c2.priority = 80;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![c1, c2], None, None, false).unwrap();
+        manager.set_group_manager(group_mgr);
+
+        // 继承全局 (invert_priority = false) -> 数字小的 c1
+        let ctx = manager
+            .acquire_context(None, Some("group_inherit"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+
+        // 分组独立配置 invert_priority = true -> 数字大的 c2
+        let ctx = manager
+            .acquire_context(None, Some("group_inverted"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+
+        // 将全局 invert_priority 改为 true
+        manager.set_invert_priority(true).unwrap();
+
+        // group_inherit 继承全局 true -> c2
+        let ctx = manager
+            .acquire_context(None, Some("group_inherit"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+
+        // group_normal 独立配置 false -> 仍选 c1
+        let ctx = manager
+            .acquire_context(None, Some("group_normal"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+
+        // group_balanced 独立配置 balanced 模式，优先级反转继承全局 true
+        let (mode, invert) = manager.resolve_load_balancing_for_group(Some("group_balanced"));
+        assert_eq!(mode, "balanced");
+        assert!(invert);
+    }
+}
+
+#[cfg(test)]
+mod fork_scheduler_tests {
+    use super::*;
+
+    fn manager(mode: &str, invert: bool) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.load_balancing_mode = mode.into();
+        config.invert_priority = invert;
+        let credentials = [(1, 0, 30), (2, 0, 10), (3, 1, 1000)]
+            .into_iter()
+            .map(|(id, priority, load_factor)| KiroCredentials {
+                id: Some(id),
+                priority,
+                load_factor,
+                groups: vec!["team".into()],
+                kiro_api_key: Some(format!("fixture-{id}")),
+                ..KiroCredentials::default()
+            })
+            .collect();
+        MultiTokenManager::new(config, credentials, None, None, false).unwrap()
+    }
+
+    #[test]
+    fn priority_balanced_uses_weights_within_tier_and_respects_exclusions() {
+        let m = manager("priority-balanced", false);
+        let mut counts = [0; 3];
+        for _ in 0..400 {
+            let (id, _) = m.select_next_credential(None, None).unwrap();
+            counts[id as usize - 1] += 1;
+        }
+        assert_eq!(counts, [300, 100, 0]);
+        let guard = m.acquire_in_flight_guard(1).unwrap();
+        assert_eq!(m.select_next_credential(None, None).unwrap().0, 2);
+        let excluded = HashSet::from([1, 2]);
+        assert_eq!(
+            m.select_next_credential_impl(None, None, true, false, &excluded)
+                .unwrap()
+                .0,
+            3
+        );
+        drop(guard);
+        assert_eq!(m.snapshot().active_concurrency, 0);
+    }
+
+    #[test]
+    fn four_modes_support_group_overrides_and_priority_inversion() {
+        for mode in [
+            "priority",
+            "balanced",
+            "priority-balanced",
+            "priority-random",
+        ] {
+            let m = manager("priority", false);
+            m.set_load_balancing_mode(mode.into()).unwrap();
+            let groups = Arc::new(crate::admin::groups::GroupManager::new());
+            groups
+                .create_with_dispatch("team".into(), None, Some(mode.into()), Some(true))
+                .unwrap();
+            m.set_group_manager(groups);
+            assert_eq!(
+                m.resolve_load_balancing_for_group(Some("team")),
+                (mode.into(), true)
+            );
+            if mode != "balanced" {
+                for _ in 0..30 {
+                    assert_eq!(m.select_next_credential(None, Some("team")).unwrap().0, 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn priority_random_stays_in_top_tier_and_reaches_both_accounts() {
+        let m = manager("priority-random", false);
+        let mut picked = HashSet::new();
+        for _ in 0..200 {
+            let (id, _) = m.select_next_credential(None, None).unwrap();
+            assert!(matches!(id, 1 | 2));
+            picked.insert(id);
+        }
+        assert_eq!(picked, HashSet::from([1, 2]));
     }
 }

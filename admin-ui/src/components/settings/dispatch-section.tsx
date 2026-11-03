@@ -1,4 +1,15 @@
 import { LOAD_BALANCING_HINTS } from '@/lib/load-balancing'
+import { useState } from 'react'
+import {
+  Plus,
+  Trash2,
+  Lock,
+  Check,
+  Loader2,
+} from 'lucide-react'
+import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
 import {
   useRetryConfig,
   useSetRetryConfig,
@@ -48,6 +59,9 @@ export function DispatchSection() {
       <RetryBudgetGroup />
       <RpmLimitGroup />
       <QuotaResetRecoveryGroup />
+      <div id="dispatch-ban-detect">
+        <AccountBanGroup />
+      </div>
       <SelfHealGroup />
     </div>
   )
@@ -57,22 +71,46 @@ function LoadBalancingGroup() {
   const { data, isLoading } = useLoadBalancingMode()
   const { mutate } = useSetLoadBalancingMode()
   const saver = useFieldSaver(mutate, reportSaveError)
+  const invertPriority = data?.invertPriority ?? false
 
   return (
     <SettingGroup title="凭据选择">
       <SettingSegments
         label="负载均衡模式"
-        hint={LOAD_BALANCING_HINTS[data?.mode ?? 'priority']}
+        hint={
+          (data?.mode ?? 'priority') === 'priority'
+            ? invertPriority ? '按优先级数字从大到小使用' : '按优先级数字从小到大使用'
+            : LOAD_BALANCING_HINTS[data?.mode ?? 'priority']
+        }
         value={data?.mode ?? 'priority'}
         options={[
-          { value: 'priority', label: '按优先级', hint: '小数字先用，顺序耗尽' },
-          { value: 'balanced', label: '随机均衡', hint: '可用账号池随机分配' },
-          { value: 'priority-balanced', label: '优先级均衡', hint: '最高优先级层内按成功次数均衡' },
+          {
+            value: 'priority',
+            label: '按优先级',
+            hint: invertPriority ? '大数字先用，顺序耗尽' : '小数字先用，顺序耗尽',
+          },
+          { value: 'balanced', label: '均衡负载', hint: '并发避让后按权重平滑轮询' },
+          { value: 'priority-balanced', label: '优先级均衡', hint: '最高优先级层内并发避让和权重均衡' },
           { value: 'priority-random', label: '优先级随机', hint: '最高优先级层内随机分配' },
         ]}
-        onChange={(next) => saver.save('mode', next)}
+        onChange={(next) =>
+          saver.save('mode', { mode: next as 'priority' | 'balanced' | 'priority-balanced' | 'priority-random' })
+        }
         pending={saver.isSaving('mode')}
         saved={saver.isSaved('mode')}
+        disabled={isLoading}
+      />
+      <SettingSwitch
+        label="优先级反转"
+        hint={
+          invertPriority
+            ? '已开启：数字越大优先级越高（如 100 > 10 > 0）'
+            : '未开启（默认）：数字越小优先级越高（0 最优先）'
+        }
+        checked={invertPriority}
+        onChange={(next) => saver.save('invertPriority', { invertPriority: next })}
+        pending={saver.isSaving('invertPriority')}
+        saved={saver.isSaved('invertPriority')}
         disabled={isLoading}
       />
     </SettingGroup>
@@ -249,6 +287,42 @@ function QuotaResetRecoveryGroup() {
   )
 }
 
+function AccountBanGroup() {
+  const { data, isLoading } = useSelfHealConfig()
+  const { mutate } = useSetSelfHealConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const enabled = data?.suspendedDetectionEnabled ?? true
+  const keywords = data?.suspendedBanKeywords ?? []
+
+  return (
+    <SettingGroup
+      title="账号封禁治理"
+      description="识别上游封号响应（如 TEMPORARILY_SUSPENDED、locked 等）并永久熔断，绝不参与自愈重试"
+    >
+      <SettingSwitch
+        label="启用封号识别"
+        hint="命中封号响应（不限 403/429）立即标记为「账号封禁」并禁用，且永久排除在凭据自愈之外"
+        checked={enabled}
+        onChange={(next) =>
+          saver.save('suspended', { suspendedDetectionEnabled: next })
+        }
+        pending={saver.isSaving('suspended')}
+        saved={saver.isSaved('suspended')}
+        disabled={isLoading}
+      />
+      <BanRulesTable
+        keywords={keywords}
+        onCommit={(newKeywords) =>
+          saver.save('keywords', { suspendedBanKeywords: newKeywords })
+        }
+        pending={saver.isSaving('keywords')}
+        saved={saver.isSaved('keywords')}
+        disabled={isLoading || !enabled}
+      />
+    </SettingGroup>
+  )
+}
+
 function SelfHealGroup() {
   const { data, isLoading } = useSelfHealConfig()
   const { mutate } = useSetSelfHealConfig()
@@ -257,32 +331,21 @@ function SelfHealGroup() {
 
   return (
     <SettingGroup
-      title="凭据自愈"
-      description="请求池全灭时自动把禁用的凭据放回来重试"
+      title="凭据自愈恢复"
+      description="请求池全灭时自动批量恢复因临时失败被禁用的凭据（已封禁账号将被永久隔离，不参与自愈）"
     >
       <SettingSwitch
         label="启用自愈"
-        hint="当前作用域内已无可用凭据时，按作用域批量恢复被禁用的凭据"
+        hint="当前作用域内已无可用凭据时，按作用域批量恢复因失败过多被禁用的凭据"
         checked={enabled}
         onChange={(next) => saver.save('enabled', { enabled: next })}
         pending={saver.isSaving('enabled')}
         saved={saver.isSaved('enabled')}
         disabled={isLoading}
       />
-      <SettingSwitch
-        label="403 封禁识别"
-        hint="命中封禁文案的 403 直接禁用且不参与自愈，避免为已封账号反复重试"
-        checked={data?.suspendedDetectionEnabled ?? true}
-        onChange={(next) =>
-          saver.save('suspended', { suspendedDetectionEnabled: next })
-        }
-        pending={saver.isSaving('suspended')}
-        saved={saver.isSaved('suspended')}
-        disabled={isLoading}
-      />
       <SettingNumber
         label="自愈冷却间隔"
-        hint="两次自愈之间的最小间隔。设 0 表示不冷却 —— 上游持续 403 时这是唯一能打断死循环的刹车，不建议设 0"
+        hint="两次自愈之间的最小间隔。设 0 表示不冷却 —— 上游持续故障时这是唯一能打断死循环的刹车，不建议设 0"
         value={data?.minIntervalSecs ?? 0}
         toDisplay={(secs) => Math.round(secs / SECS_PER_MIN)}
         fromDisplay={(min) => min * SECS_PER_MIN}
@@ -325,4 +388,202 @@ function RetryBudgetGroup() {
     <SettingNumber label="每凭据尝试上限" hint="网络错误和可换号的瞬态错误达到上限后，跳过该账号" value={data?.perCredential ?? 3} onCommit={(n) => saver.save('perCredential', { perCredential: n })} min={1} max={10} unit="次" pending={saver.isSaving('perCredential')} saved={saver.isSaved('perCredential')} disabled={isLoading} />
     <SettingNumber label="总尝试上限" hint="包含首次请求。至少留出一次尝试，才能在当前优先级层耗尽后降级" value={data?.total ?? 4} onCommit={(n) => saver.save('total', { total: n })} min={1} max={20} unit="次" pending={saver.isSaving('total')} saved={saver.isSaved('total')} disabled={isLoading} />
   </SettingGroup>
+}
+
+function BanRulesTable({
+  keywords,
+  onCommit,
+  pending,
+  saved,
+  disabled,
+}: {
+  keywords: string[]
+  onCommit: (keywords: string[]) => void
+  pending?: boolean
+  saved?: boolean
+  disabled?: boolean
+}) {
+  const [draft, setDraft] = useState('')
+
+  const handleAdd = () => {
+    const trimmed = draft.trim()
+    if (!trimmed) return
+    if (keywords.some((k) => k.toLowerCase() === trimmed.toLowerCase())) {
+      setDraft('')
+      return
+    }
+    onCommit([...keywords, trimmed])
+    setDraft('')
+  }
+
+  const handleRemove = (index: number) => {
+    onCommit(keywords.filter((_, i) => i !== index))
+  }
+
+  return (
+    <div className="py-3.5 space-y-3">
+      {/* 头部：说明与添加操作栏 */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="text-[13.5px] font-medium text-foreground">封号特征识别规则表</span>
+            {pending && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+            {!pending && saved && <Check className="h-3.5 w-3.5 text-emerald-500" />}
+            <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 text-muted-foreground font-mono">
+              共 {2 + keywords.length} 条规则
+            </Badge>
+          </div>
+          <p className="mt-0.5 text-xs text-muted-foreground leading-relaxed">
+            无论正常调度还是探测重试，响应体命中表中任一特征将立即熔断并标记为「账号封禁」，永久排除在自动自愈之外。
+          </p>
+        </div>
+
+        {/* 添加自定义关键词 */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          <Input
+            value={draft}
+            disabled={disabled || pending}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                handleAdd()
+              }
+            }}
+            placeholder="输入自定义封禁关键词..."
+            className="h-8 w-48 sm:w-56 text-xs bg-background"
+          />
+          <Button
+            type="button"
+            size="sm"
+            className="h-8 px-3 text-xs gap-1 shrink-0 cursor-pointer"
+            disabled={disabled || pending || !draft.trim()}
+            onClick={handleAdd}
+          >
+            <Plus className="h-3.5 w-3.5" />
+            添加关键词
+          </Button>
+        </div>
+      </div>
+
+      {/* 规则表格 */}
+      <div className="rounded-lg border border-border/70 overflow-hidden bg-card/60 shadow-2xs">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-border/60 bg-muted/40 text-muted-foreground text-[11px]">
+                <th className="py-2.5 px-3.5 font-medium w-24">规则来源</th>
+                <th className="py-2.5 px-3.5 font-medium">匹配特征 / 关键词</th>
+                <th className="py-2.5 px-3.5 font-medium w-48">匹配模式</th>
+                <th className="py-2.5 px-3.5 font-medium w-36">处置策略</th>
+                <th className="py-2.5 px-3.5 font-medium text-right w-20">操作</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border/40 text-xs">
+              {/* 内置规则 1 */}
+              <tr className="hover:bg-muted/20 transition-colors">
+                <td className="py-2.5 px-3.5">
+                  <Badge variant="outline" className="border-rose-500/30 text-rose-600 dark:text-rose-400 bg-rose-500/10 text-[10.5px] px-1.5 py-0 font-medium">
+                    内置规则
+                  </Badge>
+                </td>
+                <td className="py-2.5 px-3.5">
+                  <code className="font-mono text-[11px] font-semibold text-rose-600 dark:text-rose-400 bg-rose-500/5 border border-rose-500/20 px-1.5 py-0.5 rounded">
+                    reason: "TEMPORARILY_SUSPENDED"
+                  </code>
+                </td>
+                <td className="py-2.5 px-3.5 text-muted-foreground text-[11.5px]">
+                  JSON 顶层或嵌套结构化字段精确比对
+                </td>
+                <td className="py-2.5 px-3.5 text-muted-foreground text-[11.5px]">
+                  标记封禁 · 排除自愈
+                </td>
+                <td className="py-2.5 px-3.5 text-right">
+                  <span className="inline-flex items-center gap-0.5 text-[10.5px] text-muted-foreground/70" title="内核原生只读规则">
+                    <Lock className="h-3 w-3" />
+                    系统锁定
+                  </span>
+                </td>
+              </tr>
+
+              {/* 内置规则 2 */}
+              <tr className="hover:bg-muted/20 transition-colors">
+                <td className="py-2.5 px-3.5">
+                  <Badge variant="outline" className="border-rose-500/30 text-rose-600 dark:text-rose-400 bg-rose-500/10 text-[10.5px] px-1.5 py-0 font-medium">
+                    内置规则
+                  </Badge>
+                </td>
+                <td className="py-2.5 px-3.5">
+                  <div className="flex items-center gap-1 font-mono text-[11px] flex-wrap">
+                    <code className="bg-muted px-1.5 py-0.5 rounded border border-border/60 text-foreground">
+                      "suspended"
+                    </code>
+                    <span className="text-muted-foreground font-bold text-[10px]">+</span>
+                    <code className="bg-muted px-1.5 py-0.5 rounded border border-border/60 text-foreground">
+                      "locked your account" / "locked it"
+                    </code>
+                  </div>
+                </td>
+                <td className="py-2.5 px-3.5 text-muted-foreground text-[11.5px]">
+                  响应体双短语交叉组合包含
+                </td>
+                <td className="py-2.5 px-3.5 text-muted-foreground text-[11.5px]">
+                  标记封禁 · 排除自愈
+                </td>
+                <td className="py-2.5 px-3.5 text-right">
+                  <span className="inline-flex items-center gap-0.5 text-[10.5px] text-muted-foreground/70" title="内核原生只读规则">
+                    <Lock className="h-3 w-3" />
+                    系统锁定
+                  </span>
+                </td>
+              </tr>
+
+              {/* 自定义关键词行 */}
+              {keywords.map((kw, idx) => (
+                <tr key={idx} className="hover:bg-muted/20 transition-colors">
+                  <td className="py-2.5 px-3.5">
+                    <Badge variant="secondary" className="text-[10.5px] px-1.5 py-0 font-normal">
+                      自定义
+                    </Badge>
+                  </td>
+                  <td className="py-2.5 px-3.5">
+                    <code className="font-mono text-[11.5px] font-medium text-foreground bg-muted/70 px-1.5 py-0.5 rounded border border-border/60">
+                      {kw}
+                    </code>
+                  </td>
+                  <td className="py-2.5 px-3.5 text-muted-foreground text-[11.5px]">
+                    响应体子串匹配 (忽略大小写)
+                  </td>
+                  <td className="py-2.5 px-3.5 text-muted-foreground text-[11.5px]">
+                    标记封禁 · 排除自愈
+                  </td>
+                  <td className="py-2.5 px-3.5 text-right">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-destructive hover:bg-destructive/10 cursor-pointer"
+                      onClick={() => handleRemove(idx)}
+                      disabled={disabled || pending}
+                      title="删除该关键词"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+
+              {keywords.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="py-4 px-3.5 text-center text-muted-foreground text-xs bg-muted/5">
+                    暂未配置自定义关键词。若上游出现特定封号错误文案，可在上方输入框添加关键词进行补充拦截。
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  )
 }

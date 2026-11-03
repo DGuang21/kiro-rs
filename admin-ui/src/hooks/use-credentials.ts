@@ -1,9 +1,10 @@
 import { getRetryConfig, setRetryConfig } from '@/api/credentials'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialLoadFactor,
   resetCredentialFailure,
   forceRefreshToken,
   clearThrottle,
@@ -39,6 +40,8 @@ import {
   setGlobalProxy,
   getCustomModels,
   setCustomModels,
+  getCustomHeaders,
+  setCustomHeaders,
   getUpdateConfig,
   setUpdateConfig,
   resetSuccessCount,
@@ -49,18 +52,21 @@ import {
 import type {
   AddCredentialRequest,
   CustomModelItem,
+  SetCustomHeadersRequest,
   SetGlobalProxyRequest,
   SetUpdateConfigRequest,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   CredentialMetadataSchemaConfig,
+  CredentialQueryParams,
 } from '@/types/api'
 
-// 查询凭据列表
-export function useCredentials(refetchInterval = 30_000) {
+// 查询凭据列表（支持分页、搜索、过滤、排序）
+export function useCredentials(params?: CredentialQueryParams, refetchInterval = 30_000) {
   return useQuery({
-    queryKey: ['credentials'],
-    queryFn: getCredentials,
+    queryKey: ['credentials', params],
+    queryFn: () => getCredentials(params),
+    placeholderData: keepPreviousData,
     refetchInterval,
   })
 }
@@ -141,6 +147,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置负载因子（均衡模式下的调度权重）
+export function useSetLoadFactor() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, loadFactor }: { id: number; loadFactor: number }) =>
+      setCredentialLoadFactor(id, loadFactor),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
@@ -473,6 +491,24 @@ export function useSetCustomModels() {
       setCustomModels(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-models'] })
+    },
+  })
+}
+
+// 自定义响应头配置
+export function useCustomHeaders() {
+  return useQuery({
+    queryKey: ['custom-headers'],
+    queryFn: getCustomHeaders,
+  })
+}
+
+export function useSetCustomHeaders() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetCustomHeadersRequest) => setCustomHeaders(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-headers'] })
     },
   })
 }

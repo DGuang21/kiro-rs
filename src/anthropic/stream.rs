@@ -26,295 +26,7 @@ pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signat
 /// Anthropic `stop_reason`。一经设置即为终态，后续事件不得覆盖。
 pub(super) const REFUSAL_STOP_REASON: &str = "refusal";
 
-const TOOL_USE_XML_PREFIX: &str = "<tool_use";
-const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
-const THINKING_START_TAG: &str = "<thinking>";
-const THINKING_END_TAG: &str = "</thinking>";
-
-/// 跨 chunk 过滤字面 `<tool_use ...>...</tool_use>` XML 泄漏（见
-/// [`crate::kiro::model::events::strip_tool_use_xml_leaks`] 的语义）。
-///
-/// 流式下一个 `<tool_use>` 块可能跨多个 chunk，故用状态机：`stripping` 表示已进入
-/// 一个未闭合的 `<tool_use>`，持续吞字直到遇到 `</tool_use>`；chunk 末尾若残留可能是
-/// `<tool_use` 前缀的后缀，则缓冲到下个 chunk 再判定。
-#[derive(Debug, Default)]
-struct ToolUseXmlLeakFilter {
-    buffer: String,
-    stripping: bool,
-}
-
-impl ToolUseXmlLeakFilter {
-    fn filter(&mut self, content: &str) -> String {
-        self.buffer.push_str(content);
-        let mut out = String::with_capacity(self.buffer.len());
-        let mut rest = self.buffer.as_str();
-
-        loop {
-            if self.stripping {
-                if let Some(close_start) = rest.find(TOOL_USE_XML_CLOSE) {
-                    rest = &rest[close_start + TOOL_USE_XML_CLOSE.len()..];
-                    self.stripping = false;
-                    continue;
-                }
-                // 仍未闭合：丢弃已吞内容，但保留末尾可能是 `</tool_use>` 前缀的后缀，
-                // 以正确处理闭合标签被切分到多个 chunk 的情形。
-                let keep = longest_prefix_suffix(rest, TOOL_USE_XML_CLOSE);
-                self.buffer = rest[rest.len() - keep..].to_string();
-                return out;
-            }
-
-            let Some(start) = rest.find(TOOL_USE_XML_PREFIX) else {
-                // 无 `<tool_use`：全部输出，但保留末尾可能是 `<tool_use` 前缀的后缀。
-                let keep = longest_prefix_suffix(rest, TOOL_USE_XML_PREFIX);
-                let emit_len = rest.len().saturating_sub(keep);
-                out.push_str(&rest[..emit_len]);
-                self.buffer = rest[emit_len..].to_string();
-                return out;
-            };
-
-            out.push_str(&rest[..start]);
-            let after_start = &rest[start..];
-            let Some(open_end) = after_start.find('>') else {
-                // 开标签尚未见到 `>`：可能是真标签的开头 → 进入 stripping 缓冲等闭合；
-                // 否则原样输出 `<tool_use` 继续。
-                if is_potential_tool_use_tag_start(after_start) {
-                    self.stripping = true;
-                    self.buffer.clear();
-                    return out;
-                }
-                out.push_str(&after_start[..TOOL_USE_XML_PREFIX.len()]);
-                rest = &after_start[TOOL_USE_XML_PREFIX.len()..];
-                continue;
-            };
-
-            let tag_head = &after_start[..open_end];
-            if !tag_head
-                .get(TOOL_USE_XML_PREFIX.len()..)
-                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
-            {
-                // 形似但非真标签（如 `<tool_user>`）：保留 `<tool_use` 继续扫描。
-                out.push_str(&after_start[..TOOL_USE_XML_PREFIX.len()]);
-                rest = &after_start[TOOL_USE_XML_PREFIX.len()..];
-                continue;
-            }
-
-            let after_open = &after_start[open_end + 1..];
-            if let Some(close_start) = after_open.find(TOOL_USE_XML_CLOSE) {
-                rest = &after_open[close_start + TOOL_USE_XML_CLOSE.len()..];
-            } else {
-                // 开标签完整但闭合未到：进入 stripping，保留末尾可能是 `</tool_use>`
-                // 前缀的后缀（处理闭合标签被切分到多个 chunk）。
-                self.stripping = true;
-                let keep = longest_prefix_suffix(after_open, TOOL_USE_XML_CLOSE);
-                self.buffer = after_open[after_open.len() - keep..].to_string();
-                return out;
-            }
-        }
-    }
-
-    /// 收尾：对残留缓冲做一次性剥离（截断的未闭合块会被丢弃）。
-    fn finish(&mut self) -> String {
-        self.stripping = false;
-        let remaining = std::mem::take(&mut self.buffer);
-        if remaining.is_empty() {
-            String::new()
-        } else {
-            crate::kiro::model::events::strip_tool_use_xml_leaks(&remaining)
-        }
-    }
-}
-
-/// Removes legacy thinking XML that occasionally leaks inside native
-/// `reasoningContentEvent.text` chunks. Native reasoning is already carried by
-/// the Anthropic thinking channel, so these delimiters are transport artifacts.
-#[derive(Debug, Default)]
-pub(crate) struct ThinkingXmlTagFilter {
-    buffer: String,
-}
-
-impl ThinkingXmlTagFilter {
-    pub(crate) fn filter(&mut self, content: &str) -> String {
-        self.buffer.push_str(content);
-        let mut out = String::with_capacity(self.buffer.len());
-        let mut rest = self.buffer.as_str();
-
-        loop {
-            let start = rest.find(THINKING_START_TAG);
-            let end = rest.find(THINKING_END_TAG);
-            let next = match (start, end) {
-                (Some(start), Some(end)) => Some((
-                    start.min(end),
-                    if start <= end {
-                        THINKING_START_TAG.len()
-                    } else {
-                        THINKING_END_TAG.len()
-                    },
-                )),
-                (Some(start), None) => Some((start, THINKING_START_TAG.len())),
-                (None, Some(end)) => Some((end, THINKING_END_TAG.len())),
-                (None, None) => None,
-            };
-
-            if let Some((pos, tag_len)) = next {
-                out.push_str(&rest[..pos]);
-                rest = &rest[pos + tag_len..];
-                continue;
-            }
-
-            let keep = longest_prefix_suffix(rest, THINKING_START_TAG)
-                .max(longest_prefix_suffix(rest, THINKING_END_TAG));
-            let emit_len = rest.len().saturating_sub(keep);
-            out.push_str(&rest[..emit_len]);
-            self.buffer = rest[emit_len..].to_string();
-            return out;
-        }
-    }
-
-    pub(crate) fn finish(&mut self) -> String {
-        let remaining = std::mem::take(&mut self.buffer);
-        if THINKING_START_TAG.starts_with(&remaining) || THINKING_END_TAG.starts_with(&remaining) {
-            return String::new();
-        }
-        strip_thinking_xml_tags(&remaining)
-    }
-}
-
-/// Suppresses legacy `<thinking>...</thinking>` blocks when the client did not
-/// request a reasoning channel. Kiro may still emit these transport wrappers,
-/// and forwarding them as text leaks private reasoning to the user.
-///
-/// The filter is incremental because either delimiter can be split across
-/// `assistantResponseEvent` chunks. Text outside the blocks is returned
-/// immediately; an unterminated block is discarded at a hard boundary.
-#[derive(Debug, Default)]
-pub(crate) struct HiddenThinkingXmlFilter {
-    buffer: String,
-    stripping: bool,
-}
-
-impl HiddenThinkingXmlFilter {
-    pub(crate) fn filter(&mut self, content: &str) -> String {
-        self.buffer.push_str(content);
-        let input = std::mem::take(&mut self.buffer);
-        let mut out = String::with_capacity(input.len());
-        let mut rest = input.as_str();
-
-        loop {
-            if self.stripping {
-                if let Some(end_pos) = find_real_thinking_end_tag(rest) {
-                    rest = &rest[end_pos + THINKING_END_TAG.len()..];
-                    self.stripping = false;
-                    continue;
-                }
-
-                // Everything in an open block is hidden. Retain only a possible
-                // split closing delimiter (and its quote marker) for the next chunk.
-                let keep = partial_thinking_tag_suffix_len(rest);
-                self.buffer = rest[rest.len().saturating_sub(keep)..].to_string();
-                return out;
-            }
-
-            let start = find_real_thinking_start_tag(rest);
-            let orphan_end = find_real_thinking_end_tag(rest);
-
-            // A closing delimiter outside a block is transport residue as well.
-            if let Some(end_pos) = orphan_end
-                && start.is_none_or(|start_pos| end_pos < start_pos)
-            {
-                out.push_str(&rest[..end_pos]);
-                rest = &rest[end_pos + THINKING_END_TAG.len()..];
-                continue;
-            }
-
-            if let Some(start_pos) = start {
-                out.push_str(&rest[..start_pos]);
-                rest = &rest[start_pos + THINKING_START_TAG.len()..];
-                self.stripping = true;
-                continue;
-            }
-
-            let keep = partial_thinking_tag_suffix_len(rest);
-            let emit_len = rest.len().saturating_sub(keep);
-            out.push_str(&rest[..emit_len]);
-            self.buffer = rest[emit_len..].to_string();
-            return out;
-        }
-    }
-
-    pub(crate) fn finish(&mut self) -> String {
-        let remaining = std::mem::take(&mut self.buffer);
-        if self.stripping {
-            self.stripping = false;
-            return String::new();
-        }
-        strip_unquoted_partial_thinking_tag_suffix(&remaining)
-    }
-}
-
-/// One-shot counterpart used by buffered/non-streaming paths.
-pub(crate) fn strip_thinking_xml_tags(text: &str) -> String {
-    let stripped = text
-        .replace(THINKING_START_TAG, "")
-        .replace(THINKING_END_TAG, "");
-    strip_unquoted_partial_thinking_tag_suffix(&stripped)
-}
-
-/// `s` 是否可能是 `<tool_use` 真标签的开头（用于开标签尚未闭合时的跨 chunk 判定）。
-fn is_potential_tool_use_tag_start(s: &str) -> bool {
-    TOOL_USE_XML_PREFIX.starts_with(s)
-        || s.get(TOOL_USE_XML_PREFIX.len()..)
-            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
-}
-
-/// 返回 `s` 末尾「恰好是 `needle` 某个前缀」的最长长度（chunk 边界保留用）。
-/// 用于把可能被切断的 `<tool_use` / `</tool_use>` 标签保留到下个 chunk 再判定。
-fn longest_prefix_suffix(s: &str, needle: &str) -> usize {
-    let max = s.len().min(needle.len().saturating_sub(1));
-    for len in (1..=max).rev() {
-        if s.is_char_boundary(s.len() - len) && needle.starts_with(&s[s.len() - len..]) {
-            return len;
-        }
-    }
-    0
-}
-
-/// Bytes to retain while scanning ordinary assistant text for a thinking tag
-/// split at a chunk boundary. Keep the preceding delimiter too, because the
-/// completed tag detector needs it to distinguish quoted examples from real XML.
-fn partial_thinking_tag_suffix_len(s: &str) -> usize {
-    let tag_len = longest_prefix_suffix(s, THINKING_START_TAG)
-        .max(longest_prefix_suffix(s, THINKING_END_TAG));
-    if tag_len == 0 {
-        return 0;
-    }
-    let tag_start = s.len() - tag_len;
-    if tag_start > 0 && is_quote_char(s, tag_start - 1) {
-        tag_len + 1
-    } else {
-        tag_len
-    }
-}
-
-fn strip_unquoted_partial_thinking_tag_suffix(text: &str) -> String {
-    let start_len = longest_prefix_suffix(text, THINKING_START_TAG);
-    let end_len = longest_prefix_suffix(text, THINKING_END_TAG);
-    let tag_len = start_len.max(end_len);
-    if tag_len == 0 {
-        return text.to_string();
-    }
-    let tag_start = text.len() - tag_len;
-    let quoted = tag_start > 0
-        && if end_len >= start_len {
-            is_thinking_end_quote_char(text, tag_start - 1)
-        } else {
-            is_quote_char(text, tag_start - 1)
-        };
-    if quoted {
-        text.to_string()
-    } else {
-        text[..tag_start].to_string()
-    }
-}
+use crate::kiro::model::events::{MarkdownCodeTracker, ToolUseXmlLeakFilter};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -355,31 +67,16 @@ fn is_quote_char(buffer: &str, pos: usize) -> bool {
         .unwrap_or(false)
 }
 
-/// 结束标签只把真正的引用定界符视为“被引用”。
-///
-/// `QUOTE_CHARS` 还服务于开始标签和其他 XML 嗅探，包含句号、冒号、右括号等
-/// 保守字符；结束标签不能复用那套规则，否则 `done.</thinking>answer` 会被误判
-/// 为正文中提及标签，导致 answer 继续落进 thinking。
-fn is_thinking_end_quote_char(buffer: &str, pos: usize) -> bool {
-    buffer
-        .as_bytes()
-        .get(pos)
-        .is_some_and(|c| matches!(c, b'`' | b'"' | b'\''))
-}
-
-fn is_thinking_end_tag_quoted(buffer: &str, tag_pos: usize) -> bool {
-    let before = tag_pos > 0 && is_thinking_end_quote_char(buffer, tag_pos - 1);
-    let after = is_thinking_end_quote_char(buffer, tag_pos + THINKING_END_TAG.len());
-    before || after
-}
-
-/// 查找完整的、未被引用的 thinking 结束标签。
+/// 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
 ///
 /// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号、引号等包裹，
+/// 或者在同一行有其他内容（如"关于 </thinking> 标签"）。
 /// 这个函数会跳过这些情况，只返回真正的结束标签位置。
 ///
-/// 标签本身一旦完整到达就立即切换通道；标签后的格式不作假设，可以是空格、换行
-/// 或直接正文。只有标签被拆分时才继续缓冲。
+/// 跳过的情况：
+/// - 被引用字符包裹（反引号、引号等）
+/// - 后面没有双换行符（真正的结束标签后面会有 `\n\n`）
+/// - 标签在缓冲区末尾（流式处理时需要等待更多内容）
 ///
 /// # 参数
 /// - `buffer`: 要搜索的字符串
@@ -388,20 +85,56 @@ fn is_thinking_end_tag_quoted(buffer: &str, tag_pos: usize) -> bool {
 /// - `Some(pos)`: 真正的结束标签的起始位置
 /// - `None`: 没有找到真正的结束标签
 fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
+    const TAG: &str = "</thinking>";
     let mut search_start = 0;
 
-    while let Some(pos) = buffer[search_start..].find(THINKING_END_TAG) {
+    while let Some(pos) = buffer[search_start..].find(TAG) {
         let absolute_pos = search_start + pos;
 
-        if is_thinking_end_tag_quoted(buffer, absolute_pos) {
+        // 检查前面是否有引用字符
+        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
+
+        // 检查后面是否有引用字符
+        let after_pos = absolute_pos + TAG.len();
+        let has_quote_after = is_quote_char(buffer, after_pos);
+
+        // 如果被引用字符包裹，跳过
+        if has_quote_before || has_quote_after {
             search_start = absolute_pos + 1;
             continue;
         }
 
-        return Some(absolute_pos);
+        // 检查后面的内容
+        let after_content = &buffer[after_pos..];
+
+        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
+        if after_content.len() < 2 {
+            return None;
+        }
+
+        // 真正的 thinking 结束标签后面是换行：`\n\n`，或一个 `\n` 后紧跟正文（L1）。
+        if after_content.starts_with("\n\n")
+            || (after_content.starts_with('\n') && !after_content[1..].starts_with('\n'))
+        {
+            return Some(absolute_pos);
+        }
+
+        // 不是双换行符，跳过继续搜索
+        search_start = absolute_pos + 1;
     }
 
     None
+}
+
+/// `find_real_thinking_end_tag` 命中位置之后要剥掉的字节数：标签本身加其后的 1–2 个换行。
+fn thinking_end_tag_strip_len(buffer: &str, pos: usize) -> usize {
+    let after = pos + "</thinking>".len();
+    let newlines = buffer[after..]
+        .bytes()
+        .take(2)
+        .take_while(|&b| b == b'\n')
+        .count();
+    "</thinking>".len() + newlines
 }
 
 /// 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
@@ -412,17 +145,24 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
 /// 约束：只有当 `</thinking>` 之后全部都是空白字符时才认为是结束标签，
 /// 以避免在 thinking 内容中提到 `</thinking>`（非结束标签）时误判。
 fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
+    const TAG: &str = "</thinking>";
     let mut search_start = 0;
 
-    while let Some(pos) = buffer[search_start..].find(THINKING_END_TAG) {
+    while let Some(pos) = buffer[search_start..].find(TAG) {
         let absolute_pos = search_start + pos;
 
-        if is_thinking_end_tag_quoted(buffer, absolute_pos) {
+        // 检查前面是否有引用字符
+        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
+
+        // 检查后面是否有引用字符
+        let after_pos = absolute_pos + TAG.len();
+        let has_quote_after = is_quote_char(buffer, after_pos);
+
+        if has_quote_before || has_quote_after {
             search_start = absolute_pos + 1;
             continue;
         }
 
-        let after_pos = absolute_pos + THINKING_END_TAG.len();
         // 只有当标签后面全部是空白字符时才认定为结束标签
         if buffer[after_pos..].trim().is_empty() {
             return Some(absolute_pos);
@@ -438,16 +178,17 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
 ///
 /// 与 `find_real_thinking_end_tag` 类似，跳过被引用字符包裹的开始标签。
 fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
+    const TAG: &str = "<thinking>";
     let mut search_start = 0;
 
-    while let Some(pos) = buffer[search_start..].find(THINKING_START_TAG) {
+    while let Some(pos) = buffer[search_start..].find(TAG) {
         let absolute_pos = search_start + pos;
 
         // 检查前面是否有引用字符
         let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
 
         // 检查后面是否有引用字符
-        let after_pos = absolute_pos + THINKING_START_TAG.len();
+        let after_pos = absolute_pos + TAG.len();
         let has_quote_after = is_quote_char(buffer, after_pos);
 
         // 如果不被引用字符包裹，则是真正的开始标签
@@ -605,65 +346,161 @@ fn extract_name_attr(tag: &str) -> Option<String> {
     Some(tag[start..start + end_rel].to_string())
 }
 
-/// 解析一个完整 invoke 块，抠出 (tool_name, input_json_string)
+/// 严格解析一个完整 invoke 块，返回 (tool_name, [(参数名, 原始字符串值)])。
 ///
-/// - tool name 来自 invoke 开标签的 `name="..."`（兼容 antml: 前缀）
-/// - 参数为零个或多个 `<parameter name="K">V</parameter>`（兼容前缀）
-/// - 参数值取到下一个参数开标签前的**最后一个** `</parameter>` 为界（贪婪），
-///   允许多行 / 含 `<` / 中文 / 含字面 `</parameter>`（P0-1 修复）
-/// - 用 serde_json 拼成 object（值都是字符串，自动转义）
-/// - 无合法 name 或拼不出合法 JSON 返回 `None`
-fn parse_invoke_block(block: &str) -> Option<(String, String)> {
-    // invoke 开标签 = 块开头到第一个 '>'
+/// - tool name 来自 invoke 开标签的 `name="..."`（兼容前缀写法）；
+/// - 参数值取到下一个参数开标签前的**最后一个** `</parameter>` 为界（允许多行 / 含 `<` /
+///   含字面 `</parameter>`）；
+/// - 参数之间、参数与闭标签之间只允许空白。参数未闭合、重名、有游离正文都返回 `None`：
+///   拿不准就不合成，整块按正文保留。
+fn parse_invoke_block_strict(block: &str) -> Option<(String, Vec<(String, String)>)> {
     let open_end = block.find('>')?;
-    let open_tag = &block[..=open_end];
-    let tool_name = extract_name_attr(open_tag)?;
+    let tool_name = extract_name_attr(&block[..=open_end])?;
     if tool_name.is_empty() {
         return None;
     }
-
-    let mut map = serde_json::Map::new();
     let body = &block[open_end + 1..];
+    // 块尾的闭标签（`</invoke>` / `</prefix:invoke>`）。
+    let inner = &body[..body.rfind("</")?];
+
+    let mut params: Vec<(String, String)> = Vec::new();
     let mut cursor = 0usize;
-    while let Some(rel) = body[cursor..].find("parameter name=\"") {
-        let name_kw = cursor + rel;
-        // 确认是真正的 '<parameter' 或 '<prefix:parameter' 开标签
-        // name_kw 指向 'parameter'，往前应是 '<' 或 '<prefix:'
-        // 确认是真正的开标签（'<parameter' / '<prefix:parameter'）；仅用于校验，不需要位置值
-        if open_tag_lt_pos(body, name_kw).is_none() {
-            cursor = name_kw + "parameter".len();
-            continue;
-        }
-        // 找该参数开标签的 '>'
-        let tag_gt = match body[name_kw..].find('>') {
-            Some(r) => name_kw + r,
-            None => break, // 开标签未闭合，停止
-        };
-        let param_open_tag = &body[name_kw..tag_gt + 1];
-        // 从 'parameter name="..."' 抠 key（剥掉前缀干扰：直接找 name="）
-        let key = match extract_name_attr(param_open_tag) {
-            Some(k) => k,
-            None => {
-                cursor = tag_gt + 1;
-                continue;
+    loop {
+        let rest = &inner[cursor..];
+        let Some(lt_rel) = rest.find('<') else {
+            if !rest.trim().is_empty() {
+                return None;
             }
+            break;
         };
-        // 参数值取到 </parameter>（兼容前缀）为界。find_param_close 较贵，只调一次，
-        // 同时复用 (闭标签起始, 闭标签结束) 两个值：起始用于切值，结束用于推进游标。
+        if !rest[..lt_rel].trim().is_empty() {
+            return None;
+        }
+        let lt = cursor + lt_rel;
+        let name_kw = lt + inner[lt..].find("parameter")?;
+        if open_tag_lt_pos(inner, name_kw) != Some(lt) {
+            return None;
+        }
+        let tag_gt = name_kw + inner[name_kw..].find('>')?;
+        let key = extract_name_attr(&inner[name_kw..=tag_gt])?;
+        if key.is_empty() || params.iter().any(|(k, _)| *k == key) {
+            return None;
+        }
         let val_start = tag_gt + 1;
-        let (close_start, close_end) = match find_param_close(body, val_start) {
-            Some(pair) => pair,
-            None => break, // 值未闭合，停止
-        };
-        let value = &body[val_start..close_start];
-        map.insert(key, serde_json::Value::String(value.to_string()));
-        // 推进到闭标签之后
+        let (close_start, close_end) = find_param_close(inner, val_start)?;
+        params.push((key, inner[val_start..close_start].to_string()));
         cursor = close_end;
     }
+    Some((tool_name, params))
+}
 
-    let obj = serde_json::Value::Object(map);
-    let s = serde_json::to_string(&obj).ok()?;
-    Some((tool_name, s))
+/// 按工具 input_schema 把 invoke 的字符串参数恢复成带类型的 JSON 对象（H2）。
+///
+/// 拿不准就返回 `None`（整块按正文保留）：
+/// - schema 声明了 `properties` 时，未声明的参数只有 `additionalProperties` 显式允许才接受；
+/// - `required` 里的参数必须都在；
+/// - 参数按 `type` 解析（见 [`coerce_invoke_value`]），有 `enum` 时值必须在枚举里。
+fn coerce_invoke_params(
+    params: &[(String, String)],
+    schema: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let properties = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .filter(|p| !p.is_empty());
+    let extra_allowed = match schema.get("additionalProperties") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Object(_)) => true,
+        _ => properties.is_none(),
+    };
+    let mut out = serde_json::Map::new();
+    for (key, raw) in params {
+        let value = match properties.and_then(|p| p.get(key)) {
+            Some(prop) => coerce_invoke_value(raw, prop)?,
+            None if extra_allowed => serde_json::Value::String(raw.clone()),
+            None => return None,
+        };
+        out.insert(key.clone(), value);
+    }
+    if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
+        if required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|name| !out.contains_key(name))
+        {
+            return None;
+        }
+    }
+    Some(serde_json::Value::Object(out))
+}
+
+/// 按单个参数的 schema 解析字符串值。integer / number / boolean / null 严格匹配，
+/// array / object 须能解析成对应 JSON，string 原样保留；多类型时非字符串类型优先
+/// （`60000` 对 `integer|string` 恢复成数字）。没有类型约束（含 anyOf 里无类型的分支）
+/// 时按字符串保留。
+fn coerce_invoke_value(raw: &str, schema: &serde_json::Value) -> Option<serde_json::Value> {
+    fn collect<'a>(schema: &'a serde_json::Value, types: &mut Vec<&'a str>) -> bool {
+        match schema.get("type") {
+            Some(serde_json::Value::String(t)) => types.push(t.as_str()),
+            Some(serde_json::Value::Array(ts)) => types.extend(ts.iter().filter_map(|t| t.as_str())),
+            _ => return false,
+        }
+        true
+    }
+    let mut types: Vec<&str> = Vec::new();
+    let mut untyped_branch = false;
+    let top_typed = collect(schema, &mut types);
+    let mut has_branches = false;
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(key).and_then(|v| v.as_array()) {
+            for branch in branches {
+                has_branches = true;
+                if !collect(branch, &mut types) {
+                    untyped_branch = true;
+                }
+            }
+        }
+    }
+    if untyped_branch || (!top_typed && !has_branches) {
+        types.push("string");
+    }
+    let value = match types
+        .iter()
+        .filter(|t| **t != "string")
+        .find_map(|t| coerce_invoke_scalar(raw, t))
+    {
+        Some(v) => v,
+        None if types.contains(&"string") => serde_json::Value::String(raw.to_string()),
+        None => return None,
+    };
+    if let Some(allowed) = schema.get("enum").and_then(|v| v.as_array()) {
+        if !allowed.contains(&value) {
+            return None;
+        }
+    }
+    Some(value)
+}
+
+fn coerce_invoke_scalar(raw: &str, ty: &str) -> Option<serde_json::Value> {
+    let t = raw.trim();
+    let json_of = |pred: fn(&serde_json::Value) -> bool| {
+        serde_json::from_str::<serde_json::Value>(t)
+            .ok()
+            .filter(|v| pred(v))
+    };
+    match ty {
+        "integer" => t.parse::<i64>().ok().map(serde_json::Value::from),
+        "number" => json_of(serde_json::Value::is_number),
+        "boolean" => match t {
+            "true" => Some(serde_json::Value::Bool(true)),
+            "false" => Some(serde_json::Value::Bool(false)),
+            _ => None,
+        },
+        "null" => (t == "null").then_some(serde_json::Value::Null),
+        "array" => json_of(serde_json::Value::is_array),
+        "object" => json_of(serde_json::Value::is_object),
+        _ => None,
+    }
 }
 
 /// 从 `from` 开始查找第一个 parameter 闭标签，返回 (起始位置, 结束位置 exclusive)
@@ -739,6 +576,9 @@ const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
 /// 设为 32 远高于正常上限、又远低于退化时的数万次，既不误伤正常引导词，又能尽早止血。
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 
+/// 复读熔断触发后返回给客户端的错误（L5）。措辞让客户端按「流中断、可重试」处理。
+pub(crate) const REPEAT_GUARD_ERROR_MESSAGE: &str = "Upstream response stream was interrupted: the model output degenerated into a repeated-token loop. Retry the request.";
+
 /// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
 ///
 /// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
@@ -809,68 +649,294 @@ fn strip_trailing_stray_tokens(before: &str) -> &str {
     &before[..end]
 }
 
-/// 判定一个 `<invoke>` 块到底像“真泄漏的工具调用”还是“正文里讨论的文本”
-///
-/// 实测真泄漏的 `<invoke>` 都出现在**行首**（前面是流的开头、或上一行已经换行结束），
-/// 而正文讨论里的 `<invoke>` 一般**嵌在一句话中间**——前面同一行还有普通文字。
-///
-/// 判定规则（输入 `before` 是 `<invoke>` 之前、已剥过 stray token 的文本）：
-/// - `before` 为空（`<invoke>` 在流开头）→ 像真泄漏，抓。
-/// - `before` 去掉尾部空格/制表符后以换行结尾（`<invoke>` 独占新行）→ 抓。
-/// - 否则（同一行前面还有非空白正文）→ 像讨论文本，不抓。
-///
-/// 注意：这里的“尾部空白”只剥行内空白（空格 / 制表符），不剥换行；
-/// 换行结尾才是“另起一行”的信号。
+/// `<invoke>` 前的文本是否让它处在行首：前面没有文本，或上一行已经以换行结束。
+/// 同一行前面有任何字符（包括缩进空白、列表符号、引用符号）都不算行首。
 fn invoke_looks_like_real_leak(before: &str) -> bool {
-    // 剥掉尾部的行内空白（空格 / 制表符），但保留换行
-    let trimmed = before.trim_end_matches([' ', '\t']);
-    // 行首：要么前面什么都没有，要么上一行已经以换行结束
-    trimmed.is_empty() || trimmed.ends_with('\n') || trimmed.ends_with('\r')
+    before.is_empty() || before.ends_with('\n')
 }
 
-/// 推进「代码围栏」奇偶状态，对切分到多个 chunk 的 ``` 分隔符鲁棒。
+/// 已输出正文的状态 `code` 之后再接 `before`，下一个字符是否位于行首。
+fn at_line_start_after(code: &MarkdownCodeTracker, before: &str) -> bool {
+    if before.is_empty() {
+        code.at_line_start()
+    } else {
+        invoke_looks_like_real_leak(before)
+    }
+}
+
+/// 允许从 `<invoke>` 文本合成工具调用的工具：Kiro 侧工具名 → 发给上游的 input_schema。
+/// 只包含本次请求声明的工具；为空时不合成任何调用。
+pub(crate) type InvokeToolSchemas = HashMap<String, serde_json::Value>;
+
+/// 从发给上游的请求里取出本次声明工具的 input_schema（与模型看到的完全一致）。
+/// 只保留 `known_tool_names` 里的工具，排除为历史补的占位工具。
+pub(crate) fn invoke_tool_schemas_from_state(
+    state: &crate::kiro::model::requests::conversation::ConversationState,
+    known_tool_names: &std::collections::HashSet<String>,
+) -> InvokeToolSchemas {
+    state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .tools
+        .iter()
+        .filter(|tool| known_tool_names.contains(&tool.tool_specification.name))
+        .map(|tool| {
+            (
+                tool.tool_specification.name.clone(),
+                tool.tool_specification.input_schema.json.clone(),
+            )
+        })
+        .collect()
+}
+
+/// 行首出现 `<invoke` 后最多等多少字节的 `</invoke>`；超过就按正文放出，避免一个永不闭合的
+/// 标签扣住后续全部回复。正常的 invoke（包括大 patch）远小于此。
+const MAX_INVOKE_HOLD_BYTES: usize = 262_144;
+
+/// 已识别、暂时扣住的末尾工具调用组。
+#[derive(Debug)]
+struct InvokeCandidate {
+    /// 被扣住的原文（含块前的 stray token 行），放弃合成时原样吐回。
+    raw: String,
+    /// Kiro 侧工具名 + 已按 schema 恢复类型的入参。
+    calls: Vec<(String, serde_json::Value)>,
+}
+
+/// [`InvokeSniffer`] 的输出，保持原文顺序。
+#[derive(Debug)]
+pub(crate) enum SniffOutput {
+    Text(String),
+    /// Kiro 侧工具名 + 已按 schema 恢复类型的入参。
+    ToolCall {
+        name: String,
+        input: serde_json::Value,
+    },
+}
+
+/// 从明文里识别模型写成文本的 `<invoke>` 工具调用（H2）。
 ///
-/// 只在遇到换行符时才对「已重组的完整行」判定是否为围栏行（行首去空白后以 ``` 开头）。
-/// 未遇换行的尾部留在 `partial` 里，等后续 chunk 拼齐——所以即使 ``` 被切成
-/// `` `` `` + `` ` `` 两个 chunk，重组成完整行后仍能正确翻转 `open`。
-///
-/// 返回值仅在内部使用；主要副作用是更新 `open` 与 `partial`。
-fn advance_code_fence_state(open: &mut bool, partial: &mut String, text: &str) {
-    for ch in text.chars() {
-        if ch == '\n' {
-            if partial.trim_start().starts_with("```") {
-                *open = !*open;
-            }
-            partial.clear();
+/// 模型在正文里讲解或举例的工具调用不能变成真实调用，所以只有同时满足以下条件才合成，
+/// 其余一律原样作为正文：
+/// - 本轮没有原生 tool_use（出现原生调用后调用 [`InvokeSniffer::abandon`]）；
+/// - 块位于整段回复末尾：之后只剩空白或同样合格的块，中途再出现正文就整组按正文放出；
+/// - 块在行首（允许前面一行是孤立的 stray token），且不在 ``` / ~~~ 围栏、缩进代码块、行内反引号里；
+/// - 工具名在本次请求声明的工具里，参数能按该工具的 input_schema 解析（类型按 schema 恢复）。
+#[derive(Debug, Default)]
+pub(crate) struct InvokeSniffer {
+    buffer: String,
+    code: MarkdownCodeTracker,
+    candidate: Option<InvokeCandidate>,
+    disabled: bool,
+}
+
+impl InvokeSniffer {
+    /// 喂入一段明文，返回可以立即输出的内容。
+    pub(crate) fn push(&mut self, text: &str, schemas: &InvokeToolSchemas) -> Vec<SniffOutput> {
+        self.buffer.push_str(text);
+        let mut out = Vec::new();
+        self.drain(schemas, false, &mut out);
+        out
+    }
+
+    /// 流结束：末尾仍成立的候选块合成为工具调用，其余全部作为正文放出。
+    pub(crate) fn finish(&mut self, schemas: &InvokeToolSchemas) -> Vec<SniffOutput> {
+        let mut out = Vec::new();
+        self.drain(schemas, true, &mut out);
+        if let Some(candidate) = self.candidate.take() {
+            // drain(at_end) 之后仍有候选，说明其后只剩空白：丢弃空白，合成调用。
+            self.buffer.clear();
+            out.extend(
+                candidate
+                    .calls
+                    .into_iter()
+                    .map(|(name, input)| SniffOutput::ToolCall { name, input }),
+            );
+        }
+        let rest = std::mem::take(&mut self.buffer);
+        self.emit_text(rest, &mut out);
+        out
+    }
+
+    /// 本轮出现了原生 tool_use：不再合成，已扣住的文本按原顺序放出。
+    pub(crate) fn abandon(&mut self) -> Vec<SniffOutput> {
+        self.disabled = true;
+        let mut out = Vec::new();
+        self.release_candidate(&mut out);
+        let rest = std::mem::take(&mut self.buffer);
+        self.emit_text(rest, &mut out);
+        out
+    }
+
+    fn emit_text(&mut self, text: String, out: &mut Vec<SniffOutput>) {
+        if text.is_empty() {
+            return;
+        }
+        self.code.advance(&text);
+        if let Some(SniffOutput::Text(last)) = out.last_mut() {
+            last.push_str(&text);
         } else {
-            partial.push(ch);
+            out.push(SniffOutput::Text(text));
         }
+    }
+
+    fn emit_prefix(&mut self, len: usize, out: &mut Vec<SniffOutput>) {
+        let text: String = self.buffer.drain(..len).collect();
+        self.emit_text(text, out);
+    }
+
+    fn release_candidate(&mut self, out: &mut Vec<SniffOutput>) {
+        if let Some(candidate) = self.candidate.take() {
+            self.emit_text(candidate.raw, out);
+        }
+    }
+
+    fn drain(&mut self, schemas: &InvokeToolSchemas, at_end: bool, out: &mut Vec<SniffOutput>) {
+        if self.disabled || schemas.is_empty() {
+            self.release_candidate(out);
+            let rest = std::mem::take(&mut self.buffer);
+            self.emit_text(rest, out);
+            return;
+        }
+        loop {
+            if self.candidate.is_some() {
+                let rest = self.buffer.as_str();
+                let gap_len = rest.len() - rest.trim_start().len();
+                if gap_len == rest.len() {
+                    // 候选之后只有空白：继续等（流结束时由 finish 合成）。
+                    return;
+                }
+                let gap_ok = gap_len == 0 || rest[..gap_len].ends_with('\n');
+                if gap_ok {
+                    let tail = &rest[gap_len..];
+                    if find_invoke_start(tail) == Some(0) {
+                        match find_invoke_block_end(tail, 0) {
+                            Some(end) => {
+                                if let Some(call) = validate_invoke_block(&tail[..end], schemas) {
+                                    let raw: String = self.buffer.drain(..gap_len + end).collect();
+                                    if let Some(candidate) = self.candidate.as_mut() {
+                                        candidate.raw.push_str(&raw);
+                                        candidate.calls.push(call);
+                                    }
+                                    continue;
+                                }
+                            }
+                            None if !at_end
+                                && tail.len() <= MAX_INVOKE_HOLD_BYTES
+                                && !open_invoke_tag_rejected(tail, schemas) =>
+                            {
+                                return;
+                            }
+                            None => {}
+                        }
+                    } else if !at_end && could_become_invoke_open(tail) {
+                        return;
+                    }
+                }
+                // 候选块之后又出现了正文：整组按正文放出，再按普通文本继续扫描。
+                self.release_candidate(out);
+                continue;
+            }
+
+            let Some(start) = find_invoke_start(&self.buffer) else {
+                let hold = if at_end { 0 } else { self.partial_invoke_hold_len() };
+                let emit = self.buffer.len() - hold;
+                self.emit_prefix(emit, out);
+                return;
+            };
+            let before = &self.buffer[..start];
+            let stripped_len = strip_trailing_stray_tokens(before).len();
+            let eligible = {
+                let stripped = &before[..stripped_len];
+                let mut probe = self.code.clone();
+                probe.advance(stripped);
+                at_line_start_after(&self.code, before)
+                    && at_line_start_after(&self.code, stripped)
+                    && !probe.in_code()
+            };
+            if !eligible {
+                self.emit_prefix(start + 1, out);
+                continue;
+            }
+            match find_invoke_block_end(&self.buffer, start) {
+                Some(end) => match validate_invoke_block(&self.buffer[start..end], schemas) {
+                    Some(call) => {
+                        self.emit_prefix(stripped_len, out);
+                        let raw: String = self.buffer.drain(..end - stripped_len).collect();
+                        self.candidate = Some(InvokeCandidate {
+                            raw,
+                            calls: vec![call],
+                        });
+                    }
+                    None => self.emit_prefix(end, out),
+                },
+                None => {
+                    let tail = &self.buffer[start..];
+                    if at_end
+                        || tail.len() > MAX_INVOKE_HOLD_BYTES
+                        || open_invoke_tag_rejected(tail, schemas)
+                    {
+                        self.emit_prefix(start + 1, out);
+                    } else {
+                        // 块还没到齐：先放出块前正文，块（含 stray token 行）留着等。
+                        self.emit_prefix(stripped_len, out);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 缓冲区末尾可能长成行首 `<invoke` 开标签的字节数（需要留着等下一段）。
+    fn partial_invoke_hold_len(&self) -> usize {
+        let buf = self.buffer.as_str();
+        let Some(lt) = buf.rfind('<') else {
+            return 0;
+        };
+        if !could_become_invoke_open(&buf[lt..]) || !at_line_start_after(&self.code, &buf[..lt]) {
+            return 0;
+        }
+        buf.len() - lt
     }
 }
 
-/// 纯函数：在不改动真实状态的前提下，试算「把 `text` 走完之后围栏是否打开」。
-/// 用于 drain 决策处判断某个 `<invoke>` 是否落在围栏内。
-fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
-    let mut o = open;
-    let mut p = partial.to_string();
-    advance_code_fence_state(&mut o, &mut p, text);
-    // 还要考虑：partial 里残留的「未换行行」如果本身已经是 ``` 开头，
-    // 它在遇到换行前不算翻转（保守：只有完整行才翻转）。这里返回已翻转的 o。
-    o
+/// `tail`（以 `<` 开头）是否还可能长成 `<invoke` / `<prefix:invoke` 开标签。
+fn could_become_invoke_open(tail: &str) -> bool {
+    const NAME: &str = "invoke";
+    let Some(rest) = tail.strip_prefix('<') else {
+        return false;
+    };
+    if rest.len() > 64 {
+        return false;
+    }
+    let is_ident = |s: &str| s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+    match rest.find(':') {
+        Some(colon) => {
+            let prefix = &rest[..colon];
+            !prefix.is_empty() && is_ident(prefix) && NAME.starts_with(&rest[colon + 1..])
+        }
+        // 可能是裸 `<invoke` 的前缀，也可能是还没写到 `:` 的命名空间前缀。
+        None => is_ident(rest),
+    }
 }
 
-/// 计算缓冲区末尾“可能是部分 `<invoke` 开标签前缀”的字节数，需要保留等待更多内容
-///
-/// 例如缓冲区以 `<inv` / `<` / `<i` 结尾时，可能是被切碎的 invoke 开标签，
-/// 保留这段尾巴等下一个 chunk 拼齐，避免把半个标签当文本吐出去。
-fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
-    // 任何形如 `<...`（最后一个 '<' 之后没有 '>'）的尾巴都可能是部分开标签
-    if let Some(lt) = buf.rfind('<') {
-        if !buf[lt..].contains('>') {
-            return buf.len() - lt;
-        }
+/// 未闭合块的开标签已经完整、但工具名不在可合成表里：不必再等，直接按正文放出。
+fn open_invoke_tag_rejected(tail: &str, schemas: &InvokeToolSchemas) -> bool {
+    match tail.find('>') {
+        Some(gt) => extract_name_attr(&tail[..=gt]).is_none_or(|name| !schemas.contains_key(&name)),
+        None => false,
     }
-    0
+}
+
+/// 解析并按 schema 校验一个完整 invoke 块，返回 (Kiro 侧工具名, 带类型的入参)。
+fn validate_invoke_block(
+    block: &str,
+    schemas: &InvokeToolSchemas,
+) -> Option<(String, serde_json::Value)> {
+    let (name, params) = parse_invoke_block_strict(block)?;
+    let schema = schemas.get(&name)?;
+    let input = coerce_invoke_params(&params, schema)?;
+    Some((name, input))
 }
 
 /// 从完整文本中提取 thinking 块（用于非流式响应）
@@ -882,158 +948,89 @@ fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
 /// - `(Some(thinking_content), remaining_text)` — 检测到有效 thinking 块
 /// - `(None, original_text)` — 未检测到，原样返回
 pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>, String) {
-    let mut cursor = 0;
-    let mut thinking_parts = Vec::new();
+    // M1：只有回复开头（去掉前导空白后）的 <thinking> 才是思考块；正文中间的字面量按正文保留。
+    let start_pos = match find_real_thinking_start_tag(text) {
+        Some(pos) if text[..pos].trim().is_empty() => pos,
+        _ => return (None, text.to_string()),
+    };
+
+    let before = &text[..start_pos];
+    let after_open = &text[start_pos + "<thinking>".len()..];
+
+    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
+    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + thinking_end_tag_strip_len(after_open, end_pos)..],
+        )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
+    } else {
+        // 找不到有效的结束标签，不做提取
+        return (None, text.to_string());
+    };
+
+    // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
+    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
+
+    // 组装剩余文本：跳过纯空白的 before 部分
     let mut remaining = String::new();
-
-    while cursor < text.len() {
-        let rest = &text[cursor..];
-        let start = find_real_thinking_start_tag(rest);
-        let orphan_end = find_real_thinking_end_tag(rest);
-
-        if let Some(end_pos) = orphan_end
-            && start.is_none_or(|start_pos| end_pos < start_pos)
-        {
-            remaining.push_str(&rest[..end_pos]);
-            cursor += end_pos + THINKING_END_TAG.len();
-            continue;
-        }
-
-        let Some(start_pos) = start else {
-            remaining.push_str(rest);
-            break;
-        };
-        if !rest[..start_pos].trim().is_empty() {
-            remaining.push_str(&rest[..start_pos]);
-        }
-
-        let after_open_pos = start_pos + THINKING_START_TAG.len();
-        let after_open = &rest[after_open_pos..];
-        let Some(end_pos) = find_real_thinking_end_tag(after_open) else {
-            // A truncated final thinking block is still hidden reasoning. Keeping it in
-            // visible text would reproduce the exact XML leak this extractor prevents.
-            let thinking = after_open.strip_prefix('\n').unwrap_or(after_open);
-            if !thinking.is_empty() {
-                thinking_parts.push(thinking.to_string());
-            }
-            break;
-        };
-
-        let thinking = after_open[..end_pos]
-            .strip_prefix('\n')
-            .unwrap_or(&after_open[..end_pos]);
-        if !thinking.is_empty() {
-            thinking_parts.push(thinking.to_string());
-        }
-        cursor += after_open_pos + end_pos + THINKING_END_TAG.len();
-        while text[cursor..].starts_with(char::is_whitespace) {
-            cursor += text[cursor..].chars().next().unwrap().len_utf8();
-        }
+    if !before.trim().is_empty() {
+        remaining.push_str(before);
     }
+    remaining.push_str(text_after);
 
-    let remaining = strip_unquoted_partial_thinking_tag_suffix(&remaining);
-    if thinking_parts.is_empty() {
+    if thinking_content.is_empty() {
         (None, remaining)
     } else {
-        (Some(thinking_parts.join("\n\n")), remaining)
+        (Some(thinking_content.to_string()), remaining)
     }
 }
 
-/// 一次性（非流式 / 整段已完整）把 assistant 文本切成 Anthropic content block 序列，
-/// 把混在文本里的字面 `<invoke name="...">...</invoke>` 工具调用捞回成结构化 `tool_use`。
+/// 一次性（非流式 / 整段已完整）把 assistant 文本切成 Anthropic content block 序列。
 ///
-/// 复用与流式 `drain_invoke_sniff_buffer` **完全相同**的安全判定，避免误抓正文里讨论的命令：
-///   ① 行首判定 `invoke_looks_like_real_leak`（块前去 stray token 后须在行首）
-///   ② 代码围栏判定 `fence_open_after`（被 ``` 包裹的展示文本不捞）
-///   ③ 工具表硬护栏 `known_tool_names`（解析出的工具名必须是本次请求声明的工具）
-/// 任一不满足 → 该 `<invoke>` 块当普通文本原样保留。
-///
-/// 与流式版本的区别：这里输入是**已完整**的整段文本，所以不需要 hold 缓冲、
-/// 部分开标签、`MAX_INVOKE_HOLD_BYTES` 那套增量逻辑——直接线性扫描即可。
-///
-/// 返回的 content block 形态与调用方现有约定一致：
-///   - 文本：`{"type":"text","text": "..."}`
-///   - 工具：`{"type":"tool_use","id":"toolu_...","name":"...","input": {...}}`
-/// 文本块按需合并相邻片段；空文本片段不产出。`input` 解析失败时 fall back 成 `{}`。
-///
-/// `tool_name_map`（短名 → 原始名）用于把捞回的工具名还原成客户端可识别的原始名，
-/// 经统一入口 `CompletedToolUse::from_kiro`；映射为空或命中失败时按原名返回。
+/// 与流式路径共用 [`InvokeSniffer`]，规则完全一致（H2）：只有回复末尾、行首、代码外、
+/// 工具已声明且参数符合 schema 的 `<invoke>` 块才合成 tool_use，其余原样作为文本。
+/// 调用方负责在已有原生 tool_use 时不调用本函数。
 pub(crate) fn extract_invoke_content_blocks(
     text: &str,
-    known_tool_names: &std::collections::HashSet<String>,
+    schemas: &InvokeToolSchemas,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<serde_json::Value> {
-    // 🛑 块级复读熔断：先把 Opus 退化的「同一 stray token 连续复读」截断，
-    // 再做 invoke 嗅探。覆盖 web_search loop（99.9% 真实流量）这条非流式路径。
+    // 块级复读熔断：先截断「同一 stray token 连续复读」，再识别 invoke。
     let collapsed = collapse_stray_token_floods(text);
-    let text: &str = &collapsed;
+    let mut sniffer = InvokeSniffer::default();
+    let mut outputs = sniffer.push(&collapsed, schemas);
+    outputs.extend(sniffer.finish(schemas));
+
     let mut blocks: Vec<serde_json::Value> = Vec::new();
     let mut pending_text = String::new();
-    // 围栏奇偶状态：跨「已吐出的文本」累进，确保 ``` 跨片段也能正确判定。
-    let mut fence_open = false;
-    let mut fence_partial = String::new();
-
-    let push_text = |blocks: &mut Vec<serde_json::Value>, pending: &mut String| {
-        if !pending.is_empty() {
-            blocks.push(serde_json::json!({"type": "text", "text": pending.clone()}));
-            pending.clear();
+    for output in outputs {
+        match output {
+            SniffOutput::Text(t) => pending_text.push_str(&t),
+            SniffOutput::ToolCall { name, input } => {
+                if !pending_text.is_empty() {
+                    blocks.push(json!({"type": "text", "text": std::mem::take(&mut pending_text)}));
+                }
+                let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+                let completed = CompletedToolUse::from_kiro(tool_use_id, &name, input, tool_name_map);
+                blocks.push(completed.to_anthropic_block());
+            }
         }
-    };
-
-    let mut rest = text;
-    loop {
-        let start = match find_invoke_start(rest) {
-            Some(s) => s,
-            None => {
-                pending_text.push_str(rest);
-                break;
-            }
-        };
-        let end = match find_invoke_block_end(rest, start) {
-            Some(e) => e,
-            None => {
-                // 块没闭合（整段已完整仍未见 </invoke>）→ 不是干净的工具调用，整段当文本。
-                pending_text.push_str(rest);
-                break;
-            }
-        };
-
-        let before = &rest[..start];
-        let stripped_before = strip_trailing_stray_tokens(before);
-        // ③ 围栏：在「块之前的文本」走完后围栏是否打开
-        let fence_after_before = fence_open_after(fence_open, &fence_partial, before);
-        // ② 工具名解析 + 工具表护栏
-        let parsed = parse_invoke_block(&rest[start..end]);
-        let name_known = parsed
-            .as_ref()
-            .map(|(n, _)| known_tool_names.contains(n))
-            .unwrap_or(false);
-
-        if invoke_looks_like_real_leak(stripped_before) && !fence_after_before && name_known {
-            // 真泄漏：保留剥过 stray token 的前文（推进围栏），再产出结构化 tool_use。
-            if !stripped_before.is_empty() {
-                advance_code_fence_state(&mut fence_open, &mut fence_partial, stripped_before);
-                pending_text.push_str(stripped_before);
-            }
-            push_text(&mut blocks, &mut pending_text);
-            let (name, input_json) = parsed.expect("parsed is Some when name_known");
-            let input: serde_json::Value =
-                serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({}));
-            // 统一还原（名字 + 入参）并统一拼块，与结构化 / websearch 路径同口径。
-            let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
-            let completed = CompletedToolUse::from_kiro(tool_use_id, &name, input, tool_name_map);
-            blocks.push(completed.to_anthropic_block());
-        } else {
-            // 不捞（句中 / 围栏内 / 工具名未知 / 解析失败）→ 整块（含 before）当文本，推进围栏。
-            let chunk = &rest[..end];
-            advance_code_fence_state(&mut fence_open, &mut fence_partial, chunk);
-            pending_text.push_str(chunk);
-        }
-        rest = &rest[end..];
     }
-
-    push_text(&mut blocks, &mut pending_text);
+    if !pending_text.is_empty() {
+        blocks.push(json!({"type": "text", "text": pending_text}));
+    }
     blocks
+}
+
+/// 整段文本里是否出现了会被复读熔断截断的 stray token 洪泛（L5，非流式判定用）。
+pub(crate) fn stray_token_flood_detected(text: &str) -> bool {
+    matches!(
+        collapse_stray_token_floods(text),
+        std::borrow::Cow::Owned(_)
+    )
 }
 
 /// 累积完成的工具调用（`ToolUseEvent` 的所有分片拼接、解析成功后的结果）。
@@ -1047,8 +1044,8 @@ pub struct CompletedToolUse {
 impl CompletedToolUse {
     /// 从 Kiro 侧 (name, input) 还原为客户端可见的完整工具调用。
     ///
-    /// 这是**唯一的还原入口**：名字按 `tool_name_map` 还原、入参按 Kiro 名反向重写
-    /// （见 `converter::restore_tool_use_for_client`）。结构化事件、`<invoke>` 文本捞回、
+    /// 这是**唯一的还原入口**：名字按 `tool_name_map` 还原；入参只对 ClaudeCode 模式下
+    /// 做过内置名映射的工具反向重写，raw 模式原样返回（见 `converter::restore_tool_use_for_client`）。结构化事件、`<invoke>` 文本捞回、
     /// websearch 三条来源都经此收敛，避免各站点各自调用还原逻辑。
     pub fn from_kiro(
         id: String,
@@ -1362,13 +1359,6 @@ impl SseStateManager {
         self.stop_reason = Some(reason.into());
     }
 
-    /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
-    fn has_non_thinking_blocks(&self) -> bool {
-        self.active_blocks
-            .values()
-            .any(|b| b.block_type != "thinking")
-    }
-
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
@@ -1599,9 +1589,6 @@ pub struct StreamContext {
     pub provider_token_usage: Option<TokenUsage>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
-    /// 是否已经向客户端产生过非空白的可见文本。
-    /// thinking 块不计入；tool_result 续轮必须有可见文本或完整 tool_use 才算有效。
-    has_visible_text: bool,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1610,41 +1597,28 @@ pub struct StreamContext {
     /// 只有合成名在此集合里才允许捞回成结构化 tool_use，否则当文本吐出。
     /// 为空（请求未带 tools）时不捞回任何 invoke——宁可漏捞，不可误执行。
     pub known_tool_names: std::collections::HashSet<String>,
-    /// 跨整条流的「代码围栏」奇偶状态：每遇到一行以 ``` 开头就翻转。
-    /// 在围栏内（true）时，`<invoke>` 一律不捞回（视为正文展示的代码块）。
-    pub code_fence_open: bool,
-    /// 围栏检测的「未完成行」累加器：只在遇到换行时才对完整行判定是否为 ``` 围栏行。
-    /// 这样即使 ``` 分隔符被切分到多个 chunk（如 `` `` + ` ``），重组成完整行后仍能正确识别。
-    pub fence_scan_partial: String,
+    /// H2：允许从 `<invoke>` 文本合成工具调用的工具及其 input_schema（Kiro 侧名）。
+    /// 为空时不合成。由 handler 按发给上游的工具定义填充。
+    pub invoke_tool_schemas: InvokeToolSchemas,
     /// thinking 是否启用
     pub thinking_enabled: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
-    /// invoke 文本嗅探缓冲区（用于从明文流里嗅探字面 `<invoke>` 工具调用块）
-    pub invoke_sniff_buffer: String,
+    /// 明文里 `<invoke>` 工具调用的识别器（H2）。
+    invoke_sniffer: InvokeSniffer,
     /// 是否在 thinking 块内
     pub in_thinking_block: bool,
-    /// Whether at least one thinking block has already been recognized. This
-    /// only controls conservative buffering before the first block; it must not
-    /// prevent later thinking blocks in the same provider stream.
+    /// thinking 块是否已提取完成
     pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
     /// 上游原生 reasoningContentEvent 下发的 thinking 签名
     pending_thinking_signature: Option<String>,
-    /// Native reasoning may still contain legacy XML delimiters split across events.
-    native_reasoning_tag_filter: ThinkingXmlTagFilter,
-    /// When reasoning was not requested, suppress complete legacy thinking blocks
-    /// instead of forwarding their tags and private contents as ordinary text.
-    hidden_thinking_xml_filter: HiddenThinkingXmlFilter,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    /// 是否需要剥离 `</thinking>` 后、正文前的分隔空白。
-    /// 结束标签、分隔空白和正文可能分别落在不同 chunk。
-    strip_text_leading_whitespace_after_thinking: bool,
     /// 中转层 CacheMeter 的缓存覆盖情况（estimate 口径）。最终上报时按真实 total
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
@@ -1669,11 +1643,16 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
-    /// HTTP 200 响应体内携带的上游 error / exception。
-    /// 这类事件不能再被收尾成正常的 end_turn。
-    upstream_error: Option<String>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// metadataEvent.stopReason 的原始值（上游原生终止原因，M2 / M5）。
+    native_stop_reason: Option<String>,
+    /// contextUsageEvent 报告上下文用量达到 100%。
+    context_window_full: bool,
+    /// thinking 未启用时收到的原生 reasoning；只在整轮没有正文和工具调用时作为正文兜底（L9）。
+    undisclosed_reasoning: String,
+    /// 是否已经发出过非空白正文（L9 判定用）。
+    visible_text_emitted: bool,
 }
 
 impl StreamContext {
@@ -1715,23 +1694,8 @@ impl StreamContext {
         self.tool_json_error.as_ref().map(|err| err.message())
     }
 
-    /// 上游在成功 HTTP 响应体内返回的错误信息。
-    pub fn upstream_error_message(&self) -> Option<String> {
-        self.upstream_error.clone()
-    }
-
-    /// 本轮是否已经产生客户端可继续消费的 assistant 输出。
-    pub fn has_visible_continuation(&self) -> bool {
-        self.has_visible_text || self.state_manager.has_tool_use
-    }
-
-    /// 是否由上游明确给出了可接受的容量终止原因。
-    /// 调用方应在 `generate_final_events` 前读取，避免把本地 thinking-only 兜底误判为上游终止。
-    pub fn has_terminal_limit(&self) -> bool {
-        matches!(
-            self.state_manager.stop_reason.as_deref(),
-            Some("max_tokens" | "model_context_window_exceeded")
-        )
+    pub fn repeat_guard_error_message(&self) -> Option<&'static str> {
+        self.repeat_guard_tripped.then_some(REPEAT_GUARD_ERROR_MESSAGE)
     }
 
     /// 创建 StreamContext
@@ -1750,24 +1714,19 @@ impl StreamContext {
             context_input_tokens: None,
             provider_token_usage: None,
             output_tokens: 0,
-            has_visible_text: false,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
-            code_fence_open: false,
-            fence_scan_partial: String::new(),
+            invoke_tool_schemas: InvokeToolSchemas::new(),
             thinking_enabled,
             thinking_buffer: String::new(),
-            invoke_sniff_buffer: String::new(),
+            invoke_sniffer: InvokeSniffer::default(),
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
             pending_thinking_signature: None,
-            native_reasoning_tag_filter: ThinkingXmlTagFilter::default(),
-            hidden_thinking_xml_filter: HiddenThinkingXmlFilter::default(),
             text_block_index: None,
             strip_thinking_leading_newline: false,
-            strip_text_leading_whitespace_after_thinking: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
             metering: None,
@@ -1776,8 +1735,49 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
-            upstream_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            native_stop_reason: None,
+            context_window_full: false,
+            undisclosed_reasoning: String::new(),
+            visible_text_emitted: false,
+        }
+    }
+
+    /// 设置允许从 `<invoke>` 文本合成工具调用的工具 schema（H2），只保留本次请求声明的工具。
+    pub fn set_invoke_tool_schemas(&mut self, schemas: InvokeToolSchemas) {
+        let known = &self.known_tool_names;
+        self.invoke_tool_schemas = schemas
+            .into_iter()
+            .filter(|(name, _)| known.contains(name))
+            .collect();
+    }
+
+    /// 测试辅助：链式设置 [`Self::set_invoke_tool_schemas`]。
+    #[cfg(test)]
+    pub fn with_invoke_tool_schemas(mut self, schemas: InvokeToolSchemas) -> Self {
+        self.set_invoke_tool_schemas(schemas);
+        self
+    }
+
+    /// 按上游原生 metadataEvent.stopReason 决定终止原因（M2 / L2 / M5）。
+    ///
+    /// - `MAX_TOKENS` → `max_tokens`；`MODEL_CONTEXT_WINDOW_EXCEEDED` → `model_context_window_exceeded`；
+    /// - 上游明确给出其他原因（如 END_TURN / TOOL_USE）时，不再用 100% contextUsage 覆盖；
+    /// - 没有原生信号时，contextUsage 100% 仍回退为 `model_context_window_exceeded`（原行为）。
+    ///
+    /// 拒答等已设置的终态由 `set_stop_reason` 自身保护。
+    fn apply_native_stop_reason(&mut self) {
+        let native = self.native_stop_reason.as_deref().map(str::to_ascii_uppercase);
+        match native.as_deref() {
+            Some("MAX_TOKENS") => self.state_manager.set_stop_reason("max_tokens"),
+            Some("MODEL_CONTEXT_WINDOW_EXCEEDED") => self
+                .state_manager
+                .set_stop_reason("model_context_window_exceeded"),
+            Some(_) => {}
+            None if self.context_window_full => self
+                .state_manager
+                .set_stop_reason("model_context_window_exceeded"),
+            None => {}
         }
     }
 
@@ -1849,6 +1849,13 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::Metadata(metadata) => {
+                // 只补充上游报告的截断原因，不覆盖网关已确定的结束原因
+                // （refusal / 上下文溢出 / ContentLengthExceededException）。
+                if let Some(reason) = metadata.truncation_stop_reason() {
+                    if self.state_manager.stop_reason.is_none() {
+                        self.state_manager.set_stop_reason(reason);
+                    }
+                }
                 if let Some(usage) = metadata.token_usage {
                     let usage = usage.sanitized();
                     tracing::debug!(
@@ -1862,6 +1869,9 @@ impl StreamContext {
                     // 不能累加，否则会重复计费。
                     self.provider_token_usage = Some(usage);
                 }
+                if let Some(reason) = metadata.stop_reason.as_deref() {
+                    self.native_stop_reason = Some(reason.to_string());
+                }
                 if let Some(refusal) = metadata.content_filter_refusal() {
                     tracing::warn!("上游内容过滤拒答: {}", refusal);
                     self.state_manager.set_stop_reason(REFUSAL_STOP_REASON);
@@ -1874,10 +1884,10 @@ impl StreamContext {
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
-                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                // 上下文用量达到 100%：先记下，收尾时上游没有给出原生 stopReason 才报
+                // model_context_window_exceeded（M5）。
                 if context_usage.context_usage_percentage >= 100.0 {
-                    self.state_manager
-                        .set_stop_reason("model_context_window_exceeded");
+                    self.context_window_full = true;
                 }
                 tracing::debug!(
                     "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
@@ -1905,7 +1915,6 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                self.upstream_error = Some(format!("{}: {}", error_code, error_message));
                 Vec::new()
             }
             Event::Exception {
@@ -1915,8 +1924,6 @@ impl StreamContext {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
-                } else {
-                    self.upstream_error = Some(format!("{}: {}", exception_type, message));
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
@@ -1937,25 +1944,22 @@ impl StreamContext {
         let content = content.as_str();
 
         let mut events = Vec::new();
-        events.extend(self.flush_native_reasoning_tag_filter());
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
         }
 
+        // 估算 tokens
+        self.output_tokens += estimate_tokens(content);
+
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
-            self.output_tokens += estimate_tokens(content);
             events.extend(self.process_content_with_thinking(content));
             return events;
         }
 
-        // 客户端未请求 reasoning 时，上游仍可能在普通 assistant 文本里返回
-        // `<thinking>...</thinking>`。整个块都必须隐藏，不能只去掉标签。
-        let visible = self.hidden_thinking_xml_filter.filter(content);
-        if !visible.is_empty() {
-            self.output_tokens += estimate_tokens(&visible);
-            events.extend(self.create_text_delta_events(&visible));
-        }
+        // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
+        // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
+        events.extend(self.create_text_delta_events(content));
         events
     }
 
@@ -1967,37 +1971,21 @@ impl StreamContext {
         self.thinking_buffer.push_str(content);
 
         loop {
-            if !self.in_thinking_block {
-                if self.strip_text_leading_whitespace_after_thinking {
-                    self.thinking_buffer = self.thinking_buffer.trim_start().to_string();
-                    if self.thinking_buffer.is_empty() {
-                        break;
-                    }
-                    self.strip_text_leading_whitespace_after_thinking = false;
-                }
-
-                // 查找 <thinking> 开始标签（跳过被反引号包裹的）
-                let start_pos = find_real_thinking_start_tag(&self.thinking_buffer);
-                let orphan_end = find_real_thinking_end_tag(&self.thinking_buffer);
-
-                // A closing tag outside a thinking block is transport residue. Strip it
-                // before looking for the next real opening tag so it never reaches text.
-                if let Some(end_pos) = orphan_end
-                    && start_pos.is_none_or(|start_pos| end_pos < start_pos)
+            if !self.in_thinking_block && !self.thinking_extracted {
+                // M1：只有回复开头（去掉前导空白后）的 <thinking> 才是思考块。
+                // 开头已经是正文时，后面出现的字面 <thinking> 一律按正文输出。
+                let head = self.thinking_buffer.trim_start();
+                if !head.is_empty()
+                    && !head.starts_with("<thinking>")
+                    && !"<thinking>".starts_with(head)
                 {
-                    let before_end = self.thinking_buffer[..end_pos].to_string();
-                    if !before_end.trim().is_empty() {
-                        events.extend(self.create_text_delta_events(&before_end));
-                    }
-                    self.thinking_buffer = self.thinking_buffer[end_pos + THINKING_END_TAG.len()..]
-                        .trim_start()
-                        .to_string();
-                    self.strip_text_leading_whitespace_after_thinking =
-                        self.thinking_buffer.is_empty();
+                    self.thinking_extracted = true;
                     continue;
                 }
-
-                if let Some(start_pos) = start_pos {
+                // 查找 <thinking> 开始标签（跳过被反引号包裹的）
+                if let Some(start_pos) = find_real_thinking_start_tag(&self.thinking_buffer)
+                    .filter(|&pos| self.thinking_buffer[..pos].trim().is_empty())
+                {
                     // 发送 <thinking> 之前的内容作为 text_delta
                     // 注意：如果前面只是空白字符（如 adaptive 模式返回的 \n\n），则跳过，
                     // 避免在 thinking 块之前产生无意义的 text 块导致客户端解析失败
@@ -2005,13 +1993,12 @@ impl StreamContext {
                     if !before_thinking.is_empty() && !before_thinking.trim().is_empty() {
                         events.extend(self.create_text_delta_events(&before_thinking));
                     }
-                    events.extend(self.close_open_text_block());
 
                     // 进入 thinking 块
                     self.in_thinking_block = true;
                     self.strip_thinking_leading_newline = true;
                     self.thinking_buffer =
-                        self.thinking_buffer[start_pos + THINKING_START_TAG.len()..].to_string();
+                        self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
 
                     // 创建 thinking 块的 content_block_start 事件
                     let thinking_index = self.state_manager.next_block_index();
@@ -2032,12 +2019,10 @@ impl StreamContext {
                 } else {
                     // 没有找到 <thinking>，检查是否可能是部分标签
                     // 保留可能是部分标签的内容
-                    let keep = if self.thinking_extracted {
-                        partial_thinking_tag_suffix_len(&self.thinking_buffer)
-                    } else {
-                        THINKING_START_TAG.len()
-                    };
-                    let target_len = self.thinking_buffer.len().saturating_sub(keep);
+                    let target_len = self
+                        .thinking_buffer
+                        .len()
+                        .saturating_sub("<thinking>".len());
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -2081,6 +2066,7 @@ impl StreamContext {
                     // 结束 thinking 块
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
+
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
@@ -2095,21 +2081,21 @@ impl StreamContext {
                         }
                     }
 
-                    // 结束标签后允许任意空白或直接正文；分隔空白不属于 text。
-                    // 若当前 chunk 到这里结束，后续 chunk 的前导空白也要继续剥离。
-                    let remaining = self.thinking_buffer[end_pos + THINKING_END_TAG.len()..]
-                        .trim_start()
-                        .to_string();
-                    self.strip_text_leading_whitespace_after_thinking = remaining.is_empty();
-                    self.thinking_buffer = remaining;
+                    // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
+                    self.thinking_buffer =
+                        self.thinking_buffer[end_pos + thinking_end_tag_strip_len(&self.thinking_buffer, end_pos)..]
+                            .to_string();
                 } else {
-                    // 保留可能被拆分的 `</thinking>` 标签尾巴及其前一个字符。
-                    // 前一个字符用于跨 chunk 判断 `` `</thinking>`` / 引号引用，
-                    // 避免先把引号吐出后又把标签误认成真正边界。
+                    // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
+                    // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
+                    // find_real_thinking_end_tag 要求标签后有 `\n\n` 才返回 Some，
+                    // 因此保留区必须覆盖 `</thinking>\n\n` 的完整长度（13 字节），
+                    // 否则当 `</thinking>` 已在 buffer 但 `\n\n` 尚未到达时，
+                    // 标签的前几个字符会被错误地作为 thinking_delta 发出。
                     let target_len = self
                         .thinking_buffer
                         .len()
-                        .saturating_sub(THINKING_END_TAG.len() + 1);
+                        .saturating_sub("</thinking>\n\n".len());
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -2124,162 +2110,41 @@ impl StreamContext {
                     }
                     break;
                 }
+            } else {
+                // thinking 已提取完成，剩余内容作为 text_delta
+                if !self.thinking_buffer.is_empty() {
+                    let remaining = self.thinking_buffer.clone();
+                    self.thinking_buffer.clear();
+                    events.extend(self.create_text_delta_events(&remaining));
+                }
+                break;
             }
         }
 
         events
     }
 
-    /// 创建 text_delta 事件（带 invoke 嗅探的统一明文漏斗）
-    ///
-    /// 这是 thinking / 非 thinking 两条路径 + 两个端点唯一共用的明文出口。
-    /// 在这里把文本累进 `invoke_sniff_buffer`，循环嗅探完整的字面 `<invoke>` 工具调用块：
-    /// - 命中完整块：先把块前文本（剥掉尾部独立的 `call`/`count` 行）走 `emit_text_delta_raw` 吐出，
-    ///   再合成结构化 tool_use 事件，再继续循环；
-    /// - 未命中完整块：保留可能的部分标签尾巴留在缓冲区，其余走 `emit_text_delta_raw`。
+    /// 创建 text_delta 事件：thinking / 非 thinking 两条路径和两个端点共用的明文出口。
+    /// 文本先过 [`InvokeSniffer`]（H2）：可能是末尾工具调用的 `<invoke>` 块暂时扣住，其余立即输出。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         if text.is_empty() {
             return Vec::new();
         }
-        self.invoke_sniff_buffer.push_str(text);
-        self.drain_invoke_sniff_buffer(false)
+        let outputs = self.invoke_sniffer.push(text, &self.invoke_tool_schemas);
+        self.emit_sniffed(outputs)
     }
 
-    /// 行首未闭合 `<invoke` 块的字节上限。仅用于防止"行首一个永不闭合的 `<invoke`
-    /// 把整条流永久 hold 住"这种极端情况；正常的 invoke（哪怕是大 patch）都远小于此，
-    /// 所以不会误杀合法的多行/分片工具调用。
-    const MAX_INVOKE_HOLD_BYTES: usize = 262_144;
-
-    /// 嗅探并排空 `invoke_sniff_buffer`
-    ///
-    /// - `flush=false`（流式中途）：未命中完整块时，保留可能是部分标签的尾巴（最长一个未闭合
-    ///   `<invoke` 块或一段疑似开标签前缀），其余前缀文本走 `emit_text_delta_raw` 吐出。
-    /// - `flush=true`（流末尾）：不再保留尾巴，剩余全部走 `emit_text_delta_raw` 吐出（防尾字节丢）。
-    fn drain_invoke_sniff_buffer(&mut self, flush: bool) -> Vec<SseEvent> {
+    /// 按原顺序发出识别器的输出：正文走 `emit_text_delta_raw`，合成的调用走统一的 tool_use 出口。
+    fn emit_sniffed(&mut self, outputs: Vec<SniffOutput>) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        // Drive the loop on an owned local buffer taken out of `self` ONCE, instead of
-        // cloning `self.invoke_sniff_buffer` on every iteration. Under degraded-model
-        // floods this buffer can grow up to MAX_INVOKE_HOLD_BYTES, so a per-iteration
-        // full clone was O(n) per loop (quadratic overall). The only in-loop allocation
-        // now is the (smaller) remainder after a reclaimed block. Every exit path writes
-        // the intended remainder back into `self.invoke_sniff_buffer` (empty if fully
-        // consumed); the Some->Some path keeps looping on the local `buf`.
-        let mut buf = std::mem::take(&mut self.invoke_sniff_buffer);
-        loop {
-            match find_invoke_start(&buf) {
-                Some(start) => {
-                    match find_invoke_block_end(&buf, start) {
-                        Some(end) => {
-                            // 命中完整块：先判定它像真泄漏还是正文讨论（P1 歧义信号）
-                            let before = strip_trailing_stray_tokens(&buf[..start]);
-                            // 🅱 先把 before 里的围栏开合并进一个「试算」状态：如果这个 <invoke>
-                            // 落在代码围栏内（正文展示的代码块），一律不捞回，当文本吐出。
-                            let fence_after_before = fence_open_after(
-                                self.code_fence_open,
-                                &self.fence_scan_partial,
-                                before,
-                            );
-                            // 🅳 灾难兜底：只有解析出的工具名在本次请求声明的工具表里，才允许捞回。
-                            // 表为空（请求没带 tools）或名字不在表里 → 当文本吐，宁可漏捞不可误执行。
-                            let parsed = parse_invoke_block(&buf[start..end]);
-                            let name_known = parsed
-                                .as_ref()
-                                .map(|(n, _)| self.known_tool_names.contains(n))
-                                .unwrap_or(false);
-                            if invoke_looks_like_real_leak(before)
-                                && !fence_after_before
-                                && name_known
-                            {
-                                // 真泄漏：吐块前文本（剥掉尾部独立的 call/count 行）+ 合成 tool_use
-                                if !before.is_empty() {
-                                    events.extend(self.emit_text_delta_raw(before));
-                                }
-                                // parsed 在上面已确认是 Some 且 name_known
-                                let (name, input_json) =
-                                    parsed.expect("parsed is Some when name_known");
-                                // 解析完整入参 → 统一还原 → 统一发出（与结构化 toolUseEvent 同一发出口）。
-                                let input: serde_json::Value =
-                                    serde_json::from_str(&input_json).unwrap_or_else(|_| json!({}));
-                                let tool_use_id = format!(
-                                    "toolu_{}",
-                                    Uuid::new_v4().to_string().replace('-', "")
-                                );
-                                let completed = CompletedToolUse::from_kiro(
-                                    tool_use_id,
-                                    &name,
-                                    input,
-                                    &self.tool_name_map,
-                                );
-                                events.extend(self.emit_completed_tool_use(completed));
-                            } else {
-                                // 不捞回（嵌句中 / 围栏内 / 工具名未知 / 解析失败）→ 整段当普通文本吐出
-                                events.extend(self.emit_text_delta_raw(&buf[..end]));
-                            }
-                            // 推进本地缓冲区到块之后，继续循环（不再回写 self、不再整体 clone）
-                            buf = buf[end..].to_string();
-                            continue;
-                        }
-                        None => {
-                            // 块还没到齐。先用 P1 行首判定：不在行首的 <invoke 当讨论文本，
-                            // 直接整段吐出，不进 hold 缓冲（P2：避免 hold 住后续文本到流末尾）。
-                            let before = strip_trailing_stray_tokens(&buf[..start]);
-                            // 🅱 围栏内的未闭合 <invoke> 也不 hold（是正文代码块），直接当文本吐。
-                            let fence_after_before = fence_open_after(
-                                self.code_fence_open,
-                                &self.fence_scan_partial,
-                                before,
-                            );
-                            if !invoke_looks_like_real_leak(before) || fence_after_before {
-                                if !buf.is_empty() {
-                                    events.extend(self.emit_text_delta_raw(&buf));
-                                }
-                                break;
-                            }
-                            // 行首的未闭合块：把 start 之前的文本吐出，保留 start.. 等闭合
-                            if start > 0 {
-                                events.extend(self.emit_text_delta_raw(&buf[..start]));
-                            }
-                            let remainder = buf[start..].to_string();
-                            if flush {
-                                // flush 模式：残留半块当普通文本吐出
-                                if !remainder.is_empty() {
-                                    events.extend(self.emit_text_delta_raw(&remainder));
-                                }
-                            } else {
-                                // P2 上限：hold 的 <invoke 块累计超过阈值仍没等到 </invoke>，
-                                // 放弃等待，当普通文本吐出，避免无限期 hold 后续文本。
-                                // 仅用纯字节上限兜底"永不闭合的 `<invoke` 把流卡死"；
-                                // 不再按换行数放弃——多行参数（apply_patch 等）是常态，
-                                // 换行数不是放弃 hold 的好信号，否则会误杀分片到达的合法 invoke。
-                                let too_long = remainder.len() > Self::MAX_INVOKE_HOLD_BYTES;
-                                if too_long {
-                                    events.extend(self.emit_text_delta_raw(&remainder));
-                                } else {
-                                    // 保留半块到 self，等下一片到达再续
-                                    self.invoke_sniff_buffer = remainder;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-                None => {
-                    // 没有任何 invoke 开标签
-                    if flush {
-                        if !buf.is_empty() {
-                            events.extend(self.emit_text_delta_raw(&buf));
-                        }
-                    } else {
-                        // 保留一段可能是部分 `<invoke` 开标签前缀的尾巴，其余吐出
-                        let keep = partial_invoke_tag_suffix_len(&buf);
-                        let split = buf.len() - keep;
-                        let safe = find_char_boundary(&buf, split);
-                        if safe > 0 {
-                            events.extend(self.emit_text_delta_raw(&buf[..safe]));
-                        }
-                        self.invoke_sniff_buffer = buf[safe..].to_string();
-                    }
-                    break;
+        for output in outputs {
+            match output {
+                SniffOutput::Text(text) => events.extend(self.emit_text_delta_raw(&text)),
+                SniffOutput::ToolCall { name, input } => {
+                    let id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+                    let completed =
+                        CompletedToolUse::from_kiro(id, &name, input, &self.tool_name_map);
+                    events.extend(self.emit_completed_tool_use(completed));
                 }
             }
         }
@@ -2349,17 +2214,10 @@ impl StreamContext {
             return events;
         }
         let text: &str = &kept;
-        if !text.trim().is_empty() {
-            self.has_visible_text = true;
-        }
 
-        // 🅱 维护跨流的代码围栏奇偶状态：所有真正作为「文本」吐出的内容都过这里，
-        // 在此累进围栏状态，使后续 <invoke> 能判断自己是否落在代码块内。
-        let mut fence_open = self.code_fence_open;
-        let mut fence_partial = std::mem::take(&mut self.fence_scan_partial);
-        advance_code_fence_state(&mut fence_open, &mut fence_partial, text);
-        self.code_fence_open = fence_open;
-        self.fence_scan_partial = fence_partial;
+        if !text.trim().is_empty() {
+            self.visible_text_emitted = true;
+        }
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
@@ -2462,22 +2320,6 @@ impl StreamContext {
         events
     }
 
-    fn flush_native_reasoning_tag_filter(&mut self) -> Vec<SseEvent> {
-        let tail = self.native_reasoning_tag_filter.finish();
-        if tail.is_empty() {
-            return Vec::new();
-        }
-        self.output_tokens += estimate_tokens(&tail);
-        if !self.thinking_enabled {
-            return self.create_text_delta_events(&tail);
-        }
-        let mut events = self.ensure_thinking_block();
-        if let Some(idx) = self.thinking_block_index {
-            events.push(self.create_thinking_delta_event(idx, &tail));
-        }
-        events
-    }
-
     fn close_open_thinking_block(&mut self) -> Vec<SseEvent> {
         let Some(idx) = self.thinking_block_index else {
             return Vec::new();
@@ -2505,8 +2347,14 @@ impl StreamContext {
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
         if !self.thinking_enabled {
-            // `reasoningContentEvent` is private reasoning by definition. When the
-            // client did not request a reasoning channel, silently discard it.
+            if let Some(text) = reasoning.text.as_deref()
+                && !text.is_empty()
+            {
+                self.output_tokens += estimate_tokens(text);
+                // L9：thinking 未启用时 reasoning 不混入正文，只在整轮没有正文和工具调用时兜底。
+                self.undisclosed_reasoning.push_str(text);
+                return Vec::new();
+            }
             return Vec::new();
         }
 
@@ -2518,21 +2366,19 @@ impl StreamContext {
             self.pending_thinking_signature = Some(signature.to_string());
         }
 
-        if let Some(text) = reasoning.text.as_deref() {
-            let text = self.native_reasoning_tag_filter.filter(text);
-            if !text.is_empty() {
-                self.output_tokens += estimate_tokens(&text);
-                events.extend(self.ensure_thinking_block());
-                if let Some(idx) = self.thinking_block_index {
-                    events.push(self.create_thinking_delta_event(idx, &text));
-                }
+        if let Some(text) = reasoning.text.as_deref()
+            && !text.is_empty()
+        {
+            self.output_tokens += estimate_tokens(text);
+            events.extend(self.ensure_thinking_block());
+            if let Some(idx) = self.thinking_block_index {
+                events.push(self.create_thinking_delta_event(idx, text));
             }
         }
 
         if let Some(redacted) = reasoning.redacted_content.as_deref()
             && !redacted.is_empty()
         {
-            events.extend(self.flush_native_reasoning_tag_filter());
             self.output_tokens += 8;
             events.extend(self.create_redacted_thinking_events(redacted));
         }
@@ -2668,19 +2514,14 @@ impl StreamContext {
         let mut events = Vec::new();
 
         self.state_manager.set_has_tool_use(true);
-        events.extend(self.flush_native_reasoning_tag_filter());
-
-        if !self.thinking_enabled {
-            let visible = self.hidden_thinking_xml_filter.finish();
-            if !visible.is_empty() {
-                self.output_tokens += estimate_tokens(&visible);
-                events.extend(self.create_text_delta_events(&visible));
-            }
-        }
 
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
         }
+
+        // H2：本轮有原生 tool_use。识别器扣住的文本按原顺序放出，之后的 `<invoke>` 文本不再合成。
+        let held = self.invoke_sniffer.abandon();
+        events.extend(self.emit_sniffed(held));
 
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
@@ -2699,6 +2540,7 @@ impl StreamContext {
 
                 // 结束 thinking 块
                 self.in_thinking_block = false;
+                self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
@@ -2714,38 +2556,25 @@ impl StreamContext {
                 }
 
                 // 把结束标签后的内容当作普通文本（通常为空或空白）
-                let after_pos = end_pos + THINKING_END_TAG.len();
+                let after_pos = end_pos + "</thinking>".len();
                 let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                 self.thinking_buffer.clear();
                 if !remaining.is_empty() {
                     events.extend(self.create_text_delta_events(&remaining));
                 }
-            } else {
-                // A tool event is a hard boundary: no later assistant chunk can finish a
-                // split closing tag that preceded it. Flush only real thinking content.
-                let thinking_content =
-                    strip_unquoted_partial_thinking_tag_suffix(&self.thinking_buffer);
-                self.thinking_buffer.clear();
-                if !thinking_content.is_empty()
-                    && let Some(thinking_index) = self.thinking_block_index
-                {
-                    events
-                        .push(self.create_thinking_delta_event(thinking_index, &thinking_content));
-                }
-                self.in_thinking_block = false;
-                events.extend(self.close_open_thinking_block());
             }
         }
 
         // thinking 模式下，process_content_with_thinking 可能会为了探测 `<thinking>` 而暂存一小段尾部文本。
         // 如果此时直接开始 tool_use，状态机会自动关闭 text block，导致这段"待输出文本"看起来被 tool_use 吞掉。
-        // 尚未进入 thinking block 时，将等待跨 chunk 标签的缓冲文本 flush。
-        if self.thinking_enabled && !self.in_thinking_block && !self.thinking_buffer.is_empty() {
+        // 约束：只在尚未进入 thinking block、且 thinking 尚未被提取时，将缓冲区当作普通文本 flush。
+        if self.thinking_enabled
+            && !self.in_thinking_block
+            && !self.thinking_extracted
+            && !self.thinking_buffer.is_empty()
+        {
             let buffered = std::mem::take(&mut self.thinking_buffer);
-            let buffered = strip_unquoted_partial_thinking_tag_suffix(&buffered);
-            if !buffered.is_empty() {
-                events.extend(self.create_text_delta_events(&buffered));
-            }
+            events.extend(self.create_text_delta_events(&buffered));
         }
 
         // 通过累积器缓冲工具参数 JSON 分片：只有收到 stop=true 且解析成功时才
@@ -2760,6 +2589,7 @@ impl StreamContext {
             Err(e) => {
                 tracing::error!("{}", e);
                 self.tool_json_error = Some(e);
+                self.state_manager.set_stop_reason("error");
                 return events;
             }
         };
@@ -2773,23 +2603,6 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // HTTP 状态虽然成功，但事件流明确返回了上游错误。不要再伪装成 end_turn。
-        if let Some(message) = &self.upstream_error {
-            events.push(SseEvent::new(
-                "error",
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": "upstream_error",
-                        "message": message
-                    }
-                }),
-            ));
-            return events;
-        }
-
-        events.extend(self.flush_native_reasoning_tag_filter());
-
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
         // 走同一文本路径，交由后续 thinking / invoke 缓冲一并 flush。
         let leftover = self.tool_use_xml_filter.finish();
@@ -2797,19 +2610,7 @@ impl StreamContext {
             if self.thinking_enabled {
                 events.extend(self.process_content_with_thinking(&leftover));
             } else {
-                let visible = self.hidden_thinking_xml_filter.filter(&leftover);
-                if !visible.is_empty() {
-                    self.output_tokens += estimate_tokens(&visible);
-                    events.extend(self.create_text_delta_events(&visible));
-                }
-            }
-        }
-
-        if !self.thinking_enabled {
-            let visible = self.hidden_thinking_xml_filter.finish();
-            if !visible.is_empty() {
-                self.output_tokens += estimate_tokens(&visible);
-                events.extend(self.create_text_delta_events(&visible));
+                events.extend(self.create_text_delta_events(&leftover));
             }
         }
 
@@ -2846,20 +2647,19 @@ impl StreamContext {
                     }
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
-                    let after_pos = end_pos + THINKING_END_TAG.len();
+                    let after_pos = end_pos + "</thinking>".len();
                     let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                     self.thinking_buffer.clear();
                     self.in_thinking_block = false;
+                    self.thinking_extracted = true;
                     if !remaining.is_empty() {
                         events.extend(self.create_text_delta_events(&remaining));
                     }
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
-                    let thinking_content =
-                        strip_unquoted_partial_thinking_tag_suffix(&self.thinking_buffer);
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
+                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
@@ -2878,31 +2678,16 @@ impl StreamContext {
                 }
             } else {
                 // 否则发送剩余内容作为 text_delta
-                let buffer_content =
-                    strip_unquoted_partial_thinking_tag_suffix(&self.thinking_buffer);
-                if !buffer_content.is_empty() {
-                    events.extend(self.create_text_delta_events(&buffer_content));
-                }
+                let buffer_content = self.thinking_buffer.clone();
+                events.extend(self.create_text_delta_events(&buffer_content));
             }
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
-        }
-
-        // Flush invoke 嗅探缓冲区的残留：先再嗅探一次完整块（万一最后一块就是完整 invoke），
-        // 剩下的走 emit_text_delta_raw flush 出去（防尾字节丢）。
-        if !self.invoke_sniff_buffer.is_empty() {
-            events.extend(self.drain_invoke_sniff_buffer(true));
-        }
+        // H2：流结束。回复末尾仍成立的 `<invoke>` 块（且本轮没有原生 tool_use）合成为工具调用，
+        // 其余作为正文放出。
+        let sniffed = self.invoke_sniffer.finish(&self.invoke_tool_schemas);
+        events.extend(self.emit_sniffed(sniffed));
 
         // 收尾检查工具调用累积器：无参工具（0 字节滞留）在此还原为 `{}` 并正常发出；
         // 累积了非空内容却从未 stop=true 的才是上游中途截断，记为错误。
@@ -2936,6 +2721,27 @@ impl StreamContext {
             return events;
         }
 
+        // L5：复读熔断触发过，本轮输出不完整，以可重试的 api_error 终止，不能当正常结束。
+        if self.repeat_guard_tripped {
+            events.extend(self.generate_error_events("api_error", REPEAT_GUARD_ERROR_MESSAGE));
+            return events;
+        }
+
+        // L9：thinking 未启用时，原生 reasoning 只在整轮既没有正文也没有工具调用时作为正文兜底。
+        // 兜底直接走 emit_text_delta_raw，不经过 invoke 识别。
+        if !self.thinking_enabled
+            && !self.visible_text_emitted
+            && !self.state_manager.has_tool_use
+            && !self.undisclosed_reasoning.trim().is_empty()
+        {
+            let reasoning = std::mem::take(&mut self.undisclosed_reasoning);
+            events.extend(self.emit_text_delta_raw(&reasoning));
+        }
+
+        // M2 / L2 / M5：终止原因以上游原生 stopReason 为准。没有原生截断信号时，只有 thinking 的
+        // 一轮按 end_turn 正常结束，不再伪造 max_tokens，也不补空格正文。
+        self.apply_native_stop_reason();
+
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
         let final_output_tokens = self.resolved_output_tokens();
@@ -2954,163 +2760,15 @@ impl StreamContext {
 
     /// 上游响应体读取失败时生成异常终态，不 flush 可能已被截断的缓冲内容。
     pub fn generate_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        // Anthropic requires a signature_delta before a thinking block closes,
+        // including abnormal termination. Close it through the thinking-aware
+        // path first; the generic state manager then closes any other blocks.
         let mut events = self.close_open_thinking_block();
         events.extend(
             self.state_manager
                 .generate_error_events(error_type, message),
         );
         events
-    }
-}
-
-/// 工具结果续轮的暂存上下文。
-///
-/// 在出现可见文本或完整工具调用前保留事件，以便空回答能安全重试。
-/// 出现可见内容后可通过 `take_buffered_events` 即时发送，最终用量由
-/// `message_delta` 提供；未提前发送的 `message_start` 也会在收尾时校正。
-pub struct BufferedStreamContext {
-    /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
-    /// 缓冲的所有事件（包括 message_start、content_block_start 等）
-    event_buffer: Vec<SseEvent>,
-    /// 是否已经生成了初始事件
-    initial_events_generated: bool,
-}
-
-impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
-        model: impl Into<String>,
-        estimated_input_tokens: i32,
-        thinking_enabled: bool,
-        tool_name_map: HashMap<String, String>,
-        known_tool_names: std::collections::HashSet<String>,
-    ) -> Self {
-        let inner = StreamContext::new_with_thinking(
-            model,
-            estimated_input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
-        );
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            initial_events_generated: false,
-        }
-    }
-
-    /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
-    pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
-        self.inner.cache_usage = cache_usage;
-    }
-
-    /// 处理 Kiro 事件并缓冲结果
-    ///
-    /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
-    pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
-        // 首次处理事件时，先生成初始事件（message_start 等）
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 处理事件并缓冲结果
-        let events = self.inner.process_kiro_event(event);
-        self.event_buffer.extend(events);
-    }
-
-    /// Publish buffered events once a continuation has visible text or a tool
-    /// call. Final usage is subsequently delivered in message_delta.
-    pub fn take_buffered_events(&mut self) -> Vec<SseEvent> {
-        std::mem::take(&mut self.event_buffer)
-    }
-
-    /// 完成流处理并返回所有事件
-    ///
-    /// 此方法会：
-    /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
-    /// 3. 返回所有缓冲的事件
-    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
-        // 如果从未处理过事件，也要生成初始事件
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
-        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
-
-        // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
-        let final_events = self.inner.generate_final_events();
-        self.event_buffer.extend(final_events);
-
-        // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
-                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
-    }
-
-    /// 取出最终用量（在 finish_and_get_all_events 之后调用）
-    ///
-    /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)
-    pub fn final_usage(&self) -> (i32, i32, i32, i32, f64) {
-        let (input, creation, read) = self.inner.resolved_usage();
-        (
-            input,
-            self.inner.resolved_output_tokens(),
-            creation,
-            read,
-            self.inner.credits,
-        )
-    }
-
-    /// 上游是否下发了精确 tokenUsage；配合 [`Self::cache_usage`] 推断 usage 来源。
-    pub fn has_provider_usage(&self) -> bool {
-        self.inner.provider_token_usage.is_some()
-    }
-
-    /// 本地 CacheMeter 的覆盖情况
-    pub fn cache_usage(&self) -> &super::cache_metering::CacheUsage {
-        &self.inner.cache_usage
-    }
-
-    /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
-    pub fn tool_json_error_message(&self) -> Option<String> {
-        self.inner.tool_json_error_message()
-    }
-
-    /// 转发内部 StreamContext 的上游事件错误。
-    pub fn upstream_error_message(&self) -> Option<String> {
-        self.inner.upstream_error_message()
-    }
-
-    /// 本轮是否产生了非空白文本或完整 tool_use。
-    pub fn has_visible_continuation(&self) -> bool {
-        self.inner.has_visible_continuation()
-    }
-
-    /// 是否由上游明确给出了 max_tokens / context-window 终止。
-    pub fn has_terminal_limit(&self) -> bool {
-        self.inner.has_terminal_limit()
-    }
-
-    /// Content filtering ends the turn without an empty-continuation retry.
-    pub fn is_refusal(&self) -> bool {
-        self.inner.state_manager.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON)
     }
 }
 
@@ -3294,7 +2952,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let emitted =
             ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "", false)));
@@ -3338,7 +2997,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let emitted = ctx.process_kiro_event(&Event::ToolUse(tool_evt(
             "t1",
@@ -3374,93 +3034,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(completed.name, "the_original_very_long_tool_name");
-    }
-
-    #[test]
-    fn upstream_error_finishes_with_error_without_message_stop() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "m",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let _ = ctx.generate_initial_events();
-        let _ = ctx.process_kiro_event(&Event::Error {
-            error_code: "InternalError".to_string(),
-            error_message: "upstream failed".to_string(),
-        });
-
-        let events = ctx.generate_final_events();
-        assert!(events.iter().any(|event| event.event == "error"));
-        assert!(events.iter().all(|event| event.event != "message_stop"));
-        assert!(events.iter().all(|event| event.event != "message_delta"));
-    }
-
-    #[test]
-    fn incomplete_tool_json_finishes_with_error_without_message_stop() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "m",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let _ = ctx.generate_initial_events();
-        let _ = ctx.process_tool_use(&tool_evt("toolu_1", "read_file", "{\"path\":\"/tmp", false));
-
-        let events = ctx.generate_final_events();
-        assert!(events.iter().any(|event| event.event == "error"));
-        assert!(events.iter().all(|event| event.event != "message_stop"));
-        assert!(events.iter().all(|event| event.event != "message_delta"));
-    }
-
-    #[test]
-    fn continuation_requires_visible_text_or_complete_tool_use() {
-        let mut empty = StreamContext::new_with_thinking(
-            "m",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let _ = empty.generate_initial_events();
-        assert!(!empty.has_visible_continuation());
-
-        let mut thinking_only = StreamContext::new_with_thinking(
-            "m",
-            1,
-            true,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let _ = thinking_only.generate_initial_events();
-        let _ = thinking_only.process_assistant_response("<thinking>work</thinking>");
-        let _ = thinking_only.generate_final_events();
-        assert!(!thinking_only.has_visible_continuation());
-
-        let mut text = StreamContext::new_with_thinking(
-            "m",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let _ = text.generate_initial_events();
-        let _ = text.process_assistant_response("done");
-        let _ = text.generate_final_events();
-        assert!(text.has_visible_continuation());
-
-        let mut tool = StreamContext::new_with_thinking(
-            "m",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let _ = tool.generate_initial_events();
-        let _ = tool.process_tool_use(&tool_evt("toolu_1", "read_file", "{}", true));
-        assert!(tool.has_visible_continuation());
     }
 
     /// 防回归：统一管道的两个去向（流式 emit_completed_tool_use 与非流式 to_anthropic_block）
@@ -3555,12 +3128,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_use_xml_filter_drops_unclosed_at_finish() {
+    fn tool_use_xml_filter_keeps_unclosed_at_finish() {
+        // H1：未闭合的 <tool_use 原样保留，不吞后文。
         let mut f = ToolUseXmlLeakFilter::default();
         let mut out = f.filter("keep <tool_use name=\"W\">partial...");
         out.push_str(&f.finish());
-        assert!(out.contains("keep"));
-        assert!(!out.contains("<tool_use") && !out.contains("partial"));
+        assert_eq!(out, "keep <tool_use name=\"W\">partial...");
     }
 
     #[test]
@@ -3587,6 +3160,26 @@ mod tests {
 
     /// 测试用的「已知工具表」：包含 invoke 测试里会合成的工具名，
     /// 让 🅳 工具表校验放行这些名字，从而能验证捞回逻辑本身。
+    /// H2 测试用 schema：exec_command 用真实形态（cmd 必填、yield_time_ms 为整数），其余工具不限参数。
+    fn test_tool_schemas() -> InvokeToolSchemas {
+        let mut schemas: InvokeToolSchemas = test_known_tools()
+            .into_iter()
+            .map(|name| (name, json!({"type": "object"})))
+            .collect();
+        schemas.insert(
+            "exec_command".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string"},
+                    "yield_time_ms": {"type": "integer"}
+                },
+                "required": ["cmd"]
+            }),
+        );
+        schemas
+    }
+
     fn test_known_tools() -> std::collections::HashSet<String> {
         [
             "exec_command",
@@ -3608,7 +3201,7 @@ mod tests {
         let text = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi</parameter>\n</invoke>";
         let blocks = extract_invoke_content_blocks(
             text,
-            &test_known_tools(),
+            &test_tool_schemas(),
             &std::collections::HashMap::new(),
         );
         let tu = blocks
@@ -3641,8 +3234,8 @@ mod tests {
             "call\n<invoke name=\"{}\">\n<parameter name=\"x\">y</parameter>\n</invoke>",
             short
         );
-        let mut known = std::collections::HashSet::new();
-        known.insert(short.to_string());
+        let mut known = InvokeToolSchemas::new();
+        known.insert(short.to_string(), json!({"type": "object"}));
         let mut map = std::collections::HashMap::new();
         map.insert(short.to_string(), original.to_string());
         let blocks = extract_invoke_content_blocks(&text, &known, &map);
@@ -3662,7 +3255,7 @@ mod tests {
         let fenced = "see:\n```\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf /</parameter>\n</invoke>\n```";
         let b1 = extract_invoke_content_blocks(
             fenced,
-            &test_known_tools(),
+            &test_tool_schemas(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -3673,7 +3266,7 @@ mod tests {
         let unknown = "call\n<invoke name=\"not_a_real_tool\">\n<parameter name=\"x\">y</parameter>\n</invoke>";
         let b2 = extract_invoke_content_blocks(
             unknown,
-            &test_known_tools(),
+            &test_tool_schemas(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -3686,7 +3279,7 @@ mod tests {
     fn extract_blocks_clean_text_is_single_unchanged_text_block() {
         let blocks = extract_invoke_content_blocks(
             "just a normal answer with no tool calls",
-            &test_known_tools(),
+            &test_tool_schemas(),
             &std::collections::HashMap::new(),
         );
         assert_eq!(blocks.len(), 1);
@@ -3781,7 +3374,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -3840,87 +3434,36 @@ mod tests {
 
     #[test]
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
-        // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
-        // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
+        // thinking 模式下正文后接 tool_use：开头不是 `<thinking>` 的正文立即输出（M1），
+        // 不再滞留在 thinking_buffer；文本仍必须排在 tool_use 块之前。
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
             true,
             HashMap::new(),
             test_known_tools(),
-        );
-        let _initial_events = ctx.generate_initial_events();
-
-        // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
-        // 因而会留在 thinking_buffer 中等待后续 chunk。
-        let ev1 = ctx.process_assistant_response("有修");
-        assert!(
-            ev1.iter().all(|e| e.event != "content_block_delta"),
-            "short prefix should be buffered under thinking mode"
-        );
-        let ev2 = ctx.process_assistant_response("改：");
-        assert!(
-            ev2.iter().all(|e| e.event != "content_block_delta"),
-            "short prefix should still be buffered under thinking mode"
-        );
-
-        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_assistant_response("有修"));
+        all.extend(ctx.process_assistant_response("改："));
+        all.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
-        });
-
-        let text_start_index = events.iter().find_map(|e| {
-            if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                e.data["index"].as_i64()
-            } else {
-                None
-            }
-        });
-        let pos_text_delta = events.iter().position(|e| {
-            e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-        });
-        let pos_text_stop = text_start_index.and_then(|idx| {
-            events.iter().position(|e| {
-                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(idx)
-            })
-        });
-        let pos_tool_start = events.iter().position(|e| {
-            e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
-        });
-
-        assert!(
-            text_start_index.is_some(),
-            "should start a text block to flush buffered text"
-        );
-        assert!(
-            pos_text_delta.is_some(),
-            "should flush buffered text as text_delta"
-        );
-        assert!(
-            pos_text_stop.is_some(),
-            "should stop text block before tool_use block starts"
-        );
-        assert!(pos_tool_start.is_some(), "should start tool_use block");
-
-        let pos_text_delta = pos_text_delta.unwrap();
-        let pos_text_stop = pos_text_stop.unwrap();
-        let pos_tool_start = pos_tool_start.unwrap();
-
-        assert!(
-            pos_text_delta < pos_text_stop && pos_text_stop < pos_tool_start,
-            "ordering should be: text_delta -> text_stop -> tool_use_start"
-        );
-
-        assert!(
-            events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == "有修改："
-            }),
-            "flushed text should equal the buffered prefix"
-        );
+            stop: true,
+        }));
+        all.extend(ctx.generate_final_events());
+        assert_eq!(collect_text_content(&all), "有修改：");
+        let pos_text = all
+            .iter()
+            .position(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .expect("text delta");
+        let pos_tool = all
+            .iter()
+            .position(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            .expect("tool_use start");
+        assert!(pos_text < pos_tool, "文本必须在 tool_use 块之前");
     }
 
     #[test]
@@ -3968,28 +3511,21 @@ mod tests {
 
     #[test]
     fn test_find_real_thinking_end_tag_basic() {
-        // 标签后的正文可以直接出现，也可以由任意空白分隔。
+        // 基本情况：正常的结束标签后面有双换行符
         assert_eq!(find_real_thinking_end_tag("</thinking>\n\n"), Some(0));
         assert_eq!(
             find_real_thinking_end_tag("content</thinking>\n\n"),
-            Some(7),
+            Some(7)
         );
         assert_eq!(
             find_real_thinking_end_tag("some text</thinking>\n\nmore text"),
             Some(9)
         );
-        assert_eq!(find_real_thinking_end_tag("abc</thinking>答案"), Some(3));
-        assert_eq!(find_real_thinking_end_tag("abc</thinking> 答案"), Some(3));
-        assert_eq!(find_real_thinking_end_tag("abc</thinking>\n答案"), Some(3));
-        assert_eq!(
-            find_real_thinking_end_tag("done.</thinking>answer"),
-            Some(5)
-        );
 
-        // 标签本身完整即切换，不等待后续分隔符或正文。
-        assert_eq!(find_real_thinking_end_tag("</thinking>"), Some(0));
-        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), Some(0));
-        assert_eq!(find_real_thinking_end_tag("</thinking>   \n\t"), Some(0));
+        // 没有双换行符的情况
+        assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
+        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
+        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
     }
 
     #[test]
@@ -4061,20 +3597,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_complete_text_accepts_flexible_end_separator() {
-        for payload in [
-            "<thinking>abc</thinking>答案",
-            "<thinking>abc</thinking> 答案",
-            "<thinking>abc</thinking>\n答案",
-            "<thinking>abc</thinking>  \n\t答案",
-        ] {
-            let (thinking, text) = extract_thinking_from_complete_text(payload);
-            assert_eq!(thinking.as_deref(), Some("abc"), "payload: {payload:?}");
-            assert_eq!(text, "答案", "payload: {payload:?}");
-        }
-    }
-
-    #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
@@ -4082,7 +3604,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -4143,7 +3666,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4183,7 +3707,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let mut events =
             ctx.process_reasoning_content(&crate::kiro::model::events::ReasoningContentEvent {
@@ -4224,7 +3749,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -4250,7 +3776,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -4285,7 +3812,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -4323,7 +3851,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -4358,7 +3887,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
@@ -4379,43 +3909,6 @@ mod tests {
             full_text
         );
         assert_eq!(full_text, "你好");
-    }
-
-    #[test]
-    fn test_multiple_thinking_blocks_and_orphan_end_tag_never_leak_to_text() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        for chunk in [
-            "<thinking>first plan</thi",
-            "nking>First answer. </thi",
-            "nking>\n\n<thin",
-            "king>second plan</thinking>Second answer.",
-        ] {
-            all.extend(ctx.process_assistant_response(chunk));
-        }
-        all.extend(ctx.generate_final_events());
-
-        let thinking = collect_thinking_content(&all);
-        let text = collect_text_content(&all);
-        assert_eq!(thinking, "first plansecond plan");
-        assert_eq!(text, "First answer. Second answer.");
-        assert!(!text.contains("thinking"), "XML leaked into text: {text:?}");
-
-        let thinking_starts = all
-            .iter()
-            .filter(|event| {
-                event.event == "content_block_start"
-                    && event.data["content_block"]["type"] == "thinking"
-            })
-            .count();
-        assert_eq!(thinking_starts, 2);
     }
 
     /// 辅助函数：从事件列表中提取所有 thinking_delta 的拼接内容
@@ -4478,7 +3971,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4505,7 +3999,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4531,7 +4026,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let value = "第一行 a < b\n第二行 路径 /tmp/中文";
@@ -4562,7 +4058,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4586,7 +4083,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4613,7 +4111,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4661,7 +4160,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4695,7 +4195,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4724,7 +4225,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4746,7 +4248,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -4784,7 +4287,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         // 第一次 process：句中不闭合的 <invoke>，前面同一行有正文“讨论”
@@ -4825,7 +4329,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         // 构造一个 24 行的多行 patch 内容
@@ -4884,7 +4389,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         // 每行 ~70 字节 × 250 行 ≈ 17KB
@@ -4940,14 +4446,15 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         // 行首开标签，永不闭合；填充超过上限的纯文本（无 </invoke>）
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response("<invoke name=\"x\">"));
         // 一次喂入超过上限的内容（用不含 `<` 的填充，避免触发其它路径）
-        let filler = "A".repeat(StreamContext::MAX_INVOKE_HOLD_BYTES + 1024);
+        let filler = "A".repeat(MAX_INVOKE_HOLD_BYTES + 1024);
         all.extend(ctx.process_assistant_response(&filler));
         all.extend(ctx.generate_final_events());
 
@@ -4978,7 +4485,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -5010,7 +4518,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -5065,7 +4574,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -5094,7 +4604,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -5114,97 +4625,6 @@ mod tests {
     }
 
     #[test]
-    fn test_end_tag_accepts_direct_text_and_arbitrary_whitespace() {
-        for payload in [
-            "<thinking>abc</thinking>答案",
-            "<thinking>abc</thinking> 答案",
-            "<thinking>abc</thinking>\n答案",
-            "<thinking>abc</thinking>  \n\t答案",
-            "<thinking>done.</thinking>答案",
-        ] {
-            let mut ctx = StreamContext::new_with_thinking(
-                "test-model",
-                1,
-                true,
-                HashMap::new(),
-                test_known_tools(),
-            );
-            let _initial_events = ctx.generate_initial_events();
-
-            let mut all = Vec::new();
-            all.extend(ctx.process_assistant_response(payload));
-            all.extend(ctx.generate_final_events());
-
-            let thinking = collect_thinking_content(&all);
-            assert!(
-                thinking == "abc" || thinking == "done.",
-                "thinking boundary should close for {payload:?}, got {thinking:?}"
-            );
-            assert_eq!(
-                collect_text_content(&all),
-                "答案",
-                "text after thinking boundary should remain visible for {payload:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_end_tag_and_separator_split_across_events() {
-        for chunks in [
-            vec!["<thinking>abc</thi", "nking>", "答案"],
-            vec!["<thinking>abc</thi", "nking>", " ", "答案"],
-            vec!["<thinking>abc</thi", "nking>", "\n", "答案"],
-            vec!["<thinking>abc</thi", "nking>", "  ", "\n\t", "答案"],
-        ] {
-            let mut ctx = StreamContext::new_with_thinking(
-                "test-model",
-                1,
-                true,
-                HashMap::new(),
-                test_known_tools(),
-            );
-            let _initial_events = ctx.generate_initial_events();
-
-            let mut all = Vec::new();
-            for chunk in chunks {
-                all.extend(ctx.process_assistant_response(chunk));
-            }
-            all.extend(ctx.generate_final_events());
-
-            assert_eq!(collect_thinking_content(&all), "abc");
-            assert_eq!(collect_text_content(&all), "答案");
-        }
-    }
-
-    #[test]
-    fn test_quoted_end_tag_split_across_events_stays_in_thinking() {
-        for chunks in [
-            vec!["<thinking>mention `</thi", "nking>` here"],
-            vec!["<thinking>mention \"</thi", "nking>\" here"],
-            vec!["<thinking>mention '</thi", "nking>' here"],
-            vec!["<thinking>mention `</thinking>", "` here"],
-        ] {
-            let mut ctx = StreamContext::new_with_thinking(
-                "test-model",
-                1,
-                true,
-                HashMap::new(),
-                test_known_tools(),
-            );
-            let _initial_events = ctx.generate_initial_events();
-
-            let mut all = Vec::new();
-            for chunk in chunks {
-                all.extend(ctx.process_assistant_response(chunk));
-            }
-            all.extend(ctx.generate_final_events());
-
-            assert!(collect_thinking_content(&all).contains("</thinking>"));
-            assert_eq!(collect_text_content(&all), " ");
-        }
-    }
-
-    #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
         let mut ctx = StreamContext::new_with_thinking(
@@ -5213,7 +4633,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -5243,7 +4664,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -5274,64 +4696,100 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_only_sets_max_tokens_stop_reason() {
-        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let _initial_events = ctx.generate_initial_events();
+    fn native_thinking_only_does_not_fabricate_output_limit() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, true, HashMap::new(), test_known_tools());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("I should summarize the directory.".to_string()),
+                ..Default::default()
+            },
+        )));
+        events.extend(ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"END_TURN"})).unwrap(),
+        )));
+        events.extend(ctx.generate_final_events());
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        assert_ne!(terminal.data["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(collect_text_content(&events), "");
+    }
 
-        let mut all_events = Vec::new();
-        all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.generate_final_events());
+    #[test]
+    fn native_output_limit_is_preserved_when_metadata_reports_it() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, true, HashMap::new(), test_known_tools());
+        ctx.process_assistant_response("A partial answer");
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"MAX_TOKENS"})).unwrap(),
+        ));
+        let events = ctx.generate_final_events();
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        assert_eq!(terminal.data["delta"]["stop_reason"], "max_tokens");
+    }
 
-        let message_delta = all_events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("should have message_delta event");
+    fn final_stop_reason(ctx: &mut StreamContext) -> serde_json::Value {
+        let events = ctx.generate_final_events();
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        terminal.data["delta"]["stop_reason"].clone()
+    }
 
-        assert_eq!(
-            message_delta.data["delta"]["stop_reason"], "max_tokens",
-            "stop_reason should be max_tokens when only thinking is produced"
-        );
+    #[test]
+    fn metadata_end_turn_before_tool_use_still_reports_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"END_TURN"})).unwrap(),
+        ));
+        ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "{}", true)));
+        assert_eq!(final_stop_reason(&mut ctx), "tool_use");
+    }
 
-        // 应补发一套完整的 text 事件（content_block_start + delta 空格 + content_block_stop）
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
-            }),
-            "should emit text content_block_start"
-        );
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == " "
-            }),
-            "should emit text_delta with a single space"
-        );
-        // text block 应被 generate_final_events 自动关闭
-        let text_block_index = all_events
-            .iter()
-            .find_map(|e| {
-                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                    e.data["index"].as_i64()
-                } else {
-                    None
-                }
-            })
-            .expect("text block should exist");
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(text_block_index)
-            }),
-            "text block should be stopped"
-        );
+    #[test]
+    fn metadata_tool_use_without_tool_block_reports_end_turn() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_assistant_response("No tool after all.");
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"TOOL_USE"})).unwrap(),
+        ));
+        assert_eq!(final_stop_reason(&mut ctx), "end_turn");
+    }
+
+    #[test]
+    fn native_output_limit_takes_precedence_over_context_usage() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_assistant_response("A partial answer");
+        ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent { context_usage_percentage: 100.0 },
+        ));
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"MAX_TOKENS"})).unwrap(),
+        ));
+        assert_eq!(final_stop_reason(&mut ctx), "max_tokens");
+    }
+
+    #[test]
+    fn legacy_thinking_only_does_not_invent_limit_or_blank_answer() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("<thinking>abc</thinking>"));
+        events.extend(ctx.generate_final_events());
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        assert_eq!(terminal.data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(collect_text_content(&events), "");
+        assert_eq!(collect_thinking_content(&events), "abc");
+    }
+
+    #[test]
+    fn test_thinking_only_ends_turn_without_padding() {
+        // L2：只有 thinking、上游没有截断信号时按 end_turn 正常结束，不补空格正文。
+        let mut ctx = fr_ctx(true);
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_assistant_response("<thinking>只是想了想</thinking>"));
+        all.extend(ctx.generate_final_events());
+        assert_eq!(fr_stop_reason(&all), json!("end_turn"));
+        assert_eq!(collect_text_content(&all), "");
+        assert_eq!(collect_thinking_content(&all), "只是想了想");
     }
 
     #[test]
@@ -5343,7 +4801,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -5370,7 +4829,8 @@ mod tests {
             true,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -5407,7 +4867,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         // patch 正文里出现字面 </invoke>，真正的闭合在最后
         let payload = "count\n<invoke name=\"apply_patch\"><parameter name=\"input\">line1\n</invoke>\nstill in patch\nline3</parameter></invoke>";
@@ -5440,7 +4901,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let payload = "count\n<invoke name=\"apply_patch\"><parameter name=\"input\">before</parameter> after the fake close</parameter></invoke>";
         let mut all = Vec::new();
@@ -5465,7 +4927,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let payload = "示例代码：\n```\n<invoke name=\"exec_command\"><parameter name=\"cmd\">rm -rf /</parameter></invoke>\n```\n讲解完毕。";
         let mut all = Vec::new();
@@ -5490,7 +4953,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let payload = "count\n<invoke name=\"totally_unknown_tool\"><parameter name=\"x\">1</parameter></invoke>";
         let mut all = Vec::new();
@@ -5534,7 +4998,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let payload = "我先等结果。\n\ncard\n<invoke name=\"wait_agent\"><parameter name=\"x\">1</parameter></invoke>";
         let mut all = Vec::new();
@@ -5560,7 +5025,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let mut all = Vec::new();
         // 围栏开标签分两个 chunk 到达
@@ -5576,33 +5042,24 @@ mod tests {
     /// 🟡 回归（Reviewer 问题1）：连发 burst，块 A 在 `</invoke>` 前混了非 `>` 收尾文字，
     /// 不应把 A、B 误合并成一个块、也不应让 B 的参数串进 A。两个块都应独立捞回。
     #[test]
-    fn test_invoke_burst_with_trailing_text_not_merged() {
+    fn test_invoke_burst_with_malformed_block_stays_text() {
+        // H2：A 块参数后夹着游离正文（结构不干净），拿不准就整段按正文保留；
+        // 紧贴其后的 B 块不在行首，同样不合成。A 的参数因此不可能串进 B。
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let payload = "count\n<invoke name=\"tool_a\"><parameter name=\"x\">1</parameter>trailing plain</invoke><invoke name=\"tool_b\"><parameter name=\"y\">2</parameter></invoke>";
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response(payload));
         all.extend(ctx.generate_final_events());
-        let tools = collect_tool_uses(&all);
-        assert_eq!(
-            tools.len(),
-            2,
-            "应独立合成 2 个 tool_use，不能误合并: {:?}",
-            tools
-        );
-        assert_eq!(tools[0].0, "tool_a");
-        assert_eq!(tools[1].0, "tool_b");
-        let a: serde_json::Value = serde_json::from_str(&tools[0].1).expect("合法 JSON");
-        let b: serde_json::Value = serde_json::from_str(&tools[1].1).expect("合法 JSON");
-        assert!(a.get("y").is_none(), "B 的参数 y 不应串进 A: {a:?}");
-        assert_eq!(a["x"], "1");
-        assert_eq!(b["y"], "2");
+        assert!(collect_tool_uses(&all).is_empty());
+        assert_eq!(collect_text_content(&all), payload);
     }
 
     /// 🟢 正常连发 burst（块紧贴、A 以 </parameter> 收尾）仍应正确拆成两个。
@@ -5614,7 +5071,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let payload = "count\n<invoke name=\"tool_a\"><parameter name=\"x\">1</parameter></invoke><invoke name=\"tool_b\"><parameter name=\"y\">2</parameter></invoke>";
         let mut all = Vec::new();
@@ -5637,7 +5095,8 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect();
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), known);
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), known)
+                .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         // 逐字摘自 thread 019e9e8d 真实泄漏 assistant 消息
         let real = "）。\n\ncount\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">cd /Users/yuyifeng/.codex/everything-codex/runtime/agent-tools && python3 -m pytest -q -p no:cacheprovider objects/dev/beads/leaves/create_issue/ 2>&1 | tail -8</parameter>\n<parameter name=\"yield_time_ms\">60000</parameter>\n</invoke>";
@@ -5659,7 +5118,7 @@ mod tests {
             "cmd 参数应完整保留: {:?}",
             parsed
         );
-        assert_eq!(parsed["yield_time_ms"], "60000", "yield_time_ms 参数应保留");
+        assert_eq!(parsed["yield_time_ms"], json!(60000), "yield_time_ms 参数应保留");
         // 关键：字面 <invoke> 不应泄漏到 text
         let text = collect_text_content(&all);
         assert!(
@@ -5687,7 +5146,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         // 真实形态：正常话 + call + 海量 count（这里用 5000 次模拟 3.2 万次）
@@ -5723,7 +5183,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let payload =
             "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>";
@@ -5749,7 +5210,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let payload =
             "我数了一下 count = 3，然后继续做别的事。\n这是第二行正常文字。\n第三行也正常。";
@@ -5778,7 +5240,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response("call\n\n"));
@@ -5806,7 +5269,7 @@ mod tests {
         }
         let blocks = extract_invoke_content_blocks(
             &text,
-            &test_known_tools(),
+            &test_tool_schemas(),
             &std::collections::HashMap::new(),
         );
         let joined: String = blocks
@@ -5829,7 +5292,7 @@ mod tests {
         let text = "count\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
         let blocks = extract_invoke_content_blocks(
             text,
-            &test_known_tools(),
+            &test_tool_schemas(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -5872,322 +5335,6 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_filters_split_legacy_thinking_tags() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        for text in ["<thin", "king>native reasoning</thi", "nking>"] {
-            all.extend(ctx.process_kiro_event(&Event::ReasoningContent(
-                crate::kiro::model::events::ReasoningContentEvent {
-                    text: Some(text.to_string()),
-                    signature: None,
-                    redacted_content: None,
-                },
-            )));
-        }
-        all.extend(ctx.process_assistant_response("final answer"));
-        all.extend(ctx.generate_final_events());
-
-        assert_eq!(collect_thinking_content(&all), "native reasoning");
-        assert_eq!(collect_text_content(&all), "final answer");
-        assert!(all.iter().all(|event| {
-            let delta = &event.data["delta"];
-            !delta["thinking"]
-                .as_str()
-                .is_some_and(|text| text.contains("thinking>"))
-                && !delta["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("thinking>"))
-        }));
-    }
-
-    #[test]
-    fn test_native_reasoning_is_hidden_when_thinking_disabled() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        for text in ["<thin", "king>visible fallback</thi", "nking>"] {
-            all.extend(ctx.process_kiro_event(&Event::ReasoningContent(
-                crate::kiro::model::events::ReasoningContentEvent {
-                    text: Some(text.to_string()),
-                    signature: None,
-                    redacted_content: None,
-                },
-            )));
-        }
-        all.extend(ctx.generate_final_events());
-
-        assert_eq!(collect_text_content(&all), "");
-        assert_eq!(collect_thinking_content(&all), "");
-    }
-
-    #[test]
-    fn test_legacy_thinking_is_hidden_when_thinking_disabled() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        all.extend(ctx.process_assistant_response(
-            "before<thinking>private chain of thought</thinking>after",
-        ));
-        all.extend(ctx.generate_final_events());
-
-        assert_eq!(collect_text_content(&all), "beforeafter");
-        assert_eq!(collect_thinking_content(&all), "");
-        assert!(all.iter().all(|event| {
-            !event.data["delta"]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("thinking") || text.contains("chain of thought"))
-        }));
-    }
-
-    #[test]
-    fn test_split_legacy_thinking_is_hidden_when_thinking_disabled() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        for chunk in [
-            "visible before<thi",
-            "nking>private ",
-            "reasoning</thin",
-            "king>visible after",
-        ] {
-            all.extend(ctx.process_assistant_response(chunk));
-        }
-        all.extend(ctx.generate_final_events());
-
-        assert_eq!(collect_text_content(&all), "visible beforevisible after");
-        assert_eq!(collect_thinking_content(&all), "");
-    }
-
-    #[test]
-    fn test_unterminated_legacy_thinking_is_dropped_at_stream_boundary() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            false,
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        all.extend(ctx.process_assistant_response("visible<thinking>private unfinished"));
-        all.extend(ctx.generate_final_events());
-
-        assert_eq!(collect_text_content(&all), "visible");
-        assert_eq!(collect_thinking_content(&all), "");
-    }
-
-    #[test]
-    fn test_unterminated_legacy_thinking_is_dropped_before_tool_call() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            false,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        all.extend(
-            ctx.process_assistant_response("<thinking>private plan immediately before a tool"),
-        );
-        all.extend(ctx.process_tool_use(&tool_evt(
-            "toolu_1",
-            "read_file",
-            "{\"path\":\"/tmp/example\"}",
-            true,
-        )));
-        all.extend(ctx.process_assistant_response("final answer"));
-        all.extend(ctx.generate_final_events());
-
-        assert_eq!(collect_text_content(&all), "final answer");
-        assert_eq!(collect_thinking_content(&all), "");
-        assert_eq!(collect_tool_uses(&all).len(), 1);
-    }
-
-    #[test]
-    fn test_twelve_native_thinking_rounds_with_split_tags_and_tool_calls() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        for round in 0..12 {
-            for text in [
-                format!("plan-{round}."),
-                "</thi".to_string(),
-                format!("nking>continued-{round}|"),
-            ] {
-                all.extend(ctx.process_kiro_event(&Event::ReasoningContent(
-                    crate::kiro::model::events::ReasoningContentEvent {
-                        text: Some(text),
-                        signature: None,
-                        redacted_content: None,
-                    },
-                )));
-            }
-            all.extend(ctx.process_tool_use(&tool_evt(
-                &format!("toolu_{round}"),
-                "read_file",
-                &format!("{{\"path\":\"/tmp/{round}\"}}"),
-                true,
-            )));
-            all.extend(ctx.process_assistant_response(&format!("answer-{round}|")));
-        }
-        all.extend(ctx.generate_final_events());
-
-        let expected_thinking: String = (0..12)
-            .map(|round| format!("plan-{round}.continued-{round}|"))
-            .collect();
-        let expected_text: String = (0..12).map(|round| format!("answer-{round}|")).collect();
-        assert_eq!(collect_thinking_content(&all), expected_thinking);
-        assert_eq!(collect_text_content(&all), expected_text);
-        assert_eq!(collect_tool_uses(&all).len(), 12);
-        assert!(all.iter().all(|event| {
-            let delta = &event.data["delta"];
-            !delta["thinking"]
-                .as_str()
-                .is_some_and(|text| text.contains("thinking>"))
-                && !delta["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("thinking>"))
-        }));
-    }
-
-    #[test]
-    fn test_twelve_thinking_rounds_mixed_with_tool_calls_keep_channels_separate() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let mut all = ctx.generate_initial_events();
-
-        for round in 0..12 {
-            for chunk in [
-                "<thin".to_string(),
-                format!("king>plan-{round}</thi"),
-                format!("nking>answer-{round}|"),
-            ] {
-                all.extend(ctx.process_assistant_response(&chunk));
-            }
-            if round % 3 == 2 {
-                all.extend(ctx.process_tool_use(&tool_evt(
-                    &format!("toolu_{round}"),
-                    "read_file",
-                    &format!("{{\"path\":\"/tmp/{round}\"}}"),
-                    true,
-                )));
-            }
-        }
-        all.extend(ctx.generate_final_events());
-
-        let expected_thinking: String = (0..12).map(|round| format!("plan-{round}")).collect();
-        let expected_text: String = (0..12).map(|round| format!("answer-{round}|")).collect();
-        assert_eq!(collect_thinking_content(&all), expected_thinking);
-        assert_eq!(collect_text_content(&all), expected_text);
-        assert_eq!(collect_tool_uses(&all).len(), 4);
-        assert!(all.iter().all(|event| {
-            !event.data["delta"]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("thinking>"))
-        }));
-    }
-
-    #[test]
-    fn test_truncated_orphan_thinking_tag_is_dropped_at_boundaries() {
-        let mut final_ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let mut final_events = final_ctx.generate_initial_events();
-        final_events
-            .extend(final_ctx.process_assistant_response("<thinking>plan</thinking>answer</thin"));
-        final_events.extend(final_ctx.generate_final_events());
-        assert_eq!(collect_text_content(&final_events), "answer");
-
-        let mut tool_ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let mut tool_events = tool_ctx.generate_initial_events();
-        tool_events
-            .extend(tool_ctx.process_assistant_response("<thinking>plan</thinking>answer</thin"));
-        tool_events.extend(tool_ctx.process_tool_use(&tool_evt(
-            "toolu_1",
-            "read_file",
-            "{\"path\":\"/tmp/example\"}",
-            true,
-        )));
-        tool_events.extend(tool_ctx.generate_final_events());
-        assert_eq!(collect_text_content(&tool_events), "answer");
-        assert_eq!(collect_tool_uses(&tool_events).len(), 1);
-    }
-
-    #[test]
-    fn test_truncated_closing_tag_inside_thinking_is_dropped_before_tool_call() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let mut all = ctx.generate_initial_events();
-        all.extend(ctx.process_assistant_response("<thinking>plan before tool</thin"));
-        all.extend(ctx.process_tool_use(&tool_evt(
-            "toolu_1",
-            "read_file",
-            "{\"path\":\"/tmp/example\"}",
-            true,
-        )));
-        all.extend(ctx.generate_final_events());
-
-        assert_eq!(collect_thinking_content(&all), "plan before tool");
-        assert_eq!(collect_tool_uses(&all).len(), 1);
-        let (_, thinking_idx) = block_start_position(&all, "thinking");
-        let thinking_stop = block_stop_position(&all, thinking_idx);
-        let (tool_start, _) = block_start_position(&all, "tool_use");
-        assert!(thinking_stop < tool_start);
-    }
-
-    #[test]
     fn test_native_reasoning_signature_only_applies_to_next_thinking_text() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
@@ -6226,7 +5373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_text_is_dropped_when_thinking_disabled() {
+    fn test_native_reasoning_text_downgrades_to_text_when_thinking_disabled() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -6245,7 +5392,10 @@ mod tests {
         )));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(collect_text_content(&all_events), "");
+        assert_eq!(
+            collect_text_content(&all_events),
+            "visible reasoning fallback"
+        );
         assert_eq!(collect_thinking_content(&all_events), "");
         assert!(!all_events.iter().any(|e| {
             e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
@@ -6408,7 +5558,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
 
         // 第一次下发（异常：上游几乎只会下发一次）
@@ -6445,7 +5596,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let _ = ctx.generate_initial_events();
         let final_events = ctx.generate_final_events();
         let delta = final_events
@@ -6469,7 +5621,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         ctx.context_input_tokens = Some(80);
         ctx.output_tokens = 99;
         ctx.cache_usage = CacheUsage {
@@ -6514,7 +5667,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         ctx.context_input_tokens = Some(80);
         ctx.output_tokens = 9;
         ctx.cache_usage = CacheUsage {
@@ -6547,7 +5701,8 @@ mod tests {
                 false,
                 HashMap::new(),
                 test_known_tools(),
-            );
+            )
+            .with_invoke_tool_schemas(test_tool_schemas());
             ctx.context_input_tokens = None;
             ctx.output_tokens = output_tokens;
             ctx.cache_usage = CacheUsage {
@@ -6585,7 +5740,8 @@ mod tests {
             false,
             HashMap::new(),
             test_known_tools(),
-        );
+        )
+        .with_invoke_tool_schemas(test_tool_schemas());
         let mut events = ctx.generate_initial_events();
         events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
             token_usage: Some(usage),
@@ -6608,5 +5764,267 @@ mod tests {
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
+    }
+
+    // ---- fix-resp 回归：H1 / H2 / M1 / M2 / M5 / L1–L5 / L9 / L11 ----
+
+    fn fr_ctx(thinking: bool) -> StreamContext {
+        StreamContext::new_with_thinking("test-model", 1, thinking, HashMap::new(), test_known_tools())
+            .with_invoke_tool_schemas(test_tool_schemas())
+    }
+
+    fn fr_run(thinking: bool, chunks: &[&str]) -> Vec<SseEvent> {
+        let mut ctx = fr_ctx(thinking);
+        let mut all = ctx.generate_initial_events();
+        for chunk in chunks {
+            all.extend(ctx.process_assistant_response(chunk));
+        }
+        all.extend(ctx.generate_final_events());
+        all
+    }
+
+    fn fr_stop_reason(events: &[SseEvent]) -> serde_json::Value {
+        events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["delta"]["stop_reason"].clone())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    const FR_EXEC: &str = "<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf build</parameter>\n</invoke>";
+
+    #[test]
+    fn fixresp_h2_invoke_followed_by_prose_stays_text() {
+        let text = format!("例如：\n{FR_EXEC}\n上面就是调用格式。");
+        let all = fr_run(false, &[&text]);
+        assert!(collect_tool_uses(&all).is_empty());
+        assert_eq!(collect_text_content(&all), text);
+    }
+
+    #[test]
+    fn fixresp_h2_indented_code_block_invoke_stays_text() {
+        let text = "示例：\n\n    <invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>";
+        let all = fr_run(false, &[text]);
+        assert!(collect_tool_uses(&all).is_empty());
+        assert_eq!(collect_text_content(&all), text);
+    }
+
+    #[test]
+    fn fixresp_h2_tilde_fence_invoke_stays_text() {
+        let text = format!("示例：\n~~~xml\n{FR_EXEC}");
+        let all = fr_run(false, &[&text]);
+        assert!(collect_tool_uses(&all).is_empty());
+        assert_eq!(collect_text_content(&all), text);
+    }
+
+    #[test]
+    fn fixresp_h2_inline_code_invoke_stays_text() {
+        for text in [
+            format!("写成 `{}` 即可", FR_EXEC.replace('\n', "")),
+            format!("用法 `\n{FR_EXEC}"),
+        ] {
+            let all = fr_run(false, &[&text]);
+            assert!(collect_tool_uses(&all).is_empty(), "{text}");
+            assert_eq!(collect_text_content(&all), text);
+        }
+    }
+
+    #[test]
+    fn fixresp_h2_native_tool_use_disables_text_invoke_and_keeps_order() {
+        let mut ctx = fr_ctx(false);
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_assistant_response(&format!("先说明：\n{FR_EXEC}")));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "{}", true))));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "{tools:?}");
+        assert_eq!(tools[0].0, "list_apps");
+        assert!(collect_text_content(&all).contains("rm -rf build"));
+        let text_pos = all
+            .iter()
+            .position(|e| e.data["delta"]["type"] == "text_delta")
+            .expect("text");
+        let tool_pos = all
+            .iter()
+            .position(|e| e.data["content_block"]["type"] == "tool_use")
+            .expect("tool");
+        assert!(text_pos < tool_pos, "文本必须在工具调用之前");
+    }
+
+    #[test]
+    fn fixresp_h2_params_restored_by_schema_types() {
+        let text = "<invoke name=\"exec_command\">\n<parameter name=\"cmd\">sleep 1</parameter>\n<parameter name=\"yield_time_ms\">60000</parameter>\n</invoke>";
+        let blocks = extract_invoke_content_blocks(text, &test_tool_schemas(), &HashMap::new());
+        let tu = blocks.iter().find(|b| b["type"] == "tool_use").expect("应合成 tool_use");
+        assert_eq!(tu["input"]["yield_time_ms"], json!(60000));
+        assert_eq!(tu["input"]["cmd"], json!("sleep 1"));
+    }
+
+    #[test]
+    fn fixresp_h2_schema_mismatch_stays_text() {
+        let schemas = test_tool_schemas();
+        let mut strict = schemas.clone();
+        strict.insert(
+            "exec_command".to_string(),
+            json!({
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+                "additionalProperties": false
+            }),
+        );
+        let cases: [(&str, &InvokeToolSchemas); 3] = [
+            ("<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter><parameter name=\"yield_time_ms\">soon</parameter></invoke>", &schemas),
+            ("<invoke name=\"exec_command\"><parameter name=\"yield_time_ms\">5</parameter></invoke>", &schemas),
+            ("<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter><parameter name=\"sudo\">true</parameter></invoke>", &strict),
+        ];
+        for (text, table) in cases {
+            let blocks = extract_invoke_content_blocks(text, table, &HashMap::new());
+            assert_eq!(blocks, vec![json!({"type": "text", "text": text})], "{text}");
+        }
+    }
+
+    #[test]
+    fn fixresp_l3_lone_lt_in_prose_is_not_held() {
+        let mut ctx = fr_ctx(false);
+        let _ = ctx.generate_initial_events();
+        let first = ctx.process_assistant_response("如果 a < b 就继续");
+        assert_eq!(collect_text_content(&first), "如果 a < b 就继续");
+    }
+
+    #[test]
+    fn fixresp_l3_line_start_unknown_invoke_is_released_immediately() {
+        let mut ctx = fr_ctx(false);
+        let _ = ctx.generate_initial_events();
+        let chunk = "<invoke name=\"not_declared\">\n后面的正文";
+        let first = ctx.process_assistant_response(chunk);
+        assert_eq!(collect_text_content(&first), chunk);
+    }
+
+    #[test]
+    fn fixresp_m1_literal_thinking_mid_text_stays_text() {
+        let text = "可以用 <thinking> 标签包住推理，然后正文继续。";
+        let all = fr_run(true, &[text]);
+        assert_eq!(collect_text_content(&all), text);
+        assert_eq!(collect_thinking_content(&all), "");
+        assert_eq!(extract_thinking_from_complete_text(text), (None, text.to_string()));
+    }
+
+    #[test]
+    fn fixresp_l1_single_newline_after_thinking_end() {
+        let text = "<thinking>想一想</thinking>\n答案在这里";
+        let all = fr_run(true, &[text]);
+        assert_eq!(collect_thinking_content(&all), "想一想");
+        assert_eq!(collect_text_content(&all), "答案在这里");
+        let (thinking, rest) = extract_thinking_from_complete_text(text);
+        assert_eq!(thinking.as_deref().map(str::trim), Some("想一想"));
+        assert_eq!(rest, "答案在这里");
+    }
+
+    #[test]
+    fn fixresp_m2_thinking_then_noarg_tool_reports_tool_use() {
+        let mut ctx = fr_ctx(true);
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_assistant_response("<thinking>需要列出应用</thinking>"));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "", false))));
+        all.extend(ctx.generate_final_events());
+        assert_eq!(fr_stop_reason(&all), json!("tool_use"));
+        assert_eq!(collect_tool_uses(&all).len(), 1);
+    }
+
+    #[test]
+    fn fixresp_m2_native_max_tokens_reports_max_tokens() {
+        let mut ctx = fr_ctx(true);
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_assistant_response("<thinking>想到一半"));
+        all.extend(ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("MAX_TOKENS".to_string()),
+                ..Default::default()
+            },
+        )));
+        all.extend(ctx.generate_final_events());
+        assert_eq!(fr_stop_reason(&all), json!("max_tokens"));
+    }
+
+    #[test]
+    fn fixresp_m5_native_end_turn_beats_full_context_usage() {
+        let run = |native: Option<&str>| {
+            let mut ctx = fr_ctx(false);
+            let mut all = ctx.generate_initial_events();
+            all.extend(ctx.process_assistant_response("完整的回答。"));
+            all.extend(ctx.process_kiro_event(&Event::ContextUsage(
+                crate::kiro::model::events::ContextUsageEvent {
+                    context_usage_percentage: 100.0,
+                },
+            )));
+            if let Some(reason) = native {
+                all.extend(ctx.process_kiro_event(&Event::Metadata(
+                    crate::kiro::model::events::MetadataEvent {
+                        stop_reason: Some(reason.to_string()),
+                        ..Default::default()
+                    },
+                )));
+            }
+            all.extend(ctx.generate_final_events());
+            fr_stop_reason(&all)
+        };
+        assert_eq!(run(Some("END_TURN")), json!("end_turn"));
+        assert_eq!(run(None), json!("model_context_window_exceeded"));
+    }
+
+    #[test]
+    fn fixresp_l5_repeat_guard_ends_with_visible_error() {
+        let mut payload = String::from("先看状态。\n\n");
+        for _ in 0..200 {
+            payload.push_str("count\n");
+        }
+        let all = fr_run(false, &[&payload]);
+        let err = all.iter().find(|e| e.event == "error").expect("熔断必须以 error 事件结束");
+        assert!(err.data.to_string().contains("api_error"), "{:?}", err.data);
+        assert!(!all.iter().any(|e| e.event == "message_stop"));
+        assert!(stray_token_flood_detected(&payload));
+        assert!(!stray_token_flood_detected("先看状态。\ncount\n正文"));
+    }
+
+    #[test]
+    fn fixresp_l9_reasoning_not_mixed_into_text_when_thinking_disabled() {
+        let reasoning = |t: &str| {
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: Some(t.to_string()),
+                signature: None,
+                redacted_content: None,
+            })
+        };
+        let mut ctx = fr_ctx(false);
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_kiro_event(&reasoning("内部推理")));
+        all.extend(ctx.process_assistant_response("最终回答"));
+        all.extend(ctx.generate_final_events());
+        assert_eq!(collect_text_content(&all), "最终回答");
+
+        let mut ctx = fr_ctx(false);
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_kiro_event(&reasoning("只有推理")));
+        all.extend(ctx.generate_final_events());
+        assert_eq!(collect_text_content(&all), "只有推理");
+    }
+
+    #[test]
+    fn fixresp_h1_unclosed_tool_use_does_not_swallow_reply() {
+        let all = fr_run(false, &["格式是 <tool_use id=\"x\" name=\"Read\">", " 然后继续回答。"]);
+        assert_eq!(
+            collect_text_content(&all),
+            "格式是 <tool_use id=\"x\" name=\"Read\"> 然后继续回答。"
+        );
+    }
+
+    #[test]
+    fn fixresp_l11_strip_keeps_surrounding_whitespace() {
+        let content = "  缩进开头\n<tool_use id=\"t\" name=\"Read\">{}</tool_use>\n";
+        assert_eq!(
+            crate::kiro::model::events::strip_tool_use_xml_leaks(content),
+            "  缩进开头\n\n"
+        );
     }
 }
