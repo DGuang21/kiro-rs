@@ -6,7 +6,7 @@
 //!
 //! 启动时扫描历史 JSONL 文件重建聚合，保证重启后趋势图不丢数据。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,6 @@ const RETENTION_DAYS: i64 = 31;
 const HOUR_BUCKETS: usize = 24 * 31;
 /// 天桶数量（31 天）
 const DAY_BUCKETS: usize = 31;
-/// RPM 采样窗口（秒）：统计最近 60 秒的请求数作为瞬时 RPM
 const RPM_WINDOW_SECS: i64 = 60;
 
 /// 单次请求的用量记录（与 JSONL 一行一一对应）
@@ -227,87 +226,12 @@ pub struct UsageAggregator {
     inner: parking_lot::RwLock<AggregatorInner>,
 }
 
-/// RPM 秒级采样槽
-///
-/// 每个槽代表一个 Unix 秒。槽是"可复用"的：`ts` 不在当前窗口内时视为过期，
-/// 下次写入直接覆盖，因此固定 60 个槽即可表达最近 60 秒的滑动窗口，
-/// 无需分配或淘汰。
-#[derive(Debug, Default, Clone)]
-struct RpmSlot {
-    /// 该槽对应的 Unix 秒；0 表示空槽
-    ts: i64,
-    /// 该秒内的总请求数
-    calls: u64,
-    /// 该秒内按上游凭据 id 的请求数（不含未走到上游的请求）
-    by_credential: HashMap<u64, u64>,
-}
-
-/// 最近 60 秒的请求速率采样环
-///
-/// 用秒级槽而非分钟桶：RPM 需要滑动窗口语义（"最近 60 秒"），
-/// 分钟对齐的桶在整分边界会瞬间归零，读数不可用。
-struct RpmRing {
-    slots: Vec<RpmSlot>,
-}
-
-impl RpmRing {
-    fn new() -> Self {
-        Self {
-            slots: vec![RpmSlot::default(); RPM_WINDOW_SECS as usize],
-        }
-    }
-
-    fn slot_index(ts: i64) -> usize {
-        ts.rem_euclid(RPM_WINDOW_SECS) as usize
-    }
-
-    /// 记录一次发生在 `ts`（Unix 秒）的请求
-    fn record(&mut self, ts: i64, credential_id: u64) {
-        let idx = Self::slot_index(ts);
-        let slot = &mut self.slots[idx];
-        // 历史 JSONL 按文件/行回放时可能不是时间顺序。旧记录不能覆盖同一
-        // 秒槽中较新的请求，否则一条 90 秒前的记录会抹掉窗口内的请求。
-        if slot.ts != 0 && ts < slot.ts {
-            return;
-        }
-        // 槽被上一轮（≥60s 前）占用：先清空再复用
-        if slot.ts != ts {
-            slot.ts = ts;
-            slot.calls = 0;
-            slot.by_credential.clear();
-        }
-        slot.calls += 1;
-        if credential_id != 0 {
-            *slot.by_credential.entry(credential_id).or_insert(0) += 1;
-        }
-    }
-
-    /// 汇总窗口内（`now - 60s < ts <= now`）的总请求数与各凭据请求数
-    fn snapshot(&self, now: i64) -> (u64, HashMap<u64, u64>) {
-        let cutoff = now - RPM_WINDOW_SECS;
-        let mut total = 0u64;
-        let mut by_credential: HashMap<u64, u64> = HashMap::new();
-        for slot in &self.slots {
-            // 过期槽（上一轮残留）与未来时间戳（时钟回拨）都跳过
-            if slot.ts <= cutoff || slot.ts > now {
-                continue;
-            }
-            total += slot.calls;
-            for (id, n) in &slot.by_credential {
-                *by_credential.entry(*id).or_insert(0) += n;
-            }
-        }
-        (total, by_credential)
-    }
-}
-
 struct AggregatorInner {
     /// 小时桶（环形数组按桶起始时间索引），最近 31 天
     hour_buckets: Vec<BucketEntry>,
     /// 天桶（按本地日期），最近 31 天
     day_buckets: Vec<BucketEntry>,
-    /// 最近 60 秒的请求速率采样（不持久化，重启后从 0 开始累积）
-    rpm: RpmRing,
+    recent_credential_calls: BTreeMap<i64, HashMap<u64, u64>>,
 }
 
 /// 预设聚合查询时间范围
@@ -404,6 +328,13 @@ pub struct CredentialDistribution {
     pub errors: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialActivity {
+    pub today_calls: u64,
+    pub rpm: u64,
+}
+
 /// 入口 Key 分布
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -441,7 +372,7 @@ impl UsageAggregator {
             inner: parking_lot::RwLock::new(AggregatorInner {
                 hour_buckets: Vec::new(),
                 day_buckets: Vec::new(),
-                rpm: RpmRing::new(),
+                recent_credential_calls: BTreeMap::new(),
             }),
         }
     }
@@ -499,9 +430,13 @@ impl UsageAggregator {
 
     /// 接收一条记录并落入对应桶
     pub fn ingest(&self, rec: &UsageRecord) {
+        self.ingest_at(rec, Utc::now());
+    }
+
+    fn ingest_at(&self, rec: &UsageRecord, now: DateTime<Utc>) {
         let dt: DateTime<Utc> = match DateTime::parse_from_rfc3339(&rec.ts) {
             Ok(d) => d.with_timezone(&Utc),
-            Err(_) => Utc::now(),
+            Err(_) => now,
         };
         let local = dt.with_timezone(&Local);
 
@@ -521,17 +456,84 @@ impl UsageAggregator {
 
         upsert_bucket(&mut inner.hour_buckets, hour_ts, rec, HOUR_BUCKETS);
         upsert_bucket(&mut inner.day_buckets, day_ts, rec, DAY_BUCKETS);
-        // RPM 秒级采样：历史记录（重建时装载）的时间戳落在窗口外，读取时自然被跳过
-        inner.rpm.record(dt.timestamp(), rec.credential_id);
+
+        let now_ts = now.timestamp();
+        let latest_ts = inner
+            .recent_credential_calls
+            .last_key_value()
+            .map(|(timestamp, _)| (*timestamp).max(now_ts))
+            .unwrap_or(now_ts);
+        let cutoff = latest_ts - RPM_WINDOW_SECS;
+        inner
+            .recent_credential_calls
+            .retain(|timestamp, _| *timestamp > cutoff);
+        let request_ts = dt.timestamp();
+        if request_ts > cutoff && request_ts <= now_ts {
+            *inner
+                .recent_credential_calls
+                .entry(request_ts)
+                .or_default()
+                .entry(rec.credential_id)
+                .or_default() += 1;
+        }
     }
 
-    /// 最近 60 秒的瞬时 RPM（总量 + 按上游凭据）
-    ///
-    /// 返回 `(总 RPM, 各凭据 RPM)`。窗口为滑动的"最近 60 秒"，
-    /// 因此数值即为每分钟请求数，无需再做换算。
+    /// 最近 60 秒已完成请求的总 RPM 与各凭据 RPM，与活跃度接口共用采样。
+    /// 尚未归属上游凭据的请求只计入总量。
     pub fn rpm_snapshot(&self) -> (u64, HashMap<u64, u64>) {
+        self.rpm_snapshot_at(Utc::now())
+    }
+
+    fn rpm_snapshot_at(&self, now: DateTime<Utc>) -> (u64, HashMap<u64, u64>) {
         let inner = self.inner.read();
-        inner.rpm.snapshot(Utc::now().timestamp())
+        let mut total = 0;
+        let mut by_credential = HashMap::new();
+        let now_ts = now.timestamp();
+        for counts in inner
+            .recent_credential_calls
+            .range((now_ts - RPM_WINDOW_SECS + 1)..=now_ts)
+            .map(|(_, counts)| counts)
+        {
+            for (&credential_id, &calls) in counts {
+                total += calls;
+                if credential_id != 0 {
+                    *by_credential.entry(credential_id).or_default() += calls;
+                }
+            }
+        }
+        (total, by_credential)
+    }
+
+    pub fn query_credential_activity(&self) -> HashMap<u64, CredentialActivity> {
+        self.query_credential_activity_at(Utc::now())
+    }
+
+    fn query_credential_activity_at(&self, now: DateTime<Utc>) -> HashMap<u64, CredentialActivity> {
+        let inner = self.inner.read();
+        let today = now.with_timezone(&Local).date_naive();
+        let mut activity: HashMap<u64, CredentialActivity> = HashMap::new();
+        for bucket in &inner.day_buckets {
+            let is_today = DateTime::from_timestamp(bucket.ts, 0)
+                .is_some_and(|start| start.with_timezone(&Local).date_naive() == today);
+            if is_today {
+                for (credential_id, stats) in &bucket.by_credential {
+                    activity.entry(*credential_id).or_default().today_calls += stats.calls;
+                }
+            }
+        }
+        let now_ts = now.timestamp();
+        for counts in inner
+            .recent_credential_calls
+            .range((now_ts - RPM_WINDOW_SECS + 1)..=now_ts)
+            .map(|(_, counts)| counts)
+        {
+            for (credential_id, calls) in counts {
+                if *credential_id != 0 {
+                    activity.entry(*credential_id).or_default().rpm += calls;
+                }
+            }
+        }
+        activity
     }
 
     /// 时序数据查询
@@ -864,77 +866,250 @@ pub type SharedAggregator = Arc<UsageAggregator>;
 mod tests {
     use super::*;
 
-    /// 构造一条指定时间/凭据的记录
-    fn rec_at(ts: DateTime<Utc>, credential_id: u64) -> UsageRecord {
+    fn activity_test_time() -> DateTime<Utc> {
+        Local
+            .with_ymd_and_hms(2026, 11, 4, 12, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn activity_record(credential_id: u64, timestamp: DateTime<Utc>, status: &str) -> UsageRecord {
         UsageRecord {
-            ts: ts.to_rfc3339(),
+            ts: timestamp.to_rfc3339(),
             key_id: 1,
             credential_id,
-            model: "claude-opus-4-7".to_string(),
-            input_tokens: 10,
-            output_tokens: 5,
+            model: "activity-test".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             credits: 0.0,
             duration_ms: 100,
-            status: "success".to_string(),
+            status: status.to_string(),
         }
     }
 
     #[test]
-    fn rpm_counts_only_last_60_seconds() {
-        let agg = UsageAggregator::new();
+    fn legacy_rpm_and_activity_share_window_without_fabricating_credential_zero() {
+        let aggregator = UsageAggregator::new();
+        let now = activity_test_time();
+        for (credential_id, age) in [(7, 0), (7, 59), (7, 60), (8, 10), (0, 0)] {
+            aggregator.ingest_at(
+                &activity_record(credential_id, now - Duration::seconds(age), "error"),
+                now,
+            );
+        }
+        let (total, by_credential) = aggregator.rpm_snapshot_at(now);
+        let activity = aggregator.query_credential_activity_at(now);
+        assert_eq!(total, 4);
+        assert_eq!(by_credential.len(), 2);
+        assert!(!by_credential.contains_key(&0));
+        assert!(!activity.contains_key(&0));
+        for (&id, &rpm) in &by_credential {
+            assert_eq!(activity[&id].rpm, rpm);
+        }
+        assert_eq!(activity[&7].today_calls, 3);
+        let expired = now + Duration::seconds(60);
+        assert_eq!(aggregator.rpm_snapshot_at(expired), (0, HashMap::new()));
+        assert!(
+            aggregator
+                .query_credential_activity_at(expired)
+                .values()
+                .all(|a| a.rpm == 0)
+        );
+    }
+
+    #[test]
+    fn shared_rpm_keeps_newer_writes_and_rejects_future_records() {
+        let aggregator = UsageAggregator::new();
+        let earlier = activity_test_time();
+        let later = earlier + Duration::seconds(1);
+        aggregator.ingest_at(&activity_record(7, later, "success"), later);
+        aggregator.ingest_at(&activity_record(7, earlier, "success"), earlier);
+        aggregator.ingest_at(
+            &activity_record(7, later + Duration::seconds(1), "success"),
+            earlier,
+        );
+        aggregator.ingest_at(
+            &activity_record(7, later - Duration::seconds(60), "success"),
+            later,
+        );
+        let (total, by_credential) = aggregator.rpm_snapshot_at(later);
+        assert_eq!(total, 2);
+        assert_eq!(by_credential[&7], 2);
+        assert_eq!(aggregator.query_credential_activity_at(later)[&7].rpm, 2);
+    }
+
+    #[test]
+    fn credential_activity_counts_completed_requests_by_credential() {
+        let aggregator = UsageAggregator::new();
+        let now = activity_test_time();
+        for (credential_id, age, status) in [
+            (7, 0, "success"),
+            (7, 0, "error"),
+            (7, 59, "success"),
+            (7, 60, "error"),
+            (7, 3600, "success"),
+            (8, 5, "success"),
+            (9, 2 * 86400, "success"),
+            (0, 0, "error"),
+        ] {
+            aggregator.ingest_at(
+                &activity_record(credential_id, now - Duration::seconds(age), status),
+                now,
+            );
+        }
+
+        let activity = aggregator.query_credential_activity_at(now);
+        assert_eq!(activity.len(), 2);
+        assert_eq!(
+            activity[&7],
+            CredentialActivity {
+                today_calls: 5,
+                rpm: 3
+            }
+        );
+        assert_eq!(
+            activity[&8],
+            CredentialActivity {
+                today_calls: 1,
+                rpm: 1
+            }
+        );
+        let json = serde_json::to_value(activity).unwrap();
+        assert_eq!(json["7"]["todayCalls"], 5);
+        assert_eq!(json["7"]["rpm"], 3);
+    }
+
+    #[test]
+    fn credential_activity_rpm_expires_without_new_requests() {
+        let aggregator = UsageAggregator::new();
+        let now = activity_test_time();
+        aggregator.ingest_at(&activity_record(7, now, "success"), now);
+
+        assert_eq!(
+            aggregator.query_credential_activity_at(now + Duration::seconds(59))[&7].rpm,
+            1
+        );
+        assert_eq!(
+            aggregator.query_credential_activity_at(now + Duration::seconds(60))[&7],
+            CredentialActivity {
+                today_calls: 1,
+                rpm: 0
+            }
+        );
+    }
+
+    #[test]
+    fn credential_activity_resets_today_at_local_midnight() {
+        let aggregator = UsageAggregator::new();
+        let now = Local
+            .with_ymd_and_hms(2026, 11, 5, 0, 0, 30)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        aggregator.ingest_at(
+            &activity_record(7, now - Duration::seconds(45), "success"),
+            now,
+        );
+        aggregator.ingest_at(
+            &activity_record(7, now - Duration::seconds(15), "error"),
+            now,
+        );
+
+        assert_eq!(
+            aggregator.query_credential_activity_at(now)[&7],
+            CredentialActivity {
+                today_calls: 1,
+                rpm: 2
+            }
+        );
+        assert!(
+            aggregator
+                .query_credential_activity_at(now + Duration::days(1))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn credential_activity_accepts_out_of_order_records() {
+        let aggregator = UsageAggregator::new();
+        let now = activity_test_time();
+        for age in [1, 59, 120, 2] {
+            aggregator.ingest_at(
+                &activity_record(7, now - Duration::seconds(age), "success"),
+                now,
+            );
+        }
+        assert_eq!(
+            aggregator.query_credential_activity_at(now)[&7],
+            CredentialActivity {
+                today_calls: 4,
+                rpm: 3
+            }
+        );
+    }
+
+    #[test]
+    fn credential_activity_preserves_newer_concurrent_records() {
+        let aggregator = UsageAggregator::new();
+        let earlier = activity_test_time();
+        let later = earlier + Duration::seconds(1);
+        aggregator.ingest_at(&activity_record(7, later, "success"), later);
+        aggregator.ingest_at(&activity_record(7, earlier, "success"), earlier);
+
+        assert_eq!(
+            aggregator.query_credential_activity_at(later)[&7],
+            CredentialActivity {
+                today_calls: 2,
+                rpm: 2
+            }
+        );
+    }
+
+    #[test]
+    fn credential_activity_bounds_recent_buckets_and_ignores_future_rpm() {
+        let aggregator = UsageAggregator::new();
+        let start = activity_test_time();
+        for elapsed in 0..=120 {
+            let now = start + Duration::seconds(elapsed);
+            aggregator.ingest_at(&activity_record(7, now, "success"), now);
+        }
+        let now = start + Duration::seconds(120);
+        aggregator.ingest_at(&activity_record(7, start, "success"), now);
+        aggregator.ingest_at(
+            &activity_record(7, now + Duration::seconds(1), "success"),
+            now,
+        );
+
+        assert_eq!(aggregator.inner.read().recent_credential_calls.len(), 60);
+        assert_eq!(aggregator.query_credential_activity_at(now)[&7].rpm, 60);
+    }
+
+    #[test]
+    fn credential_activity_rebuilds_from_usage_logs() {
+        let directory =
+            std::env::temp_dir().join(format!("kiro-activity-{}", uuid::Uuid::new_v4()));
+        let recorder = UsageRecorder::with_retention(directory.clone(), RETENTION_DAYS);
         let now = Utc::now();
+        recorder.record(&activity_record(7, now, "success"));
+        recorder.record(&activity_record(7, now, "error"));
+        drop(recorder);
 
-        // 窗口内：3 次（凭据 5 两次、凭据 7 一次）
-        agg.ingest(&rec_at(now, 5));
-        agg.ingest(&rec_at(now - Duration::seconds(10), 5));
-        agg.ingest(&rec_at(now - Duration::seconds(30), 7));
-        // 窗口外：应被排除
-        agg.ingest(&rec_at(now - Duration::seconds(90), 5));
-        agg.ingest(&rec_at(now - Duration::seconds(3600), 5));
-
-        let (total, by_cred) = agg.rpm_snapshot();
-        assert_eq!(total, 3, "只应统计最近 60 秒内的请求");
-        assert_eq!(by_cred.get(&5).copied(), Some(2));
-        assert_eq!(by_cred.get(&7).copied(), Some(1));
-    }
-
-    #[test]
-    fn rpm_slot_reuse_does_not_double_count_previous_minute() {
-        // 同一秒槽被上一轮（恰好 60s 前）占用时，必须清空后复用，
-        // 否则 60s 前的请求会被算进当前 RPM。
-        let mut ring = RpmRing::new();
-        let now = 1_700_000_000i64;
-
-        ring.record(now - RPM_WINDOW_SECS, 5); // 落在同一 slot index
-        ring.record(now, 5);
-
-        let (total, by_cred) = ring.snapshot(now);
-        assert_eq!(total, 1, "上一轮同槽记录必须被覆盖，不得重复计数");
-        assert_eq!(by_cred.get(&5).copied(), Some(1));
-    }
-
-    #[test]
-    fn rpm_ignores_credential_zero_but_counts_total() {
-        // credential_id = 0 表示请求未走到上游：计入总量，但不归属任何凭据
-        let mut ring = RpmRing::new();
-        let now = 1_700_000_000i64;
-        ring.record(now, 0);
-
-        let (total, by_cred) = ring.snapshot(now);
-        assert_eq!(total, 1);
-        assert!(by_cred.is_empty());
-    }
-
-    #[test]
-    fn rpm_skips_future_timestamps_from_clock_skew() {
-        let mut ring = RpmRing::new();
-        let now = 1_700_000_000i64;
-        ring.record(now + 5, 5);
-
-        let (total, _) = ring.snapshot(now);
-        assert_eq!(total, 0, "时钟回拨产生的未来时间戳不应计入");
+        let aggregator = UsageAggregator::new();
+        aggregator.rebuild_from_logs(&directory);
+        assert_eq!(
+            aggregator.query_credential_activity_at(now)[&7],
+            CredentialActivity {
+                today_calls: 2,
+                rpm: 2
+            }
+        );
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]

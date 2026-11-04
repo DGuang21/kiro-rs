@@ -639,6 +639,13 @@ export interface ModelDistribution {
   outputTokens: number
 }
 
+export interface CredentialActivity {
+  todayCalls: number
+  rpm: number
+}
+
+export type CredentialActivityResponse = Record<string, CredentialActivity>
+
 export interface CredentialDistribution {
   credentialId: number
   email?: string
