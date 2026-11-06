@@ -57,6 +57,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn snapshot_tool_compatibility_mode(mut self) -> Self {
+        if let Some(provider) = &self.kiro_provider {
+            self.tool_compatibility_mode = provider.token_manager().tool_compatibility_mode();
+        }
+        self
+    }
+
     /// 创建新的应用状态（不含 client_keys 的基础构造，供嵌入 / 测试使用）
     #[allow(dead_code)]
     pub fn new(
@@ -152,6 +159,16 @@ pub async fn auth_middleware(
                     "rate_limit_error",
                     format!(
                         "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
+                        used, limit
+                    ),
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            }
+            KeyAuth::CallsOverLimit { used, limit, .. } => {
+                let error = ErrorResponse::new(
+                    "rate_limit_error",
+                    format!(
+                        "该 API Key 已达到有效调用次数上限（已用 {} / 上限 {}），请联系管理员调整额度或重置统计",
                         used, limit
                     ),
                 );

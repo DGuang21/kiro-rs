@@ -6,6 +6,12 @@ use crate::admin::proxy_pool::ProxyHealth;
 use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCompatibilityConfig {
+    pub mode: crate::model::config::ToolCompatibilityMode,
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -1236,6 +1242,10 @@ pub struct ClientKeyItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
     pub total_calls: u64,
+    pub total_successful_calls: u64,
+    pub billing_mode: super::client_keys::BillingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<u64>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
@@ -1337,6 +1347,10 @@ pub struct CreateClientKeyRequest {
     /// 积分使用上限（可选；None / 省略表示不限制）
     #[serde(default)]
     pub max_credits: Option<f64>,
+    #[serde(default)]
+    pub billing_mode: super::client_keys::BillingMode,
+    #[serde(default)]
+    pub max_calls: Option<u64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1357,6 +1371,8 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    pub billing_mode: Option<super::client_keys::BillingMode>,
+    pub max_calls: Option<u64>,
 }
 
 /// 设置客户端 Key 的积分使用上限

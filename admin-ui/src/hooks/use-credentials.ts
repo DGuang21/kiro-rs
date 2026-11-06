@@ -20,6 +20,8 @@ import {
   setLoadBalancingMode,
   getApiDomain,
   setApiDomain,
+  getToolCompatibilityMode,
+  setToolCompatibilityMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
   getModelApiRetryConfig,
@@ -302,6 +304,24 @@ export function useSetApiDomain() {
     mutationFn: setApiDomain,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['apiDomain'] })
+    },
+  })
+}
+
+export function useToolCompatibilityMode() {
+  return useQuery({
+    queryKey: ['toolCompatibilityMode'],
+    queryFn: getToolCompatibilityMode,
+  })
+}
+
+export function useSetToolCompatibilityMode() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setToolCompatibilityMode,
+    onSuccess: async (data) => {
+      await queryClient.cancelQueries({ queryKey: ['toolCompatibilityMode'] })
+      queryClient.setQueryData(['toolCompatibilityMode'], data)
     },
   })
 }
